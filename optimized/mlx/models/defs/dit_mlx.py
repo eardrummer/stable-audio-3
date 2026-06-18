@@ -255,7 +255,7 @@ class DiT(nn.Module):
         x_pp = self.preprocess_conv(x_lc) + x_lc
 
         if local_add_cond is None:
-            local = mx.broadcast_to(self._local_zeros_1, (B, self.T_lat, LOCAL_ADD_COND_DIM))
+            local = mx.zeros((B, x_pp.shape[1], LOCAL_ADD_COND_DIM), dtype=x_pp.dtype)
         else:
             local = local_add_cond
         h = self.transformer(x_pp, context, global_embed, local)

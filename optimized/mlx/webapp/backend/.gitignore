@@ -1,0 +1,6 @@
+# Ignore local workstation history database
+history.json
+
+# Ignore user uploads and outputs
+uploads/
+outputs/
