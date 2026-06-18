@@ -1390,15 +1390,7 @@ export default function App() {
             Model cached: {ditName === 'sm-music' ? 'sa3-small (50M)' : ditName === 'sm-sfx' ? 'sa3-sfx (50M)' : 'sa3-medium (1.4B)'}
           </div>
 
-          {/* Grid Monitor Toggle Button */}
-          <button 
-            className={`header-monitor-btn ${showMonitor ? 'active' : ''}`}
-            onClick={() => setShowMonitor(!showMonitor)}
-            title="Open 2D Matrix Generation Monitor"
-          >
-            <Grid size={15} />
-            Monitor
-          </button>
+
 
           {/* Memory Toggle Button */}
           <button 
@@ -1709,6 +1701,192 @@ export default function App() {
                   </button>
                 </div>
               )}
+
+              {/* Text Prompt & Generation settings card moved under Source Audio */}
+              {isGenerating ? (
+                /* PROGRESS OVERLAY */
+                <div className="progress-overlay" style={{ marginTop: '1rem' }}>
+                  <div className="progress-loader"></div>
+                  <div className="progress-text">{progressText}</div>
+                  <div className="progress-bar-container">
+                    <div 
+                      className="progress-bar-fill" 
+                      style={{ width: `${progressPercent}%` }}
+                    ></div>
+                  </div>
+                  <div className="progress-subtext">
+                    Processing on Metal GPU (Unified VRAM)...
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* Centered Text Prompt Box */}
+                  <div className="prompt-input-container">
+                    <div className="prompt-label">TEXT PROMPT</div>
+                    <textarea
+                      className="prompt-textarea"
+                      placeholder="Enter a prompt to guide the generation..."
+                      value={prompt}
+                      onChange={(e) => setPrompt(e.target.value)}
+                    />
+                  </div>
+
+                  {/* Stable Audio Parameters Box */}
+                  <div className="parameters-box">
+                    <div className="parameters-box-header-tabs">
+                      <button 
+                        className={`model-tab-btn ${activeTab === 'generate_a' ? 'active' : ''}`}
+                        onClick={() => {
+                          setActiveTab('generate_a');
+                          handleClearSourceRegion();
+                        }}
+                      >
+                        Audio-to-Audio / Inpaint
+                      </button>
+                      <button 
+                        className={`model-tab-btn ${activeTab === 'generate_b' ? 'active' : ''}`}
+                        onClick={() => {
+                          setActiveTab('generate_b');
+                          handleClearSourceRegion();
+                        }}
+                      >
+                        Extend Audio
+                      </button>
+                    </div>
+
+                    <div className="parameters-grid">
+                      {/* Mode-specific Slider */}
+                      {activeTab === 'generate_a' ? (
+                        <div className="parameter-group">
+                          <div className="parameter-header">
+                            <span className="parameter-label">Adding Noise / Variation Strength</span>
+                            <span className="parameter-value">{Math.round(noiseLevel * 100)}%</span>
+                          </div>
+                          <input 
+                            type="range" 
+                            min="0.05" 
+                            max="1.0" 
+                            step="0.05"
+                            value={noiseLevel} 
+                            onChange={(e) => setNoiseLevel(Number(e.target.value))}
+                            className="slider-input"
+                          />
+                        </div>
+                      ) : (
+                        <div className="parameter-group">
+                          <div className="parameter-header">
+                            <span className="parameter-label">Extension Duration</span>
+                            <span className="parameter-value">{extendLength} seconds</span>
+                          </div>
+                          <input 
+                            type="range" 
+                            min="5" 
+                            max="30" 
+                            step="1"
+                            value={extendLength} 
+                            onChange={(e) => setExtendLength(Number(e.target.value))}
+                            className="slider-input"
+                          />
+                        </div>
+                      )}
+
+                      {/* CFG Slider */}
+                      <div className="parameter-group">
+                        <div className="parameter-header">
+                          <span className="parameter-label">Control Strength (CFG)</span>
+                          <span className="parameter-value">{cfg}</span>
+                        </div>
+                        <input 
+                          type="range" 
+                          min="1.0" 
+                          max="12.0" 
+                          step="0.5"
+                          value={cfg} 
+                          onChange={(e) => setCfg(Number(e.target.value))}
+                          className="slider-input"
+                        />
+                      </div>
+
+                      {/* Steps Slider */}
+                      <div className="parameter-group">
+                        <div className="parameter-header">
+                          <span className="parameter-label">Denoising Steps</span>
+                          <span className="parameter-value">{steps}</span>
+                        </div>
+                        <input 
+                          type="range" 
+                          min="1" 
+                          max="32" 
+                          step="1"
+                          value={steps} 
+                          onChange={(e) => setSteps(Number(e.target.value))}
+                          className="slider-input"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Advanced Options Toggle */}
+                    <div style={{ alignSelf: 'flex-start' }}>
+                      <button 
+                        onClick={() => setShowAdvanced(!showAdvanced)}
+                        style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.3rem', cursor: 'pointer' }}
+                      >
+                        {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                        {showAdvanced ? 'Hide Advanced Options' : 'Show Advanced Options'}
+                      </button>
+                    </div>
+
+                    {showAdvanced && (
+                      <div className="parameters-grid" style={{ gap: '1.2rem', borderTop: '1px solid var(--border-color)', paddingTop: '1.2rem' }}>
+                        <div className="parameter-group">
+                          <div className="parameter-header">
+                            <span className="parameter-label">Manual Seed (Optional)</span>
+                          </div>
+                          <input 
+                            type="number"
+                            placeholder="Random seed"
+                            className="numeric-input"
+                            style={{ width: '100%', textAlign: 'left' }}
+                            value={seed}
+                            onChange={(e) => setSeed(e.target.value === '' ? '' : Number(e.target.value))}
+                          />
+                        </div>
+                        
+                        <div className="parameter-group">
+                          <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                            <input 
+                              type="checkbox" 
+                              checked={freeModels}
+                              onChange={(e) => setFreeModels(e.target.checked)}
+                              style={{ accentColor: 'var(--accent-cyan)' }}
+                            />
+                            Free VRAM models immediately (recommended for 8GB Macs)
+                          </label>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* ERROR DISPLAY */}
+                  {errorMsg && (
+                    <div style={{ color: 'var(--accent-red)', fontSize: '0.85rem', padding: '0.8rem', background: 'rgba(255, 59, 48, 0.03)', border: '1px solid rgba(255, 59, 48, 0.1)', borderRadius: '8px', width: '100%' }}>
+                      {errorMsg}
+                    </div>
+                  )}
+
+                  {/* GENERATE BUTTON */}
+                  <button 
+                    className="btn-generate"
+                    onClick={handleGenerate}
+                    disabled={isGenerating || audioUploadLoading}
+                  >
+                    <Sparkles size={16} />
+                    {activeTab === 'generate_a' 
+                      ? (inpaintRange ? 'Generate A: Inpaint Region' : 'Generate A: Audio-to-Audio') 
+                      : 'Generate B: Extend Audio'}
+                  </button>
+                </>
+              )}
             </div>
 
             {/* RIGHT COLUMN: GENERATED AUDIO (OUTPUT) & NOISE VARS */}
@@ -1851,197 +2029,87 @@ export default function App() {
                   </span>
                 </div>
               )}
+
+              {/* 2D GENERATION MATRIX MONITOR PANEL */}
+              <div className="matrix-monitor-panel" style={{ marginTop: '0.5rem' }}>
+                <div className="monitor-modal-header" style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.05)', paddingBottom: '0.6rem', marginBottom: '0.6rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.8rem' }}>
+                    <Grid size={16} className="icon-glow-cyan" />
+                    <span className="monitor-modal-title" style={{ fontSize: '0.75rem' }}>2D GENERATION MATRIX MONITOR</span>
+                  </div>
+                </div>
+
+                {variants.length === 0 ? (
+                  <div className="waveform-box" style={{ borderStyle: 'dashed', minHeight: '120px', justifyContent: 'center', alignItems: 'center', color: 'var(--text-muted)', flex: 1, gap: '0.4rem' }}>
+                    <Grid size={20} style={{ color: 'var(--text-muted)' }} />
+                    <span style={{ fontSize: '0.8rem' }}>Matrix Monitor offline</span>
+                    <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Generate audio in Audio-to-Audio mode to see the variations.</span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="monitor-modal-meta" style={{ gap: '1rem', padding: '0.4rem 0.8rem', marginBottom: '0.8rem' }}>
+                      <span className="meta-item"><strong>PROMPT:</strong> "{prompt || 'Unconditional'}"</span>
+                      <span className="meta-item"><strong>BASE SEED:</strong> {variants[10]?.seeds[0]?.seed || 'N/A'}</span>
+                    </div>
+
+                    <div className="monitor-modal-grid-container" style={{ maxHeight: '350px' }}>
+                      {/* Columns Header (S1..S5) */}
+                      <div className="monitor-modal-cols-header" style={{ gap: '6px', marginBottom: '6px' }}>
+                        <div style={{ width: '45px' }}></div>
+                        {Array.from({ length: 5 }, (_, sIdx) => (
+                          <div key={sIdx} className="col-modal-label" style={{ fontSize: '0.55rem' }}>VAR {sIdx + 1}</div>
+                        ))}
+                      </div>
+                      
+                      {/* Rows */}
+                      <div className="monitor-modal-rows-container" style={{ gap: '4px' }}>
+                        {variants.map((v, vIdx) => {
+                          const isCenter = vIdx === 10;
+                          return (
+                            <div key={vIdx} className="monitor-modal-row" style={{ gridTemplateColumns: '45px repeat(5, 1fr)', gap: '6px' }}>
+                              <div className="row-modal-label" style={{ fontSize: '0.55rem', paddingRight: '6px' }}>{isCenter ? 'CTR' : `${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)}`}</div>
+                              <div className="row-modal-cells">
+                                {v.seeds.map((s, sIdx) => {
+                                  const isGeneratingCell = generatingCell && generatingCell.vIndex === vIdx && generatingCell.sIndex === sIdx;
+                                  const isActive = vIdx === activeVariantIndex && sIdx === activeSeedIndex;
+                                  
+                                  let cellClass = "";
+                                  if (isActive) cellClass = "active";
+                                  else if (isGeneratingCell) cellClass = "generating";
+                                  else if (s.isReady) cellClass = "ready";
+                                  
+                                  return (
+                                    <button
+                                      key={sIdx}
+                                      className={`monitor-modal-cell ${cellClass}`}
+                                      disabled={!s.isReady}
+                                      onClick={() => loadVariant2D(vIdx, sIdx)}
+                                      title={`Noise Level: ${v.noise_level.toFixed(2)} (${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)} Delta), Seed: ${s.seed || 'Pending'} (${s.isReady ? 'Ready - Click to audition' : isGeneratingCell ? 'Generating...' : 'In Queue'})`}
+                                    />
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    
+                    {/* Legend */}
+                    <div className="monitor-modal-legend" style={{ borderTop: '1px solid rgba(255, 255, 255, 0.05)', paddingTop: '0.6rem', marginTop: '0.6rem', flexWrap: 'wrap', gap: '0.8rem', fontSize: '0.65rem' }}>
+                      <div className="legend-item"><span className="legend-modal-dot ready" style={{ width: '8px', height: '8px' }}></span>Ready</div>
+                      <div className="legend-item"><span className="legend-modal-dot generating" style={{ width: '8px', height: '8px' }}></span>Rendering</div>
+                      <div className="legend-item"><span className="legend-modal-dot active" style={{ width: '8px', height: '8px' }}></span>Playing</div>
+                      <div className="legend-item"><span className="legend-modal-dot pending" style={{ width: '8px', height: '8px' }}></span>Queued</div>
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
 
           </div>
 
-          {/* 3. BOTTOM CENTER PANEL: PROMPT & PARAMETERS */}
-          <div className="bottom-center-panel">
-            {isGenerating ? (
-              /* PROGRESS OVERLAY */
-              <div className="progress-overlay">
-                <div className="progress-loader"></div>
-                <div className="progress-text">{progressText}</div>
-                <div className="progress-bar-container">
-                  <div 
-                    className="progress-bar-fill" 
-                    style={{ width: `${progressPercent}%` }}
-                  ></div>
-                </div>
-                <div className="progress-subtext">
-                  Processing on Metal GPU (Unified VRAM)...
-                </div>
-              </div>
-            ) : (
-              <>
-                {/* Centered Text Prompt Box */}
-                <div className="prompt-input-container">
-                  <div className="prompt-label">TEXT PROMPT</div>
-                  <textarea
-                    className="prompt-textarea"
-                    placeholder="Enter a prompt to guide the generation..."
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                  />
-                </div>
 
-                {/* Stable Audio Parameters Box */}
-                <div className="parameters-box">
-                  <div className="parameters-box-header-tabs">
-                    <button 
-                      className={`model-tab-btn ${activeTab === 'generate_a' ? 'active' : ''}`}
-                      onClick={() => {
-                        setActiveTab('generate_a');
-                        handleClearSourceRegion();
-                      }}
-                    >
-                      Audio-to-Audio / Inpaint
-                    </button>
-                    <button 
-                      className={`model-tab-btn ${activeTab === 'generate_b' ? 'active' : ''}`}
-                      onClick={() => {
-                        setActiveTab('generate_b');
-                        handleClearSourceRegion();
-                      }}
-                    >
-                      Extend Audio
-                    </button>
-                  </div>
-
-                  <div className="parameters-grid">
-                    {/* Mode-specific Slider */}
-                    {activeTab === 'generate_a' ? (
-                      <div className="parameter-group">
-                        <div className="parameter-header">
-                          <span className="parameter-label">Adding Noise / Variation Strength</span>
-                          <span className="parameter-value">{Math.round(noiseLevel * 100)}%</span>
-                        </div>
-                        <input 
-                          type="range" 
-                          min="0.05" 
-                          max="1.0" 
-                          step="0.05"
-                          value={noiseLevel} 
-                          onChange={(e) => setNoiseLevel(Number(e.target.value))}
-                          className="slider-input"
-                        />
-                      </div>
-                    ) : (
-                      <div className="parameter-group">
-                        <div className="parameter-header">
-                          <span className="parameter-label">Extension Duration</span>
-                          <span className="parameter-value">{extendLength} seconds</span>
-                        </div>
-                        <input 
-                          type="range" 
-                          min="5" 
-                          max="30" 
-                          step="1"
-                          value={extendLength} 
-                          onChange={(e) => setExtendLength(Number(e.target.value))}
-                          className="slider-input"
-                        />
-                      </div>
-                    )}
-
-                    {/* CFG Slider */}
-                    <div className="parameter-group">
-                      <div className="parameter-header">
-                        <span className="parameter-label">Control Strength (CFG)</span>
-                        <span className="parameter-value">{cfg}</span>
-                      </div>
-                      <input 
-                        type="range" 
-                        min="1.0" 
-                        max="12.0" 
-                        step="0.5"
-                        value={cfg} 
-                        onChange={(e) => setCfg(Number(e.target.value))}
-                        className="slider-input"
-                      />
-                    </div>
-
-                    {/* Steps Slider */}
-                    <div className="parameter-group">
-                      <div className="parameter-header">
-                        <span className="parameter-label">Denoising Steps</span>
-                        <span className="parameter-value">{steps}</span>
-                      </div>
-                      <input 
-                        type="range" 
-                        min="1" 
-                        max="32" 
-                        step="1"
-                        value={steps} 
-                        onChange={(e) => setSteps(Number(e.target.value))}
-                        className="slider-input"
-                      />
-                    </div>
-                  </div>
-
-                  {/* Advanced Options Toggle */}
-                  <div style={{ alignSelf: 'flex-start' }}>
-                    <button 
-                      onClick={() => setShowAdvanced(!showAdvanced)}
-                      style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.3rem', cursor: 'pointer' }}
-                    >
-                      {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-                      {showAdvanced ? 'Hide Advanced Options' : 'Show Advanced Options'}
-                    </button>
-                  </div>
-
-                  {showAdvanced && (
-                    <div className="parameters-grid" style={{ gap: '1.2rem', borderTop: '1px solid var(--border-color)', paddingTop: '1.2rem' }}>
-                      <div className="parameter-group">
-                        <div className="parameter-header">
-                          <span className="parameter-label">Manual Seed (Optional)</span>
-                        </div>
-                        <input 
-                          type="number"
-                          placeholder="Random seed"
-                          className="numeric-input"
-                          style={{ width: '100%', textAlign: 'left' }}
-                          value={seed}
-                          onChange={(e) => setSeed(e.target.value === '' ? '' : Number(e.target.value))}
-                        />
-                      </div>
-                      
-                      <div className="parameter-group">
-                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
-                          <input 
-                            type="checkbox" 
-                            checked={freeModels}
-                            onChange={(e) => setFreeModels(e.target.checked)}
-                            style={{ accentColor: 'var(--accent-cyan)' }}
-                          />
-                          Free VRAM models immediately (recommended for 8GB Macs)
-                        </label>
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* ERROR DISPLAY */}
-                {errorMsg && (
-                  <div style={{ color: 'var(--accent-red)', fontSize: '0.85rem', padding: '0.8rem', background: 'rgba(255, 59, 48, 0.03)', border: '1px solid rgba(255, 59, 48, 0.1)', borderRadius: '8px', width: '100%' }}>
-                    {errorMsg}
-                  </div>
-                )}
-
-                {/* GENERATE BUTTON */}
-                <button 
-                  className="btn-generate"
-                  onClick={handleGenerate}
-                  disabled={isGenerating || audioUploadLoading}
-                >
-                  <Sparkles size={16} />
-                  {activeTab === 'generate_a' 
-                    ? (inpaintRange ? 'Generate A: Inpaint Region' : 'Generate A: Audio-to-Audio') 
-                    : 'Generate B: Extend Audio'}
-                </button>
-              </>
-            )}
-          </div>
 
         </div>
 
@@ -2109,86 +2177,7 @@ export default function App() {
           </div>
         </aside>
 
-        {/* 6. 2D MATRIX MONITOR MODAL & BACKDROP (Opens floating on top of everything!) */}
-        <div 
-          className={`monitor-backdrop ${showMonitor ? 'open' : ''}`}
-          onClick={() => setShowMonitor(false)}
-        >
-          <div 
-            className="matrix-monitor-modal"
-            onClick={(e) => e.stopPropagation()} // Prevent close on modal content click
-          >
-            <div className="monitor-modal-header">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.8rem' }}>
-                <Grid size={18} className="icon-glow-cyan" />
-                <span className="monitor-modal-title">2D GENERATION MATRIX MONITOR</span>
-              </div>
-              <button 
-                className="btn-close-monitor-modal" 
-                onClick={() => setShowMonitor(false)}
-                title="Close Monitor"
-              >
-                <X size={18} />
-              </button>
-            </div>
-            
-            <div className="monitor-modal-meta">
-              <span className="meta-item"><strong>PROMPT:</strong> "{prompt || 'Unconditional'}"</span>
-              <span className="meta-item"><strong>BASE SEED:</strong> {variants[10]?.seeds[0]?.seed || 'N/A'}</span>
-            </div>
 
-            <div className="monitor-modal-grid-container">
-              {/* Columns Header (S1..S5) */}
-              <div className="monitor-modal-cols-header">
-                <div style={{ width: '60px' }}></div>
-                {Array.from({ length: 5 }, (_, sIdx) => (
-                  <div key={sIdx} className="col-modal-label">VARIATION {sIdx + 1}</div>
-                ))}
-              </div>
-              
-              {/* Rows */}
-              <div className="monitor-modal-rows-container">
-                {variants.map((v, vIdx) => {
-                  const isCenter = vIdx === 10;
-                  return (
-                    <div key={vIdx} className="monitor-modal-row">
-                      <div className="row-modal-label">{isCenter ? 'CTR' : `${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)}`}</div>
-                      <div className="row-modal-cells">
-                        {v.seeds.map((s, sIdx) => {
-                          const isGenerating = generatingCell && generatingCell.vIndex === vIdx && generatingCell.sIndex === sIdx;
-                          const isActive = vIdx === activeVariantIndex && sIdx === activeSeedIndex;
-                          
-                          let cellClass = "";
-                          if (isActive) cellClass = "active";
-                          else if (isGenerating) cellClass = "generating";
-                          else if (s.isReady) cellClass = "ready";
-                          
-                          return (
-                            <button
-                              key={sIdx}
-                              className={`monitor-modal-cell ${cellClass}`}
-                              disabled={!s.isReady}
-                              onClick={() => loadVariant2D(vIdx, sIdx)}
-                              title={`Noise Level: ${v.noise_level.toFixed(2)} (${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)} Delta), Seed: ${s.seed || 'Pending'} (${s.isReady ? 'Ready - Click to audition' : isGenerating ? 'Generating...' : 'In Queue'})`}
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-            
-            {/* Legend */}
-            <div className="monitor-modal-legend">
-              <div className="legend-item"><span className="legend-modal-dot ready"></span>Ready to Audition</div>
-              <div className="legend-item"><span className="legend-modal-dot generating"></span>Metal GPU Rendering</div>
-              <div className="legend-item"><span className="legend-modal-dot active"></span>Currently Playing</div>
-              <div className="legend-item"><span className="legend-modal-dot pending"></span>Queued / Pending</div>
-            </div>
-          </div>
-        </div>
       </main>
     </div>
   );

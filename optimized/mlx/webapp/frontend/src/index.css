@@ -1363,49 +1363,19 @@ body {
 /* --------------------------------------------------------
    2D Matrix Generation Monitor (Fullscreen Centered Modal)
    -------------------------------------------------------- */
-/* Full-Screen Monitor Backdrop */
-.monitor-backdrop {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
-  height: 100vh;
-  background: rgba(0, 0, 0, 0.75);
-  backdrop-filter: blur(15px);
-  z-index: 200; /* Float above everything including history drawer */
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.monitor-backdrop.open {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-/* Widescreen Matrix Diagnostic Modal */
-.matrix-monitor-modal {
-  width: 90%;
-  max-width: 760px;
-  max-height: 85vh;
-  background: #060606;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 24px;
-  padding: 1.8rem;
+/* Static Matrix Generation Monitor Panel */
+.matrix-monitor-panel {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.005);
+  border: 1px solid var(--border-color);
+  border-radius: 18px;
+  padding: 1.5rem;
   display: flex;
   flex-direction: column;
+  backdrop-filter: blur(5px);
   box-shadow: 
-    0 25px 60px rgba(0, 0, 0, 0.95),
-    0 0 40px rgba(0, 240, 255, 0.02);
-  transform: scale(0.95) translateY(10px);
-  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.monitor-backdrop.open .matrix-monitor-modal {
-  transform: scale(1) translateY(0);
+    0 10px 30px rgba(0, 0, 0, 0.5),
+    inset 0 1px 1px rgba(255, 255, 255, 0.02);
 }
 
 .monitor-modal-header {
