@@ -210,6 +210,9 @@ class StableAudioEngine:
         prompt: str,
         negative_prompt: str = None,
         init_audio_path: str = None,
+        init_audio_path_2: str = None,
+        blend_ratio: float = 0.5,
+        blend_method: str = None,
         init_noise_level: float = 1.0,
         inpaint_range: tuple[float, float] = None,
         seconds: float = 30.0,
@@ -307,23 +310,44 @@ class StableAudioEngine:
             t0 = time.time()
             enc_model, pad_mod = self.load_encoder(decoder_name, mx.float32)
             
-            # Read and pad/trim audio
-            audio_np = self.read_wav(init_audio_path)
-            if audio_np.shape[-1] >= target_samples:
-                audio_np = audio_np[:, :target_samples]
+            def prep_audio(path: str):
+                arr = self.read_wav(path)
+                if arr.shape[-1] >= target_samples:
+                    arr = arr[:, :target_samples]
+                else:
+                    pad = target_samples - arr.shape[-1]
+                    arr = np.pad(arr, ((0, 0), (0, pad)), mode="constant")
+                return arr
+
+            def encode_waveform_to_latents(arr: np.ndarray):
+                arr_batch = arr[None, ...]  # Add batch dimension: (1, 2, T)
+                patches = self.patch_audio(arr_batch, patch_size=256)
+                assert patches.shape[-1] % pad_mod == 0
+                latents = enc_model(mx.array(patches))
+                mx.eval(latents)
+                return latents.astype(dtype)
+
+            audio_np = prep_audio(init_audio_path)
+
+            if init_audio_path_2 and blend_method == "waveform":
+                print(f"[Engine] Performing Pre-Encoder Waveform Mix (A vs B ratio = {blend_ratio:.2f})")
+                audio_np_2 = prep_audio(init_audio_path_2)
+                audio_np = (1.0 - blend_ratio) * audio_np + blend_ratio * audio_np_2
+                # Anti-clipping peak normalization
+                max_val = np.max(np.abs(audio_np))
+                if max_val > 1.0:
+                    audio_np = audio_np / max_val
+                init_latents = encode_waveform_to_latents(audio_np)
+            elif init_audio_path_2 and blend_method == "latent_linear":
+                print(f"[Engine] Performing Post-Encoder Latent Linear Mix (A vs B ratio = {blend_ratio:.2f})")
+                audio_np_2 = prep_audio(init_audio_path_2)
+                z_1 = encode_waveform_to_latents(audio_np)
+                z_2 = encode_waveform_to_latents(audio_np_2)
+                init_latents = (1.0 - blend_ratio) * z_1 + blend_ratio * z_2
+                mx.eval(init_latents)
             else:
-                pad = target_samples - audio_np.shape[-1]
-                audio_np = np.pad(audio_np, ((0, 0), (0, pad)), mode="constant")
-            
-            audio_np = audio_np[None, ...]  # Add batch dimension: (1, 2, T)
-            patches_np = self.patch_audio(audio_np, patch_size=256)
-            
-            # Sanity check for encoder padding modulo
-            assert patches_np.shape[-1] % pad_mod == 0
-            
-            init_latents = enc_model(mx.array(patches_np))
-            mx.eval(init_latents)
-            init_latents = init_latents.astype(dtype)
+                init_latents = encode_waveform_to_latents(audio_np)
+
             print(f"[Engine] Init audio encode finished in {(time.time()-t0)*1000:.0f} ms")
             
             if free_models:

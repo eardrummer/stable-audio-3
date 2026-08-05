@@ -70,6 +70,9 @@ class GenerateRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
     init_audio_path: Optional[str] = None
+    init_audio_path_2: Optional[str] = None
+    blend_ratio: float = 0.5
+    blend_method: Optional[str] = None
     init_noise_level: float = 1.0
     inpaint_start: Optional[float] = None
     inpaint_end: Optional[float] = None
@@ -83,6 +86,17 @@ class GenerateRequest(BaseModel):
     free_models: bool = False
     connection_id: str
     save_history: bool = True  # Toggle to disable history saving
+
+def resolve_audio_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    if "/api/audio/" in path:
+        parts = path.split("/api/audio/")[-1].split("/")
+        return str(engine.output_dir / Path(*parts))
+    elif "/api/uploads/" in path:
+        filename = path.split("/api/uploads/")[-1]
+        return str(engine.upload_dir / filename)
+    return path
 
 @app.get("/api/status")
 def get_status():
@@ -211,15 +225,9 @@ def execute_background_generation_queue(
     # 5 seed variations (Seed offsets)
     seed_offsets = [0, 100001, 200002, 300003, 400004]
     
-    # Resolve init_audio_path to local server paths
-    init_audio_path = req.init_audio_path
-    if init_audio_path:
-        if "/api/audio/" in init_audio_path:
-            parts = init_audio_path.split("/api/audio/")[-1].split("/")
-            init_audio_path = str(engine.output_dir / Path(*parts))
-        elif "/api/uploads/" in init_audio_path:
-            filename = init_audio_path.split("/api/uploads/")[-1]
-            init_audio_path = str(engine.upload_dir / filename)
+    # Resolve audio paths to local server paths
+    init_audio_path = resolve_audio_path(req.init_audio_path)
+    init_audio_path_2 = resolve_audio_path(req.init_audio_path_2)
 
     inpaint_range = None
     if req.inpaint_start is not None and req.inpaint_end is not None:
@@ -272,6 +280,9 @@ def execute_background_generation_queue(
                 prompt=req.prompt,
                 negative_prompt=req.negative_prompt,
                 init_audio_path=init_audio_path,
+                init_audio_path_2=init_audio_path_2,
+                blend_ratio=req.blend_ratio,
+                blend_method=req.blend_method,
                 init_noise_level=noise_level,
                 inpaint_range=inpaint_range,
                 seconds=req.seconds,
@@ -392,15 +403,8 @@ def generate_audio(req: GenerateRequest, background_tasks: BackgroundTasks):
         inpaint_range = (req.inpaint_start, req.inpaint_end)
 
     # Resolve web URLs to local server paths automatically
-    init_audio_path = req.init_audio_path
-    if init_audio_path:
-        if "/api/audio/" in init_audio_path:
-            # Handle nested paths
-            parts = init_audio_path.split("/api/audio/")[-1].split("/")
-            init_audio_path = str(engine.output_dir / Path(*parts))
-        elif "/api/uploads/" in init_audio_path:
-            filename = init_audio_path.split("/api/uploads/")[-1]
-            init_audio_path = str(engine.upload_dir / filename)
+    init_audio_path = resolve_audio_path(req.init_audio_path)
+    init_audio_path_2 = resolve_audio_path(req.init_audio_path_2)
 
     # Pre-generate concrete seed here to ensure total determinism
     actual_seed = req.seed
@@ -422,6 +426,9 @@ def generate_audio(req: GenerateRequest, background_tasks: BackgroundTasks):
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
             init_audio_path=init_audio_path,
+            init_audio_path_2=init_audio_path_2,
+            blend_ratio=req.blend_ratio,
+            blend_method=req.blend_method,
             init_noise_level=req.init_noise_level,
             inpaint_range=inpaint_range,
             seconds=req.seconds,

@@ -130,8 +130,13 @@ export default function App() {
   const [prompt, setPrompt] = useState('');
   const [negativePrompt, setNegativePrompt] = useState('');
   const [useNegPrompt, setUseNegPrompt] = useState(false);
-  
-  // Audio Source (Input) States
+
+  // Audio Blending Tab States
+  const [sourceMode, setSourceMode] = useState<'single' | 'blend'>('single');
+  const [blendRatio, setBlendRatio] = useState<number>(0.5); // A vs B blend (0.0 to 1.0)
+  const [blendMethod, setBlendMethod] = useState<'waveform' | 'latent_linear' | 'latent_slerp' | 'asymmetric_noise' | 'vector_field'>('waveform');
+
+  // Audio Source (Input 1) States
   const [initAudio, setInitAudio] = useState<{
     filename: string;
     local_path: string;
@@ -143,6 +148,18 @@ export default function App() {
   const [sourceProgress, setSourceProgress] = useState(0);
   const [sourceVolume, setSourceVolume] = useState(1.0); // 0.0 - 1.0
   const [inpaintRange, setInpaintRange] = useState<[number, number] | null>(null);
+
+  // Audio Source (Input 2) States
+  const [initAudio2, setInitAudio2] = useState<{
+    filename: string;
+    local_path: string;
+    duration: number;
+    wav_url: string;
+  } | null>(null);
+  const [activeSourceUrl2, setActiveSourceUrl2] = useState<string | null>(null);
+  const [isSourcePlaying2, setIsSourcePlaying2] = useState(false);
+  const [sourceProgress2, setSourceProgress2] = useState(0);
+  const [sourceVolume2, setSourceVolume2] = useState(1.0); // 0.0 - 1.0
   
   // Generated Audio (Output) States
   const [generatedAudio, setGeneratedAudio] = useState<{
@@ -168,7 +185,9 @@ export default function App() {
   // Recording States
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
+  const [recordingTarget, setRecordingTarget] = useState<1 | 2>(1); // Which source is recording
   const [audioUploadLoading, setAudioUploadLoading] = useState(false);
+  const [audioUploadLoading2, setAudioUploadLoading2] = useState(false);
   
   // Generation Settings
   const [ditName, setDitName] = useState<'sm-music' | 'sm-sfx' | 'medium'>('sm-music');
@@ -211,12 +230,16 @@ export default function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const recordTimerRef = useRef<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef2 = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   
   // Wavesurfer Refs
   const sourceWavesurferRef = useRef<WaveSurfer | null>(null);
   const sourceContainerRef = useRef<HTMLDivElement>(null);
   const sourceRegionsRef = useRef<any>(null);
+
+  const sourceWavesurferRef2 = useRef<WaveSurfer | null>(null);
+  const sourceContainerRef2 = useRef<HTMLDivElement>(null);
 
   const outputWavesurferRef = useRef<WaveSurfer | null>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
@@ -233,6 +256,12 @@ export default function App() {
   const sourceAnalyserRef = useRef<AnalyserNode | null>(null);
   const connectedSourceMediaRef = useRef<HTMLMediaElement | null>(null);
   const sourceAnimationRef = useRef<number | null>(null);
+
+  // Web Audio Context & Analyser Refs (Source 2)
+  const sourceAudioCtxRef2 = useRef<AudioContext | null>(null);
+  const sourceAnalyserRef2 = useRef<AnalyserNode | null>(null);
+  const connectedSourceMediaRef2 = useRef<HTMLMediaElement | null>(null);
+  const sourceAnimationRef2 = useRef<number | null>(null);
 
   // Web Audio Context & Analyser Refs (Output)
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
@@ -438,6 +467,62 @@ export default function App() {
     };
   }, [activeSourceUrl, isGenerating]);
 
+  // 2b. Load Source 2 Wavesurfer when active source URL 2 changes
+  useEffect(() => {
+    if (!activeSourceUrl2 || !sourceContainerRef2.current) return;
+
+    if (sourceWavesurferRef2.current) {
+      sourceWavesurferRef2.current.destroy();
+      sourceWavesurferRef2.current = null;
+    }
+
+    const ws = WaveSurfer.create({
+      container: sourceContainerRef2.current,
+      waveColor: 'rgba(255, 255, 255, 0.12)',
+      progressColor: '#00f0ff',
+      cursorColor: '#ffffff',
+      cursorWidth: 2,
+      barWidth: 2,
+      barGap: 3,
+      height: 80,
+      normalize: true,
+      fillParent: true
+    });
+
+    sourceWavesurferRef2.current = ws;
+    ws.setVolume(sourceVolume2 * masterVolume);
+
+    ws.on('ready', () => {
+      setIsSourcePlaying2(false);
+      setSourceProgress2(0);
+    });
+
+    ws.on('audioprocess', () => {
+      const current = ws.getCurrentTime();
+      const dur = ws.getDuration();
+      setSourceProgress2(dur > 0 ? (current / dur) * 100 : 0);
+    });
+
+    ws.on('finish', () => {
+      if (isLoopingRef.current) {
+        ws.play();
+      } else {
+        setIsSourcePlaying2(false);
+        setIsGlobalPlaying(false);
+        setSourceProgress2(0);
+      }
+    });
+
+    ws.load(activeSourceUrl2);
+
+    return () => {
+      if (ws) {
+        ws.destroy();
+        sourceWavesurferRef2.current = null;
+      }
+    };
+  }, [activeSourceUrl2, isGenerating]);
+
   // 3. Load Output Wavesurfer when active output URL changes
   useEffect(() => {
     if (!activeOutputUrl || !outputContainerRef.current) return;
@@ -540,6 +625,33 @@ export default function App() {
     }
   };
 
+  // Web Audio Binder (Source 2)
+  const setupSourceWebAudio2 = (mediaElement: HTMLMediaElement) => {
+    let audioCtx = sourceAudioCtxRef2.current;
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      sourceAudioCtxRef2.current = audioCtx;
+    }
+    
+    if (connectedSourceMediaRef2.current === mediaElement) return;
+    
+    try {
+      const sourceNode = audioCtx.createMediaElementSource(mediaElement);
+      let analyserNode = sourceAnalyserRef2.current;
+      if (!analyserNode) {
+        analyserNode = audioCtx.createAnalyser();
+        analyserNode.fftSize = 512; // 256 frequency bins
+        sourceAnalyserRef2.current = analyserNode;
+      }
+      
+      sourceNode.connect(analyserNode);
+      analyserNode.connect(audioCtx.destination);
+      connectedSourceMediaRef2.current = mediaElement;
+    } catch (e) {
+      console.warn("[WebAudio] Failed to bind source 2 media element:", e);
+    }
+  };
+
   // Web Audio Binder (Output Column)
   const setupOutputWebAudio = (mediaElement: HTMLMediaElement) => {
     let audioCtx = outputAudioCtxRef.current;
@@ -611,6 +723,50 @@ export default function App() {
     };
   }, [isSourcePlaying, activeSourceUrl]);
 
+  // 4b. Source 2 Spectrogram Animation Loop
+  useEffect(() => {
+    const canvas = sourceCanvasRef.current;
+    const ws = sourceWavesurferRef2.current;
+    
+    if (!canvas || !ws || !isSourcePlaying2) {
+      if (sourceAnimationRef2.current) {
+        cancelAnimationFrame(sourceAnimationRef2.current);
+        sourceAnimationRef2.current = null;
+      }
+      return;
+    }
+    
+    const media = ws.getMediaElement();
+    if (media) {
+      setupSourceWebAudio2(media);
+    }
+    
+    const analyser = sourceAnalyserRef2.current;
+    if (!analyser) return;
+    
+    if (sourceAudioCtxRef2.current && sourceAudioCtxRef2.current.state === 'suspended') {
+      sourceAudioCtxRef2.current.resume();
+    }
+    
+    const render = () => {
+      if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
+        canvas.width = canvas.clientWidth;
+        canvas.height = canvas.clientHeight;
+      }
+      drawSpectrogram(canvas, analyser, 'cyan');
+      sourceAnimationRef2.current = requestAnimationFrame(render);
+    };
+    
+    render();
+    
+    return () => {
+      if (sourceAnimationRef2.current) {
+        cancelAnimationFrame(sourceAnimationRef2.current);
+        sourceAnimationRef2.current = null;
+      }
+    };
+  }, [isSourcePlaying2, activeSourceUrl2]);
+
   // 5. Output Spectrogram Animation Loop
   useEffect(() => {
     const canvas = outputCanvasRef.current;
@@ -678,6 +834,7 @@ export default function App() {
 
   // Drag & Drop / File Upload Handlers
   const [dragOver, setDragOver] = useState(false);
+  const [dragOver2, setDragOver2] = useState(false);
   
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -694,19 +851,39 @@ export default function App() {
     
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const file = e.dataTransfer.files[0];
-      await uploadFile(file);
+      await uploadFile(file, 1);
     }
   };
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleDragOver2 = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver2(true);
+  };
+  
+  const handleDragLeave2 = () => {
+    setDragOver2(false);
+  };
+  
+  const handleDrop2 = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver2(false);
+    
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const file = e.dataTransfer.files[0];
+      await uploadFile(file, 2);
+    }
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>, target: 1 | 2) => {
     if (e.target.files && e.target.files.length > 0) {
       const file = e.target.files[0];
-      await uploadFile(file);
+      await uploadFile(file, target);
     }
   };
 
-  const uploadFile = async (file: File) => {
-    setAudioUploadLoading(true);
+  const uploadFile = async (file: File, target: 1 | 2) => {
+    if (target === 1) setAudioUploadLoading(true);
+    else setAudioUploadLoading2(true);
     setErrorMsg(null);
     
     const formData = new FormData();
@@ -724,27 +901,35 @@ export default function App() {
       }
       
       const data = await res.json();
-      setInitAudio({
+      const payload = {
         filename: data.filename,
         local_path: data.local_path,
         duration: data.duration,
         wav_url: `${API_URL}${data.wav_url}`
-      });
-      
-      setActiveSourceUrl(`${API_URL}${data.wav_url}`);
-      setInpaintRange(null);
+      };
+
+      if (target === 1) {
+        setInitAudio(payload);
+        setActiveSourceUrl(`${API_URL}${data.wav_url}`);
+        setInpaintRange(null);
+      } else {
+        setInitAudio2(payload);
+        setActiveSourceUrl2(`${API_URL}${data.wav_url}`);
+      }
     } catch (e: any) {
       setErrorMsg(e.message);
     } finally {
-      setAudioUploadLoading(false);
+      if (target === 1) setAudioUploadLoading(false);
+      else setAudioUploadLoading2(false);
     }
   };
 
   // Mic Recording
-  const startRecording = async () => {
+  const startRecording = async (target: 1 | 2) => {
     setErrorMsg(null);
     audioChunksRef.current = [];
     setRecordingTime(0);
+    setRecordingTarget(target);
     
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -759,8 +944,8 @@ export default function App() {
       
       mediaRecorder.onstop = async () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        const file = new File([audioBlob], 'mic_recording.webm', { type: 'audio/webm' });
-        await uploadFile(file);
+        const file = new File([audioBlob], `mic_recording_${target}.webm`, { type: 'audio/webm' });
+        await uploadFile(file, target);
         stream.getTracks().forEach(track => track.stop());
       };
       
@@ -850,6 +1035,14 @@ export default function App() {
     }
   };
 
+  const handleSourceVolumeChange2 = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const vol = Number(e.target.value);
+    setSourceVolume2(vol);
+    if (sourceWavesurferRef2.current) {
+      sourceWavesurferRef2.current.setVolume(vol * masterVolume);
+    }
+  };
+
   const handleOutputVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const vol = Number(e.target.value);
     setOutputVolume(vol);
@@ -864,6 +1057,9 @@ export default function App() {
     if (sourceWavesurferRef.current) {
       sourceWavesurferRef.current.setVolume(sourceVolume * vol);
     }
+    if (sourceWavesurferRef2.current) {
+      sourceWavesurferRef2.current.setVolume(sourceVolume2 * vol);
+    }
     if (outputWavesurferRef.current) {
       outputWavesurferRef.current.setVolume(outputVolume * vol);
     }
@@ -875,6 +1071,7 @@ export default function App() {
     setIsGlobalPlaying(newState);
     
     const sourceWS = sourceWavesurferRef.current;
+    const sourceWS2 = sourceWavesurferRef2.current;
     const outputWS = outputWavesurferRef.current;
     
     if (newState) {
@@ -886,31 +1083,47 @@ export default function App() {
         }
         sourceWS.play();
         outputWS.play();
+        setIsSourcePlaying(true);
       }
-      setIsSourcePlaying(true);
+      if (sourceMode === 'blend' && sourceWS2) {
+        if (sourceWS2.getCurrentTime() >= sourceWS2.getDuration()) {
+          sourceWS2.setTime(0);
+        }
+        sourceWS2.play();
+        setIsSourcePlaying2(true);
+      }
       setIsOutputPlaying(true);
     } else {
-      if (sourceWS) sourceWS.pause();
-      if (outputWS) outputWS.pause();
-      setIsSourcePlaying(false);
-      setIsOutputPlaying(false);
+      if (sourceWS) {
+        sourceWS.pause();
+        setIsSourcePlaying(false);
+      }
+      if (sourceWS2) {
+        sourceWS2.pause();
+        setIsSourcePlaying2(false);
+      }
+      if (outputWS) {
+        outputWS.pause();
+        setIsOutputPlaying(false);
+      }
     }
   };
 
   // Sync Playheads & Return to Zero (Rewind to Start)
   const handleSyncPlayheads = () => {
     const sourceWS = sourceWavesurferRef.current;
+    const sourceWS2 = sourceWavesurferRef2.current;
     const outputWS = outputWavesurferRef.current;
     
-    if (sourceWS && outputWS) {
-      sourceWS.setTime(0);
-      outputWS.setTime(0);
-      
-      // If global sync is rolling, keep them playing together from 0
-      if (isGlobalPlaying) {
-        sourceWS.play();
-        outputWS.play();
-      }
+    if (sourceWS) sourceWS.setTime(0);
+    if (sourceWS2) sourceWS2.setTime(0);
+    if (outputWS) outputWS.setTime(0);
+
+    // If global sync is rolling, keep them playing together from 0
+    if (isGlobalPlaying) {
+      if (sourceWS) sourceWS.play();
+      if (sourceMode === 'blend' && sourceWS2) sourceWS2.play();
+      if (outputWS) outputWS.play();
     }
   };
 
@@ -1020,9 +1233,16 @@ export default function App() {
 
   // Trigger Generation
   const handleGenerate = async () => {
-    if (!prompt.trim() && !initAudio) {
-      setErrorMsg('Please enter a prompt or load an initial audio file.');
-      return;
+    if (sourceMode === 'single') {
+      if (!prompt.trim() && !initAudio) {
+        setErrorMsg('Please enter a prompt or load an initial audio file.');
+        return;
+      }
+    } else {
+      if (!initAudio || !initAudio2) {
+        setErrorMsg('Dual Audio Blend mode requires both Source A and Source B to be uploaded.');
+        return;
+      }
     }
     
     setIsGenerating(true);
@@ -1065,30 +1285,39 @@ export default function App() {
       save_history: saveHistory  // Support memory toggle!
     };
 
-    if (activeTab === 'generate_a') {
-      if (initAudio) {
-        payload.init_audio_path = initAudio.wav_url;
-        payload.init_noise_level = noiseLevel;
-        payload.seconds = initAudio.duration;
-        
-        if (inpaintRange) {
-          payload.inpaint_start = inpaintRange[0];
-          payload.inpaint_end = inpaintRange[1];
+    if (sourceMode === 'blend') {
+      payload.init_audio_path = initAudio!.wav_url;
+      payload.init_audio_path_2 = initAudio2!.wav_url;
+      payload.blend_ratio = blendRatio;
+      payload.blend_method = blendMethod;
+      payload.init_noise_level = noiseLevel;
+      payload.seconds = Math.max(initAudio!.duration, initAudio2!.duration);
+    } else {
+      if (activeTab === 'generate_a') {
+        if (initAudio) {
+          payload.init_audio_path = initAudio.wav_url;
+          payload.init_noise_level = noiseLevel;
+          payload.seconds = initAudio.duration;
+          
+          if (inpaintRange) {
+            payload.inpaint_start = inpaintRange[0];
+            payload.inpaint_end = inpaintRange[1];
+          }
+        } else {
+          payload.seconds = 30.0;
         }
       } else {
-        payload.seconds = 30.0;
+        if (!initAudio) {
+          setErrorMsg('Extend option requires an initial audio file.');
+          setIsGenerating(false);
+          return;
+        }
+        payload.init_audio_path = initAudio.wav_url;
+        payload.init_noise_level = 1.0;
+        payload.seconds = initAudio.duration + extendLength;
+        payload.inpaint_start = initAudio.duration;
+        payload.inpaint_end = initAudio.duration + extendLength;
       }
-    } else {
-      if (!initAudio) {
-        setErrorMsg('Extend option requires an initial audio file.');
-        setIsGenerating(false);
-        return;
-      }
-      payload.init_audio_path = initAudio.wav_url;
-      payload.init_noise_level = 1.0;
-      payload.seconds = initAudio.duration + extendLength;
-      payload.inpaint_start = initAudio.duration;
-      payload.inpaint_end = initAudio.duration + extendLength;
     }
 
     try {
@@ -1218,6 +1447,14 @@ export default function App() {
     if (sourceWavesurferRef.current) {
       sourceWavesurferRef.current.playPause();
       setIsSourcePlaying(!isSourcePlaying);
+      setIsGlobalPlaying(false);
+    }
+  };
+
+  const handlePlayPauseSource2 = () => {
+    if (sourceWavesurferRef2.current) {
+      sourceWavesurferRef2.current.playPause();
+      setIsSourcePlaying2(!isSourcePlaying2);
       setIsGlobalPlaying(false);
     }
   };
@@ -1573,133 +1810,331 @@ export default function App() {
             {/* LEFT COLUMN: AUDIO SOURCE (INPUT) */}
             <div className="split-column left">
               
-              {/* Source Volume Slider */}
-              <div className="volume-control-group">
-                <div className="volume-header">
-                  <span>Source Volume</span>
-                  <span className="volume-value">{Math.round(sourceVolume * 100)}%</span>
-                </div>
-                <input 
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={sourceVolume}
-                  onChange={handleSourceVolumeChange}
-                  className="slider-input"
-                />
+              {/* Single Source vs Dual Source Blend Toggle */}
+              <div className="parameters-box-header-tabs" style={{ marginBottom: '1rem' }}>
+                <button 
+                  className={`model-tab-btn ${sourceMode === 'single' ? 'active' : ''}`}
+                  onClick={() => setSourceMode('single')}
+                >
+                  Single Source
+                </button>
+                <button 
+                  className={`model-tab-btn ${sourceMode === 'blend' ? 'active' : ''}`}
+                  onClick={() => setSourceMode('blend')}
+                >
+                  Dual Source Blend
+                </button>
               </div>
 
-              {/* Source Audio Waveform Box / Live Recording */}
-              {isRecording ? (
-                <div className="waveform-box source-box" style={{ borderColor: 'rgba(255, 59, 48, 0.3)' }}>
-                  <div className="waveform-meta-row">
-                    <span className="waveform-label" style={{ color: 'var(--accent-red)' }}>
-                      Recording Live Microphone Input...
-                    </span>
-                    <span className="recording-timer" style={{ color: 'var(--accent-red)' }}>{recordingTime}s</span>
+              {sourceMode === 'single' ? (
+                <>
+                  {/* Source Volume Slider */}
+                  <div className="volume-control-group">
+                    <div className="volume-header">
+                      <span>Source Volume</span>
+                      <span className="volume-value">{Math.round(sourceVolume * 100)}%</span>
+                    </div>
+                    <input 
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={sourceVolume}
+                      onChange={handleSourceVolumeChange}
+                      className="slider-input"
+                    />
                   </div>
-                  
-                  <canvas ref={canvasRef} className="live-recorder-canvas" width={800} height={80} />
-                  
-                  <div className="waveform-playback-controls">
-                    <button 
-                      className="btn-play-center"
-                      style={{ borderColor: 'var(--accent-red)', color: 'var(--accent-red)', background: 'rgba(255, 59, 48, 0.05)' }}
-                      onClick={stopRecording}
-                      title="Stop Recording"
+
+                  {/* Source Audio Waveform Box / Live Recording */}
+                  {isRecording && recordingTarget === 1 ? (
+                    <div className="waveform-box source-box" style={{ borderColor: 'rgba(255, 59, 48, 0.3)' }}>
+                      <div className="waveform-meta-row">
+                        <span className="waveform-label" style={{ color: 'var(--accent-red)' }}>
+                          Recording Live Microphone Input...
+                        </span>
+                        <span className="recording-timer" style={{ color: 'var(--accent-red)' }}>{recordingTime}s</span>
+                      </div>
+                      
+                      <canvas ref={canvasRef} className="live-recorder-canvas" width={800} height={80} />
+                      
+                      <div className="waveform-playback-controls">
+                        <button 
+                          className="btn-play-center"
+                          style={{ borderColor: 'var(--accent-red)', color: 'var(--accent-red)', background: 'rgba(255, 59, 48, 0.05)' }}
+                          onClick={stopRecording}
+                          title="Stop Recording"
+                        >
+                          <Square size={16} fill="#ff3b30" />
+                        </button>
+                      </div>
+                    </div>
+                  ) : activeSourceUrl ? (
+                    <div className="waveform-box source-box">
+                      <div className="waveform-meta-row">
+                        <span className="waveform-label">
+                          <Music size={14} />
+                          Source Audio Waveform
+                        </span>
+                        <span className="waveform-filename-text">
+                          {initAudio ? initAudio.filename : 'source_audio.wav'}
+                        </span>
+                      </div>
+                      
+                      <div className="wavesurfer-wave" ref={sourceContainerRef}></div>
+                      
+                      {inpaintRange && (
+                        <div className="region-info-overlay">
+                          <span>Inpaint Start: {inpaintRange[0]}s</span>
+                          <span>Inpaint End: {inpaintRange[1]}s</span>
+                          <span>Duration: {(inpaintRange[1] - inpaintRange[0]).toFixed(2)}s</span>
+                        </div>
+                      )}
+
+                      <div className="waveform-playback-controls">
+                        <button 
+                          className="btn-play-center"
+                          onClick={handlePlayPauseSource}
+                          title={isSourcePlaying ? 'Pause' : 'Play'}
+                        >
+                          {isSourcePlaying ? <Square size={16} fill="#fff" /> : <Play size={16} fill="#fff" />}
+                        </button>
+
+                        {inpaintRange && (
+                          <button 
+                            className="btn-clear-region"
+                            onClick={handleClearSourceRegion}
+                          >
+                            Clear Region
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    /* Empty Symmetrical Upload Dropzone */
+                    <div 
+                      className={`waveform-box source-box ${dragOver ? 'drag-over' : ''}`}
+                      style={{ borderStyle: 'dashed', minHeight: '150px', justifyContent: 'center', alignItems: 'center', cursor: 'pointer' }}
+                      onClick={() => fileInputRef.current?.click()}
+                      onDragOver={handleDragOver}
+                      onDragLeave={handleDragLeave}
+                      onDrop={handleDrop}
                     >
-                      <Square size={16} fill="#ff3b30" />
-                    </button>
-                  </div>
-                </div>
-              ) : activeSourceUrl ? (
-                <div className="waveform-box source-box">
-                  <div className="waveform-meta-row">
-                    <span className="waveform-label">
-                      <Music size={14} />
-                      Source Audio Waveform
-                    </span>
-                    <span className="waveform-filename-text">
-                      {initAudio ? initAudio.filename : 'source_audio.wav'}
-                    </span>
-                  </div>
-                  
-                  <div className="wavesurfer-wave" ref={sourceContainerRef}></div>
-                  
-                  {inpaintRange && (
-                    <div className="region-info-overlay">
-                      <span>Inpaint Start: {inpaintRange[0]}s</span>
-                      <span>Inpaint End: {inpaintRange[1]}s</span>
-                      <span>Duration: {(inpaintRange[1] - inpaintRange[0]).toFixed(2)}s</span>
+                      <Upload size={24} style={{ color: 'var(--accent-cyan)', marginBottom: '0.5rem' }} />
+                      <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                        {audioUploadLoading ? 'Uploading...' : 'Drag & Drop source audio here'}
+                      </span>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                        or click to browse
+                      </span>
                     </div>
                   )}
 
-                  <div className="waveform-playback-controls">
-                    <button 
-                      className="btn-play-center"
-                      onClick={handlePlayPauseSource}
-                      title={isSourcePlaying ? 'Pause' : 'Play'}
-                    >
-                      {isSourcePlaying ? <Square size={16} fill="#fff" /> : <Play size={16} fill="#fff" />}
-                    </button>
-
-                    {inpaintRange && (
+                  {/* Upload & Record Buttons */}
+                  {!isRecording && (
+                    <div className="media-actions" style={{ borderTop: 'none', paddingTop: 0, marginBottom: '1.2rem' }}>
+                      <input 
+                        type="file" 
+                        id="audio-file" 
+                        ref={fileInputRef}
+                        onChange={(e) => handleFileChange(e, 1)}
+                        accept="audio/*" 
+                        style={{ display: 'none' }} 
+                      />
                       <button 
-                        className="btn-clear-region"
-                        onClick={handleClearSourceRegion}
+                        className="upload-btn-label"
+                        onClick={() => fileInputRef.current?.click()}
                       >
-                        Clear Region
+                        <Upload size={14} />
+                        Upload Audio File
                       </button>
+                      <button 
+                        className="record-btn"
+                        onClick={() => startRecording(1)}
+                      >
+                        <Mic size={14} />
+                        Record Mic
+                      </button>
+                    </div>
+                  )}
+                </>
+              ) : (
+                /* DUAL AUDIO BLENDING MODE INPUTS */
+                <>
+                  {/* SOURCE 1 BLOCK */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', width: '100%' }}>
+                    <div className="volume-control-group">
+                      <div className="volume-header">
+                        <span style={{ fontSize: '0.7rem', letterSpacing: '0.05em', color: 'var(--text-secondary)' }}>SOURCE A VOLUME</span>
+                        <span className="volume-value">{Math.round(sourceVolume * 100)}%</span>
+                      </div>
+                      <input 
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={sourceVolume}
+                        onChange={handleSourceVolumeChange}
+                        className="slider-input"
+                      />
+                    </div>
+
+                    {isRecording && recordingTarget === 1 ? (
+                      <div className="waveform-box source-box" style={{ borderColor: 'rgba(255, 59, 48, 0.3)', minHeight: '120px' }}>
+                        <div className="waveform-meta-row">
+                          <span className="waveform-label" style={{ color: 'var(--accent-red)', fontSize: '0.7rem' }}>
+                            Recording A...
+                          </span>
+                          <span className="recording-timer" style={{ color: 'var(--accent-red)', fontSize: '0.7rem' }}>{recordingTime}s</span>
+                        </div>
+                        <canvas ref={canvasRef} className="live-recorder-canvas" width={800} height={40} style={{ height: '40px' }} />
+                        <div className="waveform-playback-controls">
+                          <button className="btn-play-center" onClick={stopRecording}><Square size={12} fill="#ff3b30" /></button>
+                        </div>
+                      </div>
+                    ) : activeSourceUrl ? (
+                      <div className="waveform-box source-box" style={{ padding: '1rem', gap: '0.8rem' }}>
+                        <div className="waveform-meta-row">
+                          <span className="waveform-label" style={{ fontSize: '0.7rem' }}><Music size={12} />SOURCE A</span>
+                          <span className="waveform-filename-text" style={{ fontSize: '0.65rem' }}>{initAudio?.filename}</span>
+                        </div>
+                        <div className="wavesurfer-wave" ref={sourceContainerRef} style={{ height: '60px' }}></div>
+                        <div className="waveform-playback-controls" style={{ marginTop: 0 }}>
+                          <button className="btn-play-center" onClick={handlePlayPauseSource}>
+                            {isSourcePlaying ? <Square size={12} fill="#fff" /> : <Play size={12} fill="#fff" />}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div 
+                        className={`waveform-box source-box ${dragOver ? 'drag-over' : ''}`}
+                        style={{ borderStyle: 'dashed', minHeight: '110px', justifyContent: 'center', alignItems: 'center', cursor: 'pointer', padding: '1rem' }}
+                        onClick={() => fileInputRef.current?.click()}
+                        onDragOver={handleDragOver}
+                        onDragLeave={handleDragLeave}
+                        onDrop={handleDrop}
+                      >
+                        <Upload size={16} style={{ color: 'var(--accent-cyan)', marginBottom: '0.2rem' }} />
+                        <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                          {audioUploadLoading ? 'Uploading A...' : 'Upload Source A'}
+                        </span>
+                      </div>
+                    )}
+
+                    {!isRecording && (
+                      <div className="media-actions" style={{ borderTop: 'none', paddingTop: 0, gap: '0.4rem', justifyContent: 'flex-start' }}>
+                        <input type="file" ref={fileInputRef} onChange={(e) => handleFileChange(e, 1)} accept="audio/*" style={{ display: 'none' }} />
+                        <button className="upload-btn-label" onClick={() => fileInputRef.current?.click()} style={{ padding: '0.3rem 0.6rem', fontSize: '0.65rem' }}><Upload size={10} />Upload A</button>
+                        <button className="record-btn" onClick={() => startRecording(1)} style={{ padding: '0.3rem 0.6rem', fontSize: '0.65rem' }}><Mic size={10} />Record A</button>
+                      </div>
                     )}
                   </div>
-                </div>
-              ) : (
-                /* Empty Symmetrical Upload Dropzone */
-                <div 
-                  className={`waveform-box source-box ${dragOver ? 'drag-over' : ''}`}
-                  style={{ borderStyle: 'dashed', minHeight: '180px', justifyContent: 'center', alignItems: 'center', cursor: 'pointer' }}
-                  onClick={() => fileInputRef.current?.click()}
-                  onDragOver={handleDragOver}
-                  onDragLeave={handleDragLeave}
-                  onDrop={handleDrop}
-                >
-                  <Upload size={24} style={{ color: 'var(--accent-cyan)', marginBottom: '0.5rem' }} />
-                  <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                    {audioUploadLoading ? 'Uploading...' : 'Drag & Drop source audio here'}
-                  </span>
-                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                    or click to browse
-                  </span>
-                </div>
-              )}
 
-              {/* Upload & Record Buttons */}
-              {!isRecording && (
-                <div className="media-actions" style={{ borderTop: 'none', paddingTop: 0 }}>
-                  <input 
-                    type="file" 
-                    id="audio-file" 
-                    ref={fileInputRef}
-                    onChange={handleFileChange}
-                    accept="audio/*" 
-                    style={{ display: 'none' }} 
-                  />
-                  <button 
-                    className="upload-btn-label"
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    <Upload size={14} />
-                    Upload Audio File
-                  </button>
-                  <button 
-                    className="record-btn"
-                    onClick={startRecording}
-                  >
-                    <Mic size={14} />
-                    Record Mic
-                  </button>
-                </div>
+                  {/* SOURCE 2 BLOCK */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', width: '100%', marginTop: '0.5rem' }}>
+                    <div className="volume-control-group">
+                      <div className="volume-header">
+                        <span style={{ fontSize: '0.7rem', letterSpacing: '0.05em', color: 'var(--text-secondary)' }}>SOURCE B VOLUME</span>
+                        <span className="volume-value">{Math.round(sourceVolume2 * 100)}%</span>
+                      </div>
+                      <input 
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={sourceVolume2}
+                        onChange={handleSourceVolumeChange2}
+                        className="slider-input"
+                      />
+                    </div>
+
+                    {isRecording && recordingTarget === 2 ? (
+                      <div className="waveform-box source-box" style={{ borderColor: 'rgba(255, 59, 48, 0.3)', minHeight: '120px' }}>
+                        <div className="waveform-meta-row">
+                          <span className="waveform-label" style={{ color: 'var(--accent-red)', fontSize: '0.7rem' }}>
+                            Recording B...
+                          </span>
+                          <span className="recording-timer" style={{ color: 'var(--accent-red)', fontSize: '0.7rem' }}>{recordingTime}s</span>
+                        </div>
+                        <canvas ref={canvasRef} className="live-recorder-canvas" width={800} height={40} style={{ height: '40px' }} />
+                        <div className="waveform-playback-controls">
+                          <button className="btn-play-center" onClick={stopRecording}><Square size={12} fill="#ff3b30" /></button>
+                        </div>
+                      </div>
+                    ) : activeSourceUrl2 ? (
+                      <div className="waveform-box source-box" style={{ padding: '1rem', gap: '0.8rem' }}>
+                        <div className="waveform-meta-row">
+                          <span className="waveform-label" style={{ fontSize: '0.7rem' }}><Music size={12} />SOURCE B</span>
+                          <span className="waveform-filename-text" style={{ fontSize: '0.65rem' }}>{initAudio2?.filename}</span>
+                        </div>
+                        <div className="wavesurfer-wave" ref={sourceContainerRef2} style={{ height: '60px' }}></div>
+                        <div className="waveform-playback-controls" style={{ marginTop: 0 }}>
+                          <button className="btn-play-center" onClick={handlePlayPauseSource2}>
+                            {isSourcePlaying2 ? <Square size={12} fill="#fff" /> : <Play size={12} fill="#fff" />}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div 
+                        className={`waveform-box source-box ${dragOver2 ? 'drag-over' : ''}`}
+                        style={{ borderStyle: 'dashed', minHeight: '110px', justifyContent: 'center', alignItems: 'center', cursor: 'pointer', padding: '1rem' }}
+                        onClick={() => fileInputRef2.current?.click()}
+                        onDragOver={handleDragOver2}
+                        onDragLeave={handleDragLeave2}
+                        onDrop={handleDrop2}
+                      >
+                        <Upload size={16} style={{ color: 'var(--accent-cyan)', marginBottom: '0.2rem' }} />
+                        <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                          {audioUploadLoading2 ? 'Uploading B...' : 'Upload Source B'}
+                        </span>
+                      </div>
+                    )}
+
+                    {!isRecording && (
+                      <div className="media-actions" style={{ borderTop: 'none', paddingTop: 0, gap: '0.4rem', justifyContent: 'flex-start', marginBottom: '0.8rem' }}>
+                        <input type="file" ref={fileInputRef2} onChange={(e) => handleFileChange(e, 2)} accept="audio/*" style={{ display: 'none' }} />
+                        <button className="upload-btn-label" onClick={() => fileInputRef2.current?.click()} style={{ padding: '0.3rem 0.6rem', fontSize: '0.65rem' }}><Upload size={10} />Upload B</button>
+                        <button className="record-btn" onClick={() => startRecording(2)} style={{ padding: '0.3rem 0.6rem', fontSize: '0.65rem' }}><Mic size={10} />Record B</button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* BLENDING SETTINGS BOX */}
+                  <div className="parameters-box" style={{ padding: '1rem', gap: '0.8rem', marginBottom: '1.2rem' }}>
+                    <div className="parameter-group">
+                      <div className="parameter-header">
+                        <span className="parameter-label" style={{ fontSize: '0.7rem' }}>BLEND RATIO (A VS B)</span>
+                        <span className="parameter-value" style={{ fontSize: '0.75rem' }}>{Math.round((1 - blendRatio) * 100)}% A / {Math.round(blendRatio * 100)}% B</span>
+                      </div>
+                      <input 
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.01"
+                        value={blendRatio}
+                        onChange={(e) => setBlendRatio(Number(e.target.value))}
+                        className="slider-input"
+                      />
+                    </div>
+
+                    <div className="parameter-group">
+                      <div className="parameter-header">
+                        <span className="parameter-label" style={{ fontSize: '0.7rem' }}>BLENDING METHOD EXPERIMENT</span>
+                      </div>
+                      <select 
+                        className="model-select-dropdown" 
+                        value={blendMethod} 
+                        onChange={(e) => setBlendMethod(e.target.value as any)}
+                        style={{ padding: '0.4rem', fontSize: '0.75rem', width: '100%' }}
+                      >
+                        <option value="waveform">A. Pre-Encoder Waveform Mix (Time Domain)</option>
+                        <option value="latent_linear">B. Post-Encoder Latent Linear Interpolation (Feature Morph)</option>
+                        <option value="latent_slerp">C. Spherical Latent Interpolation (Constant Energy Slerp) (TODO)</option>
+                        <option value="asymmetric_noise">D. Asymmetric Noising (Structural Mold) (TODO)</option>
+                        <option value="vector_field">E. Vector Field Interpolation (Dynamic compromise) (TODO)</option>
+                      </select>
+                    </div>
+                  </div>
+                </>
               )}
 
               {/* Text Prompt & Generation settings card moved under Source Audio */}
