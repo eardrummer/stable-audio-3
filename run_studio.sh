@@ -53,12 +53,28 @@ check_port() {
 check_port 8000 "FastAPI Backend"
 check_port 5173 "Vite Frontend"
 
+# Resolve Python Executable Dynamically
+PYTHON_CMD=""
+if [ -f "$VENV_DIR/bin/python" ] && "$VENV_DIR/bin/python" -c "import sys" 2>/dev/null; then
+    PYTHON_CMD="$VENV_DIR/bin/python"
+elif command -v uv &> /dev/null; then
+    PYTHON_CMD="uv run --directory $SCRIPT_DIR/optimized/mlx python"
+elif command -v python3 &> /dev/null && python3 -c "import mlx.core" 2>/dev/null; then
+    PYTHON_CMD="python3"
+else
+    echo -e "\033[31m[Error] Python environment not found or broken at $VENV_DIR.\033[0m"
+    echo -e "To set up this computer for the first time, run:"
+    echo -e "  \033[36mcd optimized/mlx && ./install.sh\033[0m"
+    echo -e "  \033[36mcd optimized/mlx/webapp/frontend && npm install\033[0m"
+    exit 1
+fi
+
 # 1. Start Backend
-echo "[Launcher] Starting FastAPI Backend..."
+echo "[Launcher] Starting FastAPI Backend using ($PYTHON_CMD)..."
 cd "$BACKEND_DIR" || exit 1
 
 # Launch backend in background and pipe logs to backend.log
-"$VENV_DIR/bin/python" -m uvicorn main:app --host 127.0.0.1 --port 8000 > "$BACKEND_DIR/backend.log" 2>&1 &
+$PYTHON_CMD -m uvicorn main:app --host 127.0.0.1 --port 8000 > "$BACKEND_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 
 # Wait a moment to ensure it booted successfully

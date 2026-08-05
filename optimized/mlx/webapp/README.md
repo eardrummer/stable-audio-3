@@ -142,13 +142,30 @@ huggingface_hub
 
 ## 🚀 How to Run the Workstation
 
-1. Open your terminal at the repository root.
-2. Execute the launcher script:
+### First-Time Setup on a New Computer
+If you have cloned this repository onto a new computer:
+
+1. **One-Time MLX & Weight Download**:
+   ```bash
+   cd optimized/mlx
+   ./install.sh
+   cd ../../..
+   ```
+   *This installs `uv` (if missing), creates a Python virtual environment, installs MLX dependencies, and downloads/caches the Stable Audio 3 weights.*
+
+2. **One-Time Frontend Setup**:
+   ```bash
+   cd optimized/mlx/webapp/frontend
+   npm install
+   cd ../../../..
+   ```
+
+3. **Launch the Studio**:
+   From the repository root:
    ```bash
    ./run_studio.sh
    ```
-3. Open your browser to **`http://localhost:5173`**.
-4. The FastAPI backend logs will be written to `optimized/mlx/webapp/backend/backend.log`.
+4. Open your browser to **`http://localhost:5173`**. (FastAPI logs will be written to `optimized/mlx/webapp/backend/backend.log`).
 
 ---
 
