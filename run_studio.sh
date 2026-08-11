@@ -69,6 +69,18 @@ else
     exit 1
 fi
 
+# Ensure required backend packages (uvicorn, fastapi, etc.) are installed
+if ! $PYTHON_CMD -c "import uvicorn, fastapi" 2>/dev/null; then
+    echo -e "\033[33m[Launcher] Missing backend web dependencies (fastapi, uvicorn). Installing...\033[0m"
+    if [ -f "$VENV_DIR/bin/python" ]; then
+        if command -v uv &> /dev/null; then
+            VIRTUAL_ENV="$VENV_DIR" uv pip install -r "$SCRIPT_DIR/optimized/mlx/requirements.txt"
+        else
+            "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/optimized/mlx/requirements.txt"
+        fi
+    fi
+fi
+
 # 1. Start Backend
 echo "[Launcher] Starting FastAPI Backend using ($PYTHON_CMD)..."
 cd "$BACKEND_DIR" || exit 1
