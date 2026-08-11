@@ -1,0 +1,10 @@
+# Stable Audio 3 & Studio Dependencies (Apple Silicon MLX)
+mlx>=0.30
+numpy>=1.24
+sentencepiece>=0.2
+huggingface_hub>=0.20
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+python-multipart>=0.0.9
+websockets>=12.0
+pydantic>=2.0
