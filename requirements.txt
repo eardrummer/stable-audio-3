@@ -1,5 +1,5 @@
 # Stable Audio 3 & Studio Dependencies (Apple Silicon MLX)
-mlx>=0.30
+mlx>=0.20.0
 numpy>=1.24
 sentencepiece>=0.2
 huggingface_hub>=0.20

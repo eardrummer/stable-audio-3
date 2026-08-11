@@ -11,7 +11,9 @@ cd "$SCRIPT_DIR"
 
 # 1. Detect Python Environment
 PYTHON_BIN="python3"
-if [ -f "$SCRIPT_DIR/.venv/bin/python3" ]; then
+if [ -f "$SCRIPT_DIR/optimized/mlx/.venv/bin/python3" ]; then
+    PYTHON_BIN="$SCRIPT_DIR/optimized/mlx/.venv/bin/python3"
+elif [ -f "$SCRIPT_DIR/.venv/bin/python3" ]; then
     PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
 elif [ -f "$SCRIPT_DIR/venv/bin/python3" ]; then
     PYTHON_BIN="$SCRIPT_DIR/venv/bin/python3"
