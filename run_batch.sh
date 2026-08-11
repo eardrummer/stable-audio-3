@@ -27,20 +27,20 @@ echo ""
 echo "======================================================================"
 echo " 🎛️  STABLE AUDIO 3 - BATCH VARIATION PROCESSOR"
 echo "======================================================================"
-echo "Processes a folder of audio files (e.g. from Google Drive) and creates"
-echo "a dedicated subfolder for each file with 5 noisier variants (+0.02)."
+echo "Processes a folder of audio files (or single file) and generates"
+echo "a dedicated subfolder with 5 noisier variants (+0.02 step)."
 echo "======================================================================"
 echo ""
 
-# Input Folder
+# Input Folder or File
 while true; do
-    read -r -p "📁 Enter Input Audio Folder (e.g. /path/to/Google Drive/Audio): " INPUT_DIR
+    read -r -p "📁 Enter Audio Folder OR File Path (e.g. /path/to/Google Drive/Audio): " INPUT_PATH
     # Expand tilde ~ if present
-    INPUT_DIR="${INPUT_DIR/#\~/$HOME}"
-    if [ -d "$INPUT_DIR" ]; then
+    INPUT_PATH="${INPUT_PATH/#\~/$HOME}"
+    if [ -d "$INPUT_PATH" ] || [ -f "$INPUT_PATH" ]; then
         break
     else
-        echo "❌ Directory not found. Please enter a valid folder path."
+        echo "❌ Path not found. Please enter a valid directory or audio file path."
     fi
 done
 
@@ -48,6 +48,15 @@ done
 read -r -p "📂 Enter Output Folder [default: ./batch_output]: " OUTPUT_DIR
 OUTPUT_DIR="${OUTPUT_DIR:-./batch_output}"
 OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+
+# Test Mode Option (if a directory was selected)
+TEST_FLAG=""
+if [ -d "$INPUT_PATH" ]; then
+    read -r -p "🧪 Run quick TEST on 1 file only? [y/N]: " TEST_CHOICE
+    if [[ "$TEST_CHOICE" =~ ^[Yy]$ ]]; then
+        TEST_FLAG="--test"
+    fi
+fi
 
 # Text Prompt
 read -r -p "💬 Global Text Prompt (press Enter for unconditional): " PROMPT
@@ -79,11 +88,11 @@ case "$MODEL_CHOICE" in
 esac
 
 echo ""
-echo "🚀 Starting Batch Processor..."
+echo "🚀 Starting Processor..."
 echo "----------------------------------------------------------------------"
 
 exec "$PYTHON_BIN" "$SCRIPT_DIR/batch_processor.py" \
-    --input-dir "$INPUT_DIR" \
+    --input-dir "$INPUT_PATH" \
     --output-dir "$OUTPUT_DIR" \
     --prompt "$PROMPT" \
     --noise "$NOISE_LEVEL" \
@@ -91,4 +100,5 @@ exec "$PYTHON_BIN" "$SCRIPT_DIR/batch_processor.py" \
     --variants 5 \
     --steps "$STEPS" \
     --cfg "$CFG" \
-    --model "$MODEL_NAME"
+    --model "$MODEL_NAME" \
+    $TEST_FLAG

@@ -2,7 +2,7 @@
 """
 Batch Audio Variation Processor for Stable Audio 3 (Apple Silicon MLX)
 
-Processes all audio files in an input directory (e.g. Google Drive folder)
+Processes audio files in an input directory (e.g. Google Drive folder) or a single audio file,
 and generates a dedicated folder for each file containing:
   - original.wav
   - 5 progressively noisier synthesized variants (+0.02 step)
@@ -36,10 +36,15 @@ def format_duration(seconds: float) -> str:
     secs = int(seconds % 60)
     return f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
 
-def get_audio_files(input_dir: Path, recursive: bool = False):
+def get_audio_files(input_path: Path, recursive: bool = False):
+    if input_path.is_file():
+        if input_path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            return [input_path]
+        return []
+    
     pattern = "**/*" if recursive else "*"
     files = [
-        f for f in input_dir.glob(pattern)
+        f for f in input_path.glob(pattern)
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS and not f.name.startswith('.')
     ]
     return sorted(files)
@@ -48,7 +53,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Stable Audio 3 - Batch Audio Variation Processor (MLX)"
     )
-    parser.add_argument("-i", "--input-dir", required=True, type=str, help="Input directory containing audio files (e.g. Google Drive folder)")
+    parser.add_argument("-i", "--input-dir", "-f", "--file", required=True, type=str, help="Input audio folder OR single audio file path (e.g. Google Drive)")
     parser.add_argument("-o", "--output-dir", default="./batch_output", type=str, help="Destination directory for output subfolders (default: ./batch_output)")
     parser.add_argument("-p", "--prompt", default="", type=str, help="Global text prompt to guide synthesis (optional, default: unconditional)")
     parser.add_argument("-n", "--noise", default=0.30, type=float, help="Base variation / noise level (default: 0.30)")
@@ -58,6 +63,8 @@ def main():
     parser.add_argument("-c", "--cfg", default=4.0, type=float, help="Classifier-Free Guidance strength (default: 4.0)")
     parser.add_argument("-m", "--model", default="sm-music", choices=["sm-music", "sm-sfx", "medium"], help="DiT model architecture (default: sm-music)")
     parser.add_argument("--seed", default=None, type=int, help="Base random seed (default: random per file)")
+    parser.add_argument("-t", "--test", action="store_true", help="Test mode: Process ONLY 1 audio file to verify settings")
+    parser.add_argument("-l", "--limit", default=None, type=int, help="Limit number of audio files to process")
     parser.add_argument("-r", "--recursive", action="store_true", help="Scan input directory recursively")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing completed folders instead of skipping")
 
@@ -66,24 +73,34 @@ def main():
     input_path = Path(args.input_dir).expanduser().resolve()
     output_path = Path(args.output_dir).expanduser().resolve()
 
-    if not input_path.exists() or not input_path.is_dir():
-        print(f"\n❌ Error: Input directory does not exist: {input_path}")
+    if not input_path.exists():
+        print(f"\n❌ Error: Input path does not exist: {input_path}")
         sys.exit(1)
 
     output_path.mkdir(parents=True, exist_ok=True)
 
     audio_files = get_audio_files(input_path, recursive=args.recursive)
     if not audio_files:
-        print(f"\n⚠️  No supported audio files found in: {input_path}")
+        print(f"\n⚠️  No supported audio files found at: {input_path}")
         print(f"Supported formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
         sys.exit(0)
 
+    # Apply test / limit filters
+    is_test_mode = args.test or (args.limit == 1)
+    if args.test:
+        audio_files = audio_files[:1]
+    elif args.limit is not None and args.limit > 0:
+        audio_files = audio_files[:args.limit]
+
     print("\n" + "="*70)
-    print(" 🎛️  STABLE AUDIO 3 - BATCH VARIATION PROCESSOR (MLX)")
+    if is_test_mode:
+        print(" 🧪 STABLE AUDIO 3 - SINGLE-FILE TEST RUN (MLX)")
+    else:
+        print(" 🎛️  STABLE AUDIO 3 - BATCH VARIATION PROCESSOR (MLX)")
     print("="*70)
-    print(f"📁 Input Folder:    {input_path}")
+    print(f"📁 Input Target:    {input_path}")
     print(f"📂 Output Folder:   {output_path}")
-    print(f"🎵 Audio Files:     {len(audio_files)} found")
+    print(f"🎵 Audio Files:     {len(audio_files)} to process" + (" (TEST MODE: 1 file)" if is_test_mode else ""))
     print(f"💬 Global Prompt:   \"{args.prompt}\"" if args.prompt else "💬 Global Prompt:   (Unconditional)")
     print(f"⚡ Model:           {args.model}")
     print(f"🎚️  Noise Curve:     {args.noise:.2f} base (+{args.delta:.2f} step x {args.variants} variants)")
@@ -206,8 +223,11 @@ def main():
 
     total_elapsed = time.time() - batch_start_time
     print("="*70)
-    print(f"🎉 BATCH PROCESSING COMPLETE!")
-    print(f"📊 Processed: {processed_count} files ({processed_count * args.variants} variants generated)")
+    if is_test_mode:
+        print("🎉 TEST RUN COMPLETE!")
+    else:
+        print("🎉 BATCH PROCESSING COMPLETE!")
+    print(f"📊 Processed: {processed_count} file(s) ({processed_count * args.variants} variants generated)")
     if skipped_count > 0:
         print(f"⏩ Skipped:   {skipped_count} files (already existed)")
     print(f"⏱️  Total Time: {format_duration(total_elapsed)}")
