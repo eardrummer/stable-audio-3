@@ -1440,6 +1440,69 @@ body {
   letter-spacing: 0.05em;
 }
 
+/* 2D Matrix Scrubber / Vertical Joystick */
+.matrix-grid-with-scrubber {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+  position: relative;
+  width: 100%;
+}
+
+.matrix-vertical-slider-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.015);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  padding: 8px 6px;
+  width: 48px;
+  flex-shrink: 0;
+}
+
+.vslider-header-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  font-family: monospace;
+}
+
+.vslider-text {
+  font-size: 0.55rem;
+  font-weight: 800;
+  color: var(--accent-cyan);
+  text-shadow: 0 0 6px var(--accent-cyan-glow);
+  white-space: nowrap;
+}
+
+.vslider-track-wrap {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100%;
+  min-height: 260px;
+  position: relative;
+}
+
+.matrix-vslider {
+  -webkit-appearance: slider-vertical;
+  writing-mode: bt-lr;
+  width: 16px;
+  height: 100%;
+  cursor: grab;
+  accent-color: var(--accent-cyan);
+  background: transparent;
+  outline: none;
+}
+
+.matrix-vslider:active {
+  cursor: grabbing;
+}
+
 .monitor-modal-grid-container {
   flex: 1;
   display: flex;

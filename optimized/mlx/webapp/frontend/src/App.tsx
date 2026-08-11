@@ -306,8 +306,9 @@ export default function App() {
   const outputWavesurferRef = useRef<WaveSurfer | null>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
 
-  // Playhead synchronization refs
-  const pendingPlayheadRef = useRef<{ time: number; play: boolean } | null>(null);
+  // Playhead synchronization & Smooth Crossfade refs
+  const pendingPlayheadRef = useRef<{ time: number; play: boolean; fadeIn?: boolean } | null>(null);
+  const outgoingAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Spectrogram Canvas Refs
   const sourceCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -631,18 +632,41 @@ export default function App() {
       setIsOutputPlaying(false);
       setOutputProgress(0);
 
-      // Synced Playhead Restoration!
+      // Synced Playhead & Smooth Crossfade Restoration!
       if (pendingPlayheadRef.current) {
-        const { time, play } = pendingPlayheadRef.current;
+        const { time, play, fadeIn } = pendingPlayheadRef.current;
         const duration = ws.getDuration();
         const seekTime = time < duration ? time : 0;
         ws.setTime(seekTime);
         
         if (play) {
-          ws.play();
-          setIsOutputPlaying(true);
+          const targetVol = outputVolume * masterVolume;
+          if (fadeIn) {
+            // Smooth 140ms equal-power fade-in to blend seamlessly with outgoing audio
+            ws.setVolume(0);
+            ws.play();
+            setIsOutputPlaying(true);
+
+            const startFade = Date.now();
+            const fadeDur = 140;
+            const stepFadeIn = () => {
+              const elapsed = Date.now() - startFade;
+              const prog = Math.min(1, elapsed / fadeDur);
+              // Linear volume ramp
+              ws.setVolume(targetVol * prog);
+              if (prog < 1) {
+                requestAnimationFrame(stepFadeIn);
+              }
+            };
+            requestAnimationFrame(stepFadeIn);
+          } else {
+            ws.setVolume(targetVol);
+            ws.play();
+            setIsOutputPlaying(true);
+          }
+
           // If global synced play was active, resume source too
-          if (isGlobalPlaying && sourceWavesurferRef.current) {
+          if (isGlobalPlaying && sourceWavesurferRef.current && !isSourcePlaying) {
             sourceWavesurferRef.current.play();
             setIsSourcePlaying(true);
           }
@@ -1496,14 +1520,48 @@ export default function App() {
         const currentTime = oldWS.getCurrentTime();
         const wasPlaying = isOutputPlaying || isGlobalPlaying;
         
-        // Save playhead & play state for restoration in 'ready'
-        pendingPlayheadRef.current = { time: currentTime, play: wasPlaying };
-        
-        // Pause old player
-        oldWS.pause();
-        
-        // Load new URL
-        setActiveOutputUrl(seedVar.wav_url);
+        if (wasPlaying && activeOutputUrl && activeOutputUrl !== seedVar.wav_url) {
+          // Smooth 140ms crossfade with small overlap between adjacent files
+          try {
+            if (outgoingAudioRef.current) {
+              outgoingAudioRef.current.pause();
+              outgoingAudioRef.current = null;
+            }
+            const outgoing = new Audio(activeOutputUrl);
+            outgoingAudioRef.current = outgoing;
+            outgoing.currentTime = currentTime;
+            outgoing.volume = outputVolume * masterVolume;
+            outgoing.play().catch(() => {});
+
+            const startFade = Date.now();
+            const fadeDur = 140;
+            const initVol = outputVolume * masterVolume;
+            const stepFadeOut = () => {
+              const elapsed = Date.now() - startFade;
+              const prog = Math.min(1, elapsed / fadeDur);
+              if (outgoingAudioRef.current === outgoing) {
+                outgoing.volume = Math.max(0, initVol * (1 - prog));
+                if (prog < 1) {
+                  requestAnimationFrame(stepFadeOut);
+                } else {
+                  outgoing.pause();
+                  outgoingAudioRef.current = null;
+                }
+              }
+            };
+            requestAnimationFrame(stepFadeOut);
+          } catch (e) {
+            console.warn("Crossfade error:", e);
+          }
+
+          pendingPlayheadRef.current = { time: currentTime, play: true, fadeIn: true };
+          oldWS.pause();
+          setActiveOutputUrl(seedVar.wav_url);
+        } else {
+          pendingPlayheadRef.current = { time: currentTime, play: wasPlaying, fadeIn: false };
+          oldWS.pause();
+          setActiveOutputUrl(seedVar.wav_url);
+        }
       } else {
         setActiveOutputUrl(seedVar.wav_url);
       }
@@ -3065,46 +3123,75 @@ export default function App() {
                       <span className="meta-item"><strong>BASE SEED:</strong> {variants[10]?.seeds[0]?.seed || 'N/A'}</span>
                     </div>
 
-                    <div className="monitor-modal-grid-container" style={{ maxHeight: '350px' }}>
-                      {/* Columns Header (S1..S5) */}
-                      <div className="monitor-modal-cols-header" style={{ gap: '6px', marginBottom: '6px' }}>
-                        <div style={{ width: '45px' }}></div>
-                        {Array.from({ length: 5 }, (_, sIdx) => (
-                          <div key={sIdx} className="col-modal-label" style={{ fontSize: '0.55rem' }}>VAR {sIdx + 1}</div>
-                        ))}
+                    <div className="matrix-grid-with-scrubber">
+                      {/* Vertical Joystick Scrubber on Left */}
+                      <div className="matrix-vertical-slider-container">
+                        <div className="vslider-header-badge">
+                          <Sliders size={12} style={{ color: 'var(--accent-cyan)' }} />
+                          <span className="vslider-text">
+                            {variants[activeVariantIndex]?.delta === 0 ? 'CTR' : `${variants[activeVariantIndex]?.delta > 0 ? '+' : ''}${variants[activeVariantIndex]?.delta.toFixed(2)}`}
+                          </span>
+                        </div>
+                        
+                        <div className="vslider-track-wrap">
+                          <input 
+                            type="range"
+                            min="0"
+                            max="20"
+                            step="1"
+                            value={20 - activeVariantIndex}
+                            onChange={(e) => {
+                              const targetIndex = 20 - Number(e.target.value);
+                              loadVariant2D(targetIndex, activeSeedIndex);
+                            }}
+                            className="matrix-vslider"
+                            title="Vertical Noise Level Joystick: Drag smoothly to crossfade between variations"
+                          />
+                        </div>
                       </div>
-                      
-                      {/* Rows */}
-                      <div className="monitor-modal-rows-container" style={{ gap: '4px' }}>
-                        {variants.map((v, vIdx) => {
-                          const isCenter = vIdx === 10;
-                          return (
-                            <div key={vIdx} className="monitor-modal-row" style={{ gridTemplateColumns: '45px repeat(5, 1fr)', gap: '6px' }}>
-                              <div className="row-modal-label" style={{ fontSize: '0.55rem', paddingRight: '6px' }}>{isCenter ? 'CTR' : `${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)}`}</div>
-                              <div className="row-modal-cells">
-                                {v.seeds.map((s, sIdx) => {
-                                  const isGeneratingCell = generatingCell && generatingCell.vIndex === vIdx && generatingCell.sIndex === sIdx;
-                                  const isActive = vIdx === activeVariantIndex && sIdx === activeSeedIndex;
-                                  
-                                  let cellClass = "";
-                                  if (isActive) cellClass = "active";
-                                  else if (isGeneratingCell) cellClass = "generating";
-                                  else if (s.isReady) cellClass = "ready";
-                                  
-                                  return (
-                                    <button
-                                      key={sIdx}
-                                      className={`monitor-modal-cell ${cellClass}`}
-                                      disabled={!s.isReady}
-                                      onClick={() => loadVariant2D(vIdx, sIdx)}
-                                      title={`Noise Level: ${v.noise_level.toFixed(2)} (${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)} Delta), Seed: ${s.seed || 'Pending'} (${s.isReady ? 'Ready - Click to audition' : isGeneratingCell ? 'Generating...' : 'In Queue'})`}
-                                    />
-                                  );
-                                })}
+
+                      {/* Columns & Rows Container */}
+                      <div className="monitor-modal-grid-container" style={{ maxHeight: '350px' }}>
+                        {/* Columns Header (S1..S5) */}
+                        <div className="monitor-modal-cols-header" style={{ gap: '6px', marginBottom: '6px' }}>
+                          <div style={{ width: '45px' }}></div>
+                          {Array.from({ length: 5 }, (_, sIdx) => (
+                            <div key={sIdx} className="col-modal-label" style={{ fontSize: '0.55rem' }}>VAR {sIdx + 1}</div>
+                          ))}
+                        </div>
+                        
+                        {/* Rows */}
+                        <div className="monitor-modal-rows-container" style={{ gap: '4px' }}>
+                          {variants.map((v, vIdx) => {
+                            const isCenter = vIdx === 10;
+                            return (
+                              <div key={vIdx} className="monitor-modal-row" style={{ gridTemplateColumns: '45px repeat(5, 1fr)', gap: '6px' }}>
+                                <div className="row-modal-label" style={{ fontSize: '0.55rem', paddingRight: '6px' }}>{isCenter ? 'CTR' : `${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)}`}</div>
+                                <div className="row-modal-cells">
+                                  {v.seeds.map((s, sIdx) => {
+                                    const isGeneratingCell = generatingCell && generatingCell.vIndex === vIdx && generatingCell.sIndex === sIdx;
+                                    const isActive = vIdx === activeVariantIndex && sIdx === activeSeedIndex;
+                                    
+                                    let cellClass = "";
+                                    if (isActive) cellClass = "active";
+                                    else if (isGeneratingCell) cellClass = "generating";
+                                    else if (s.isReady) cellClass = "ready";
+                                    
+                                    return (
+                                      <button
+                                        key={sIdx}
+                                        className={`monitor-modal-cell ${cellClass}`}
+                                        disabled={!s.isReady}
+                                        onClick={() => loadVariant2D(vIdx, sIdx)}
+                                        title={`Noise Level: ${v.noise_level.toFixed(2)} (${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)} Delta), Seed: ${s.seed || 'Pending'} (${s.isReady ? 'Ready - Click to audition' : isGeneratingCell ? 'Generating...' : 'In Queue'})`}
+                                      />
+                                    );
+                                  })}
+                                </div>
                               </div>
-                            </div>
-                          );
-                        })}
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                     
