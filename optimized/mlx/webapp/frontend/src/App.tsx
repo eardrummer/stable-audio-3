@@ -259,7 +259,7 @@ export default function App() {
   const [isModelMissing, setIsModelMissing] = useState(false);
   const [isPreloading, setIsPreloading] = useState(false);
   const [preloadProgressText, setPreloadProgressText] = useState('');
-  const [noiseLevel, setNoiseLevel] = useState(0.7); // 0.05 - 1.0 (for Generate A)
+  const [noiseLevel, setNoiseLevel] = useState(0.3); // 0.05 - 1.0 (for Generate A)
   const [cfg, setCfg] = useState(4.0);
   const [steps, setSteps] = useState(8);
   const [seed, setSeed] = useState<number | ''>('');
@@ -3173,7 +3173,7 @@ export default function App() {
                         {isOutputPlaying ? <Square size={16} fill="#fff" /> : <Play size={16} fill="#fff" />}
                       </button>
 
-                      {/* Loop Button for Output Audio */}
+                      {/* Loop Button for Output Audio (Icon-only) */}
                       <button 
                         onClick={() => {
                           const next = !isOutputLooping;
@@ -3182,30 +3182,22 @@ export default function App() {
                         }}
                         title={isOutputLooping ? 'Disable Loop' : 'Enable Loop'}
                         style={{
-                          padding: '0.45rem 0.8rem',
+                          width: '36px',
+                          height: '36px',
                           borderRadius: '8px',
                           border: isOutputLooping ? '1.5px solid var(--accent-green)' : '1px solid rgba(255, 255, 255, 0.1)',
                           background: isOutputLooping ? 'rgba(0, 255, 102, 0.12)' : 'rgba(255, 255, 255, 0.03)',
                           color: isOutputLooping ? 'var(--accent-green)' : 'var(--text-secondary)',
                           display: 'flex',
                           alignItems: 'center',
-                          gap: '0.4rem',
-                          fontSize: '0.72rem',
-                          fontWeight: 700,
+                          justifyContent: 'center',
                           cursor: 'pointer',
                           transition: 'all 0.2s ease',
                           boxShadow: isOutputLooping ? '0 0 10px rgba(0, 255, 102, 0.2)' : 'none'
                         }}
                       >
-                        <Repeat size={13} />
-                        <span>LOOP</span>
+                        <Repeat size={15} />
                       </button>
-
-                      {outputTrimRange && (
-                        <span style={{ fontSize: '0.68rem', fontFamily: 'monospace', color: 'var(--accent-cyan)', background: 'rgba(0, 240, 255, 0.06)', padding: '0.3rem 0.6rem', borderRadius: '6px', border: '1px solid rgba(0, 240, 255, 0.15)' }}>
-                          TRIM: {outputTrimRange[0].toFixed(2)}s – {outputTrimRange[1].toFixed(2)}s ({(outputTrimRange[1] - outputTrimRange[0]).toFixed(2)}s)
-                        </span>
-                      )}
 
                       <button 
                         className="btn-promote-source"
