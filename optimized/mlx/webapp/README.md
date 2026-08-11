@@ -78,9 +78,10 @@ Stable-Audio-experiments/  (Repo Root)
 ### 4. Frontend Studio: `App.tsx` & `index.css`
 - **Location**: `/optimized/mlx/webapp/frontend/src/App.tsx` & `index.css`
 - **Responsibilities**:
-  - Dual Deck UI: Single Source vs. Dual Source Blend tabs.
+  - Multi-Source Tabs: **Single Source**, **Dual Source Blend**, and **Live Source (Mic/Input)**.
+  - Live 10-Second Rolling Ring Buffer: Continuous circular recording buffer capturing input hardware streams with channel routing (Stereo / Left Ch 1 / Right Ch 2) and muted-by-default live monitoring.
   - Independent Waveform Display: WaveSurfer.js rendering for Source A, Source B, and Generated Output.
-  - Real-time Web Audio API: Live microphone recorder with oscilloscope, and spectrogram visualizers.
+  - Real-time Web Audio API: Live oscilloscope, input peak VU meter, and spectrogram visualizers.
   - Tape Deck Transport Bar: Synchronized Play/Pause, RTZ (Return to Zero), and Master Volume.
   - 2D Matrix Monitor Panel: Always-visible panel displaying 21 noise levels × 5 seeds.
 

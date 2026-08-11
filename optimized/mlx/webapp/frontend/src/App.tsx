@@ -22,7 +22,10 @@ import {
   Repeat,
   Volume2,
   SkipBack,
-  Grid
+  Grid,
+  Activity,
+  RefreshCw,
+  Radio
 } from 'lucide-react';
 
 // API Base URL
@@ -122,6 +125,56 @@ const drawSpectrogram = (
   }
 };
 
+// Fast Client-Side Float32 PCM to 16-bit Stereo WAV Encoder
+function encodePcmToWav(left: Float32Array, right: Float32Array, sampleRate: number): Blob {
+  const numChannels = 2;
+  const numSamples = left.length;
+  const buffer = new ArrayBuffer(44 + numSamples * numChannels * 2);
+  const view = new DataView(buffer);
+
+  function writeString(offset: number, string: string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+
+  // RIFF header
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples * numChannels * 2, true);
+  writeString(8, 'WAVE');
+
+  // fmt chunk
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true); // Subchunk1Size
+  view.setUint16(20, 1, true);  // AudioFormat (PCM)
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numChannels * 2, true); // ByteRate
+  view.setUint16(32, numChannels * 2, true); // BlockAlign
+  view.setUint16(34, 16, true); // BitsPerSample
+
+  // data chunk
+  writeString(36, 'data');
+  view.setUint32(40, numSamples * numChannels * 2, true);
+
+  // Write 16-bit PCM samples
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    const sL = Math.max(-1, Math.min(1, left[i] || 0));
+    const sR = Math.max(-1, Math.min(1, right[i] || 0));
+
+    const valL = sL < 0 ? sL * 0x8000 : sL * 0x7FFF;
+    const valR = sR < 0 ? sR * 0x8000 : sR * 0x7FFF;
+
+    view.setInt16(offset, valL, true);
+    offset += 2;
+    view.setInt16(offset, valR, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
 export default function App() {
   // Unique connection ID for websocket routing
   const [connectionId] = useState(() => Math.random().toString(36).substring(2, 15));
@@ -131,10 +184,19 @@ export default function App() {
   const [negativePrompt, setNegativePrompt] = useState('');
   const [useNegPrompt, setUseNegPrompt] = useState(false);
 
-  // Audio Blending Tab States
-  const [sourceMode, setSourceMode] = useState<'single' | 'blend'>('single');
+  // Audio Source Mode Tabs ('single' | 'blend' | 'live')
+  const [sourceMode, setSourceMode] = useState<'single' | 'blend' | 'live'>('single');
   const [blendRatio, setBlendRatio] = useState<number>(0.5); // A vs B blend (0.0 to 1.0)
   const [blendMethod, setBlendMethod] = useState<'waveform' | 'latent_linear' | 'latent_slerp' | 'asymmetric_noise' | 'vector_field'>('waveform');
+
+  // Live Source States
+  const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [selectedChannel, setSelectedChannel] = useState<'stereo' | 'ch1' | 'ch2'>('stereo');
+  const [isLiveFeedActive, setIsLiveFeedActive] = useState<boolean>(false);
+  const [liveBufferDuration, setLiveBufferDuration] = useState<number>(0);
+  const [liveMonitorVolume, setLiveMonitorVolume] = useState<number>(0); // 0.0 default (muted)
+  const [livePeakLevel, setLivePeakLevel] = useState<number>(0);
 
   // Audio Source (Input 1) States
   const [initAudio, setInitAudio] = useState<{
@@ -262,6 +324,23 @@ export default function App() {
   const sourceAnalyserRef2 = useRef<AnalyserNode | null>(null);
   const connectedSourceMediaRef2 = useRef<HTMLMediaElement | null>(null);
   const sourceAnimationRef2 = useRef<number | null>(null);
+
+  // Live Source Web Audio Refs & 10s Ring Buffer
+  const liveAudioCtxRef = useRef<AudioContext | null>(null);
+  const liveStreamRef = useRef<MediaStream | null>(null);
+  const liveSourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const liveGainNodeRef = useRef<GainNode | null>(null);
+  const liveAnalyserRef = useRef<AnalyserNode | null>(null);
+  const liveProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const liveAnimationRef = useRef<number | null>(null);
+  const liveRingBufferRef = useRef<{
+    left: Float32Array;
+    right: Float32Array;
+    writeIndex: number;
+    totalSamplesRecorded: number;
+    sampleRate: number;
+  } | null>(null);
 
   // Web Audio Context & Analyser Refs (Output)
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
@@ -1026,6 +1105,268 @@ export default function App() {
     }
   };
 
+  // Live Audio Input Device Enumeration
+  const refreshAudioDevices = async () => {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devices.filter(d => d.kind === 'audioinput');
+      setAudioInputDevices(inputs);
+      if (inputs.length > 0 && !selectedDeviceId) {
+        setSelectedDeviceId(inputs[0].deviceId);
+      }
+    } catch (e) {
+      console.warn("Failed to enumerate audio devices:", e);
+    }
+  };
+
+  useEffect(() => {
+    refreshAudioDevices();
+    const handleDeviceChange = () => refreshAudioDevices();
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
+      return () => {
+        navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
+      };
+    }
+  }, []);
+
+  // Cleanup Live Feed on unmount
+  useEffect(() => {
+    return () => {
+      stopLiveFeed();
+    };
+  }, []);
+
+  // Live Feed Start / Stop & Oscilloscope
+  const startLiveFeed = async () => {
+    setErrorMsg(null);
+    stopLiveFeed();
+
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      liveAudioCtxRef.current = audioCtx;
+      const sampleRate = audioCtx.sampleRate || 44100;
+
+      const constraints: MediaStreamConstraints = {
+        audio: {
+          deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      liveStreamRef.current = stream;
+
+      // Refresh labels now that permission is granted
+      refreshAudioDevices();
+
+      const sourceNode = audioCtx.createMediaStreamSource(stream);
+      liveSourceNodeRef.current = sourceNode;
+
+      // Monitor Gain Node (Muted / 0.0 by default)
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = liveMonitorVolume;
+      liveGainNodeRef.current = gainNode;
+
+      sourceNode.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+
+      // Analyser for Live Oscilloscope
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      liveAnalyserRef.current = analyser;
+      sourceNode.connect(analyser);
+
+      // 10-Second Circular Ring Buffer
+      const bufferLength = sampleRate * 10;
+      const ringBuffer = {
+        left: new Float32Array(bufferLength),
+        right: new Float32Array(bufferLength),
+        writeIndex: 0,
+        totalSamplesRecorded: 0,
+        sampleRate: sampleRate
+      };
+      liveRingBufferRef.current = ringBuffer;
+
+      // ScriptProcessor Node to continuously capture PCM audio
+      const processor = audioCtx.createScriptProcessor(4096, 2, 2);
+      liveProcessorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        const inputL = e.inputBuffer.getChannelData(0);
+        const inputR = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : inputL;
+        const len = inputL.length;
+        const buf = liveRingBufferRef.current;
+        if (!buf) return;
+
+        for (let i = 0; i < len; i++) {
+          let sL = inputL[i];
+          let sR = inputR[i];
+
+          if (selectedChannel === 'ch1') {
+            sR = sL;
+          } else if (selectedChannel === 'ch2') {
+            sL = sR;
+          }
+
+          buf.left[buf.writeIndex] = sL;
+          buf.right[buf.writeIndex] = sR;
+          buf.writeIndex = (buf.writeIndex + 1) % bufferLength;
+          buf.totalSamplesRecorded++;
+        }
+
+        const recordedSecs = Math.min(10.0, buf.totalSamplesRecorded / sampleRate);
+        setLiveBufferDuration(Number(recordedSecs.toFixed(1)));
+      };
+
+      sourceNode.connect(processor);
+      processor.connect(audioCtx.destination); // Needed to keep processor alive
+
+      setIsLiveFeedActive(true);
+      startLiveOscilloscope();
+    } catch (err: any) {
+      console.error("Live Feed Error:", err);
+      setErrorMsg("Failed to start Live Audio Feed: " + err.message);
+    }
+  };
+
+  const stopLiveFeed = () => {
+    if (liveAnimationRef.current) {
+      cancelAnimationFrame(liveAnimationRef.current);
+      liveAnimationRef.current = null;
+    }
+    if (liveStreamRef.current) {
+      liveStreamRef.current.getTracks().forEach(t => t.stop());
+      liveStreamRef.current = null;
+    }
+    if (liveProcessorRef.current) {
+      liveProcessorRef.current.disconnect();
+      liveProcessorRef.current = null;
+    }
+    if (liveGainNodeRef.current) {
+      liveGainNodeRef.current.disconnect();
+      liveGainNodeRef.current = null;
+    }
+    if (liveSourceNodeRef.current) {
+      liveSourceNodeRef.current.disconnect();
+      liveSourceNodeRef.current = null;
+    }
+    if (liveAudioCtxRef.current) {
+      liveAudioCtxRef.current.close().catch(() => {});
+      liveAudioCtxRef.current = null;
+    }
+    setIsLiveFeedActive(false);
+    setLivePeakLevel(0);
+  };
+
+  const startLiveOscilloscope = () => {
+    const draw = () => {
+      const canvas = liveCanvasRef.current;
+      const analyser = liveAnalyserRef.current;
+      if (!canvas || !analyser) {
+        liveAnimationRef.current = requestAnimationFrame(draw);
+        return;
+      }
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+      analyser.getByteTimeDomainData(dataArray);
+
+      if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
+        canvas.width = canvas.clientWidth;
+        canvas.height = canvas.clientHeight;
+      }
+
+      ctx.fillStyle = '#060606';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Center grid line
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, canvas.height / 2);
+      ctx.lineTo(canvas.width, canvas.height / 2);
+      ctx.stroke();
+
+      // Glowing Cyan Waveform
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#00f0ff';
+      ctx.shadowBlur = 6;
+      ctx.shadowColor = '#00f0ff';
+      ctx.beginPath();
+
+      const sliceWidth = canvas.width / bufferLength;
+      let x = 0;
+      let maxPeak = 0;
+
+      for (let i = 0; i < bufferLength; i++) {
+        const v = dataArray[i] / 128.0;
+        const normAmp = Math.abs(dataArray[i] - 128) / 128.0;
+        if (normAmp > maxPeak) maxPeak = normAmp;
+        const y = (v * canvas.height) / 2;
+
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+        x += sliceWidth;
+      }
+
+      ctx.lineTo(canvas.width, canvas.height / 2);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      setLivePeakLevel(maxPeak);
+      liveAnimationRef.current = requestAnimationFrame(draw);
+    };
+
+    liveAnimationRef.current = requestAnimationFrame(draw);
+  };
+
+  const handleLiveMonitorVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const vol = Number(e.target.value);
+    setLiveMonitorVolume(vol);
+    if (liveGainNodeRef.current && liveAudioCtxRef.current) {
+      liveGainNodeRef.current.gain.setValueAtTime(vol, liveAudioCtxRef.current.currentTime);
+    }
+  };
+
+  const extractLiveBufferAsFile = (): File | null => {
+    const buf = liveRingBufferRef.current;
+    if (!buf || buf.totalSamplesRecorded === 0) return null;
+
+    const sampleRate = buf.sampleRate;
+    const bufferLength = sampleRate * 10;
+    const finalL = new Float32Array(bufferLength);
+    const finalR = new Float32Array(bufferLength);
+
+    if (buf.totalSamplesRecorded < bufferLength) {
+      // Padded with silence if not yet 10s
+      for (let i = 0; i < buf.writeIndex; i++) {
+        finalL[i] = buf.left[i];
+        finalR[i] = buf.right[i];
+      }
+    } else {
+      // Unroll ordered 10-second ring buffer (oldest to newest)
+      let readIdx = buf.writeIndex;
+      for (let i = 0; i < bufferLength; i++) {
+        finalL[i] = buf.left[readIdx];
+        finalR[i] = buf.right[readIdx];
+        readIdx = (readIdx + 1) % bufferLength;
+      }
+    }
+
+    const wavBlob = encodePcmToWav(finalL, finalR, sampleRate);
+    return new File([wavBlob], `live_snapshot_${Date.now()}.wav`, { type: 'audio/wav' });
+  };
+
   // Real-time Mixer Volume Controls
   const handleSourceVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const vol = Number(e.target.value);
@@ -1238,9 +1579,14 @@ export default function App() {
         setErrorMsg('Please enter a prompt or load an initial audio file.');
         return;
       }
-    } else {
+    } else if (sourceMode === 'blend') {
       if (!initAudio || !initAudio2) {
         setErrorMsg('Dual Audio Blend mode requires both Source A and Source B to be uploaded.');
+        return;
+      }
+    } else if (sourceMode === 'live') {
+      if (!liveRingBufferRef.current || liveRingBufferRef.current.totalSamplesRecorded === 0) {
+        setErrorMsg('Please click "Start Live Feed" to record live microphone audio into the 10s buffer first.');
         return;
       }
     }
@@ -1285,7 +1631,47 @@ export default function App() {
       save_history: saveHistory  // Support memory toggle!
     };
 
-    if (sourceMode === 'blend') {
+    if (sourceMode === 'live') {
+      try {
+        setProgressText('Extracting and uploading 10s live audio buffer snapshot...');
+        const snapshotFile = extractLiveBufferAsFile();
+        if (!snapshotFile) {
+          throw new Error('Failed to capture audio from live 10s buffer.');
+        }
+
+        const formData = new FormData();
+        formData.append('file', snapshotFile);
+
+        const uploadRes = await fetch(`${API_URL}/api/upload`, {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!uploadRes.ok) {
+          const err = await uploadRes.json();
+          throw new Error(err.detail || 'Failed to upload live audio buffer');
+        }
+
+        const uploadData = await uploadRes.json();
+        const uploadedUrl = `${API_URL}${uploadData.wav_url}`;
+
+        setInitAudio({
+          filename: uploadData.filename,
+          local_path: uploadData.local_path,
+          duration: 10.0,
+          wav_url: uploadedUrl
+        });
+        setActiveSourceUrl(uploadedUrl);
+
+        payload.init_audio_path = uploadData.wav_url;
+        payload.init_noise_level = noiseLevel;
+        payload.seconds = 10.0;
+      } catch (err: any) {
+        setIsGenerating(false);
+        setErrorMsg(err.message || 'Error processing live audio buffer');
+        return;
+      }
+    } else if (sourceMode === 'blend') {
       payload.init_audio_path = initAudio!.wav_url;
       payload.init_audio_path_2 = initAudio2!.wav_url;
       payload.blend_ratio = blendRatio;
@@ -1810,7 +2196,7 @@ export default function App() {
             {/* LEFT COLUMN: AUDIO SOURCE (INPUT) */}
             <div className="split-column left">
               
-              {/* Single Source vs Dual Source Blend Toggle */}
+              {/* Single Source vs Dual Source Blend vs Live Source Toggle */}
               <div className="parameters-box-header-tabs" style={{ marginBottom: '1rem' }}>
                 <button 
                   className={`model-tab-btn ${sourceMode === 'single' ? 'active' : ''}`}
@@ -1823,6 +2209,12 @@ export default function App() {
                   onClick={() => setSourceMode('blend')}
                 >
                   Dual Source Blend
+                </button>
+                <button 
+                  className={`model-tab-btn ${sourceMode === 'live' ? 'active' : ''}`}
+                  onClick={() => setSourceMode('live')}
+                >
+                  Live Source (Mic/Input)
                 </button>
               </div>
 
@@ -1957,7 +2349,7 @@ export default function App() {
                     </div>
                   )}
                 </>
-              ) : (
+              ) : sourceMode === 'blend' ? (
                 /* DUAL AUDIO BLENDING MODE INPUTS */
                 <>
                   {/* SOURCE 1 BLOCK */}
@@ -2132,6 +2524,192 @@ export default function App() {
                         <option value="asymmetric_noise">D. Asymmetric Noising (Structural Mold) (TODO)</option>
                         <option value="vector_field">E. Vector Field Interpolation (Dynamic compromise) (TODO)</option>
                       </select>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                /* LIVE SOURCE (MIC / INPUT) MODE */
+                <>
+                  {/* DEVICE & CHANNEL CONFIGURATION */}
+                  <div className="parameters-box" style={{ padding: '1rem', gap: '0.8rem', marginBottom: '0.8rem' }}>
+                    <div style={{ display: 'flex', gap: '0.8rem', width: '100%', flexWrap: 'wrap' }}>
+                      
+                      {/* Hardware Input Device Selector */}
+                      <div className="parameter-group" style={{ flex: '1 1 200px' }}>
+                        <div className="parameter-header">
+                          <span className="parameter-label" style={{ fontSize: '0.7rem' }}>AUDIO INPUT DEVICE</span>
+                          <button 
+                            onClick={refreshAudioDevices}
+                            style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.65rem' }}
+                            title="Refresh connected devices"
+                          >
+                            <RefreshCw size={10} /> Scan
+                          </button>
+                        </div>
+                        <select
+                          className="model-select-dropdown"
+                          value={selectedDeviceId}
+                          onChange={(e) => {
+                            setSelectedDeviceId(e.target.value);
+                            if (isLiveFeedActive) {
+                              setTimeout(() => startLiveFeed(), 50);
+                            }
+                          }}
+                          style={{ padding: '0.4rem', fontSize: '0.75rem', width: '100%' }}
+                        >
+                          {audioInputDevices.length === 0 ? (
+                            <option value="">Default Microphone</option>
+                          ) : (
+                            audioInputDevices.map((d, idx) => (
+                              <option key={d.deviceId || idx} value={d.deviceId}>
+                                {d.label || `Audio Input ${idx + 1}`}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </div>
+
+                      {/* Input Channel Routing */}
+                      <div className="parameter-group" style={{ flex: '1 1 140px' }}>
+                        <div className="parameter-header">
+                          <span className="parameter-label" style={{ fontSize: '0.7rem' }}>CHANNEL ROUTING</span>
+                        </div>
+                        <select
+                          className="model-select-dropdown"
+                          value={selectedChannel}
+                          onChange={(e) => setSelectedChannel(e.target.value as any)}
+                          style={{ padding: '0.4rem', fontSize: '0.75rem', width: '100%' }}
+                        >
+                          <option value="stereo">Stereo (Both Channels)</option>
+                          <option value="ch1">Channel 1 (Left / Mono)</option>
+                          <option value="ch2">Channel 2 (Right)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Monitor Volume Slider */}
+                    <div className="volume-control-group" style={{ marginTop: '0.2rem' }}>
+                      <div className="volume-header">
+                        <span style={{ fontSize: '0.7rem', letterSpacing: '0.05em', color: 'var(--text-secondary)' }}>
+                          LIVE MONITOR VOLUME {liveMonitorVolume === 0 ? '(MUTED)' : ''}
+                        </span>
+                        <span className="volume-value" style={{ color: liveMonitorVolume > 0 ? 'var(--accent-yellow)' : 'var(--text-muted)' }}>
+                          {Math.round(liveMonitorVolume * 100)}%
+                        </span>
+                      </div>
+                      <input 
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={liveMonitorVolume}
+                        onChange={handleLiveMonitorVolumeChange}
+                        className="slider-input"
+                      />
+                      <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', marginTop: '0.1rem' }}>
+                        ⚠️ Keep at 0% when using speakers to prevent acoustic feedback loop.
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* LIVE FEED ACTION & STATUS BAR */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.8rem', gap: '0.6rem' }}>
+                    <button
+                      className="live-feed-btn"
+                      onClick={isLiveFeedActive ? stopLiveFeed : startLiveFeed}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                        padding: '0.55rem 1.1rem',
+                        borderRadius: '8px',
+                        fontSize: '0.75rem',
+                        fontWeight: 700,
+                        cursor: 'pointer',
+                        transition: 'all 0.2s ease',
+                        background: isLiveFeedActive ? 'rgba(255, 59, 48, 0.15)' : 'rgba(0, 240, 255, 0.12)',
+                        color: isLiveFeedActive ? '#ff3b30' : '#00f0ff',
+                        border: `1.5px solid ${isLiveFeedActive ? '#ff3b30' : '#00f0ff'}`
+                      }}
+                    >
+                      {isLiveFeedActive ? (
+                        <>
+                          <Square size={13} fill="#ff3b30" />
+                          <span>STOP LIVE FEED</span>
+                        </>
+                      ) : (
+                        <>
+                          <Mic size={13} />
+                          <span>START LIVE FEED</span>
+                        </>
+                      )}
+                    </button>
+
+                    {/* Buffer Status Gauge */}
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.2rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.7rem' }}>
+                        <span style={{ 
+                          display: 'inline-block', 
+                          width: '8px', 
+                          height: '8px', 
+                          borderRadius: '50%', 
+                          background: isLiveFeedActive ? '#00f0ff' : '#666',
+                          boxShadow: isLiveFeedActive ? '0 0 8px #00f0ff' : 'none'
+                        }}></span>
+                        <span style={{ color: isLiveFeedActive ? 'var(--accent-cyan)' : 'var(--text-muted)', fontWeight: 600 }}>
+                          {isLiveFeedActive ? 'LIVE ACTIVE' : 'STANDBY'}
+                        </span>
+                      </div>
+                      <span style={{ fontSize: '0.68rem', fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
+                        10s Buffer: {liveBufferDuration.toFixed(1)}s / 10.0s
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* LIVE OSCILLOSCOPE & BUFFER VISUALIZER */}
+                  <div className="waveform-box source-box" style={{ padding: '1rem', gap: '0.6rem', position: 'relative' }}>
+                    <div className="waveform-meta-row">
+                      <span className="waveform-label" style={{ fontSize: '0.7rem', color: isLiveFeedActive ? '#00f0ff' : 'var(--text-muted)' }}>
+                        <Activity size={12} />
+                        {isLiveFeedActive ? 'ROLLING 10-SECOND AUDIO BUFFER' : 'LIVE FEED STOPPED'}
+                      </span>
+                      <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
+                        {liveBufferDuration >= 10.0 ? 'BUFFER READY (10.0s)' : `BUFFERING: ${Math.round((liveBufferDuration / 10) * 100)}%`}
+                      </span>
+                    </div>
+
+                    <canvas 
+                      ref={liveCanvasRef} 
+                      style={{ 
+                        width: '100%', 
+                        height: '85px', 
+                        borderRadius: '6px', 
+                        background: '#060606', 
+                        display: 'block' 
+                      }} 
+                    />
+
+                    {/* Input Peak VU Meter Bar */}
+                    <div style={{ width: '100%', display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.2rem' }}>
+                      <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)', width: '30px' }}>PEAK</span>
+                      <div style={{ flex: 1, height: '4px', background: 'rgba(255, 255, 255, 0.08)', borderRadius: '2px', overflow: 'hidden' }}>
+                        <div 
+                          style={{ 
+                            height: '100%', 
+                            width: `${Math.min(100, livePeakLevel * 100)}%`, 
+                            background: livePeakLevel > 0.85 ? '#ff3b30' : livePeakLevel > 0.6 ? '#ffd60a' : '#00f0ff',
+                            transition: 'width 0.05s ease'
+                          }} 
+                        />
+                      </div>
+                      <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)', width: '35px', textAlign: 'right' }}>
+                        {Math.round(livePeakLevel * 100)}%
+                      </span>
+                    </div>
+
+                    {/* Helper caption */}
+                    <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>
+                      💡 Click <strong>GENERATE</strong> at any time to freeze and synthesize the rolling 10-second buffer.
                     </div>
                   </div>
                 </>
