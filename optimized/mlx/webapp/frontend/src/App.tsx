@@ -253,6 +253,9 @@ export default function App() {
   
   // Generation Settings
   const [ditName, setDitName] = useState<'sm-music' | 'sm-sfx' | 'medium'>('sm-music');
+  const [isModelMissing, setIsModelMissing] = useState(false);
+  const [isPreloading, setIsPreloading] = useState(false);
+  const [preloadProgressText, setPreloadProgressText] = useState('');
   const [noiseLevel, setNoiseLevel] = useState(0.7); // 0.05 - 1.0 (for Generate A)
   const [cfg, setCfg] = useState(4.0);
   const [steps, setSteps] = useState(8);
@@ -925,15 +928,53 @@ export default function App() {
     }
   };
 
-  const fetchModelStatus = async () => {
+  const fetchModelStatus = async (targetDit?: string) => {
     try {
       const res = await fetch(`${API_URL}/api/status`);
       const data = await res.json();
       setModelStatus(data.models);
+
+      const activeDit = targetDit || ditName;
+      const ditReady = data.models?.[activeDit]?.downloaded;
+      const t5Ready = data.models?.['t5gemma']?.downloaded;
+
+      if (ditReady === false || t5Ready === false) {
+        setIsModelMissing(true);
+      } else {
+        setIsModelMissing(false);
+      }
     } catch (e) {
       console.error('Failed to fetch model status:', e);
     }
   };
+
+  const handlePreloadModel = async () => {
+    setIsPreloading(true);
+    setPreloadProgressText(`Downloading weights for ${ditName.toUpperCase()} into local MLX cache...`);
+    try {
+      const res = await fetch(`${API_URL}/api/preload_model`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dit_name: ditName })
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Failed to download model weights');
+      }
+      const data = await res.json();
+      setModelStatus(data.models);
+      setIsModelMissing(false);
+      setIsPreloading(false);
+    } catch (e: any) {
+      console.error('Preload failed:', e);
+      setPreloadProgressText('Error: ' + e.message);
+      setIsPreloading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchModelStatus(ditName);
+  }, [ditName]);
 
   // Drag & Drop / File Upload Handlers
   const [dragOver, setDragOver] = useState(false);
@@ -2044,6 +2085,43 @@ export default function App() {
         <canvas ref={outputCanvasRef} className="spectrogram-canvas output-spectrogram-mirrored" />
       </div>
 
+      {/* MODEL PRELOAD / DOWNLOAD OVERLAY MODAL */}
+      {isModelMissing && (
+        <div className="model-download-modal-backdrop">
+          <div className="model-download-modal">
+            <div className="model-download-icon-wrap">
+              <Download size={32} className="icon-glow-cyan" />
+            </div>
+            <h2 className="model-download-title">MODEL SETUP REQUIRED</h2>
+            <p className="model-download-desc">
+              The weights for <strong>{ditName.toUpperCase()}</strong> and text encoder (~1.4 GB) are not cached locally yet. 
+              This is a one-time automatic download from HuggingFace to your Apple Silicon MLX cache.
+            </p>
+            
+            {isPreloading ? (
+              <div className="model-download-loading">
+                <div className="progress-loader"></div>
+                <span>{preloadProgressText || 'Downloading weights into local cache... Please wait.'}</span>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem', width: '100%', alignItems: 'center' }}>
+                <button className="btn-primary btn-preload-model" onClick={handlePreloadModel}>
+                  <Download size={16} />
+                  <span>Download & Load Model Now</span>
+                </button>
+                <button 
+                  className="btn-skip-preload"
+                  onClick={() => setIsModelMissing(false)}
+                  style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', fontSize: '0.75rem', cursor: 'pointer' }}
+                >
+                  Dismiss (Download on first generate)
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Header with Model selector and History Trigger */}
       <header className="app-header">
         <div className="logo">
@@ -2247,6 +2325,215 @@ export default function App() {
 
             </div>
           )}
+          
+          {/* CENTRAL GENERATION CONSOLE (PROMPT, DIFFUSION SLIDERS & GENERATE BUTTON) */}
+          <div className="central-generation-console">
+            <div className="central-generation-header">
+              <div className="central-generation-title">
+                <Sparkles size={14} className="icon-glow-cyan" />
+                <span>SYNTHESIS & GENERATION CONTROL</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.8rem' }}>
+                <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', fontWeight: 700 }}>MODEL:</span>
+                <select 
+                  className="model-select-dropdown"
+                  value={ditName}
+                  onChange={(e) => setDitName(e.target.value as any)}
+                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                >
+                  <option value="sm-music">Music (50M)</option>
+                  <option value="sm-sfx">SFX (50M)</option>
+                  <option value="medium">Medium (1.4B)</option>
+                </select>
+              </div>
+            </div>
+
+            {isGenerating ? (
+              /* PROGRESS OVERLAY */
+              <div className="progress-overlay" style={{ marginTop: '0.5rem' }}>
+                <div className="progress-loader"></div>
+                <div className="progress-text">{progressText}</div>
+                <div className="progress-bar-container">
+                  <div 
+                    className="progress-bar-fill" 
+                    style={{ width: `${progressPercent}%` }}
+                  ></div>
+                </div>
+                <div className="progress-subtext">
+                  Processing on Metal GPU (Unified VRAM)...
+                </div>
+              </div>
+            ) : (
+              <>
+                {/* Centered Text Prompt Box */}
+                <div className="prompt-input-container">
+                  <div className="prompt-label">TEXT PROMPT</div>
+                  <textarea
+                    className="prompt-textarea"
+                    placeholder="Enter a prompt to guide the generation (e.g. 'deep atmospheric sub bass, energetic drum break, warm analog synth')..."
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                  />
+                </div>
+
+                {/* Stable Audio Parameters Box */}
+                <div className="parameters-box">
+                  <div className="parameters-box-header-tabs">
+                    <button 
+                      className={`model-tab-btn ${activeTab === 'generate_a' ? 'active' : ''}`}
+                      onClick={() => {
+                        setActiveTab('generate_a');
+                        handleClearSourceRegion();
+                      }}
+                    >
+                      Audio-to-Audio / Inpaint
+                    </button>
+                    <button 
+                      className={`model-tab-btn ${activeTab === 'generate_b' ? 'active' : ''}`}
+                      onClick={() => {
+                        setActiveTab('generate_b');
+                        handleClearSourceRegion();
+                      }}
+                    >
+                      Extend Audio
+                    </button>
+                  </div>
+
+                  <div className="parameters-grid">
+                    {/* Mode-specific Slider */}
+                    {activeTab === 'generate_a' ? (
+                      <div className="parameter-group">
+                        <div className="parameter-header">
+                          <span className="parameter-label">Adding Noise / Variation Strength</span>
+                          <span className="parameter-value">{Math.round(noiseLevel * 100)}%</span>
+                        </div>
+                        <input 
+                          type="range" 
+                          min="0.05" 
+                          max="1.0" 
+                          step="0.05"
+                          value={noiseLevel} 
+                          onChange={(e) => setNoiseLevel(Number(e.target.value))}
+                          className="slider-input"
+                        />
+                      </div>
+                    ) : (
+                      <div className="parameter-group">
+                        <div className="parameter-header">
+                          <span className="parameter-label">Extension Duration</span>
+                          <span className="parameter-value">{extendLength} seconds</span>
+                        </div>
+                        <input 
+                          type="range" 
+                          min="5" 
+                          max="30" 
+                          step="1"
+                          value={extendLength} 
+                          onChange={(e) => setExtendLength(Number(e.target.value))}
+                          className="slider-input"
+                        />
+                      </div>
+                    )}
+
+                    {/* CFG Slider */}
+                    <div className="parameter-group">
+                      <div className="parameter-header">
+                        <span className="parameter-label">Control Strength (CFG)</span>
+                        <span className="parameter-value">{cfg}</span>
+                      </div>
+                      <input 
+                        type="range" 
+                        min="1.0" 
+                        max="12.0" 
+                        step="0.5"
+                        value={cfg} 
+                        onChange={(e) => setCfg(Number(e.target.value))}
+                        className="slider-input"
+                      />
+                    </div>
+
+                    {/* Steps Slider */}
+                    <div className="parameter-group">
+                      <div className="parameter-header">
+                        <span className="parameter-label">Denoising Steps</span>
+                        <span className="parameter-value">{steps}</span>
+                      </div>
+                      <input 
+                        type="range" 
+                        min="1" 
+                        max="32" 
+                        step="1"
+                        value={steps} 
+                        onChange={(e) => setSteps(Number(e.target.value))}
+                        className="slider-input"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Advanced Options Toggle */}
+                  <div style={{ alignSelf: 'flex-start' }}>
+                    <button 
+                      onClick={() => setShowAdvanced(!showAdvanced)}
+                      style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.3rem', cursor: 'pointer' }}
+                    >
+                      {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                      {showAdvanced ? 'Hide Advanced Options' : 'Show Advanced Options'}
+                    </button>
+                  </div>
+
+                  {showAdvanced && (
+                    <div className="parameters-grid" style={{ gap: '1.2rem', borderTop: '1px solid var(--border-color)', paddingTop: '1.2rem' }}>
+                      <div className="parameter-group">
+                        <div className="parameter-header">
+                          <span className="parameter-label">Manual Seed (Optional)</span>
+                        </div>
+                        <input 
+                          type="number"
+                          placeholder="Random seed"
+                          className="numeric-input"
+                          style={{ width: '100%', textAlign: 'left' }}
+                          value={seed}
+                          onChange={(e) => setSeed(e.target.value === '' ? '' : Number(e.target.value))}
+                        />
+                      </div>
+                      
+                      <div className="parameter-group">
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                          <input 
+                            type="checkbox" 
+                            checked={freeModels}
+                            onChange={(e) => setFreeModels(e.target.checked)}
+                            style={{ accentColor: 'var(--accent-cyan)' }}
+                          />
+                          Free VRAM models immediately (recommended for 8GB Macs)
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* ERROR DISPLAY */}
+                {errorMsg && (
+                  <div style={{ color: 'var(--accent-red)', fontSize: '0.85rem', padding: '0.8rem', background: 'rgba(255, 59, 48, 0.03)', border: '1px solid rgba(255, 59, 48, 0.1)', borderRadius: '8px', width: '100%' }}>
+                    {errorMsg}
+                  </div>
+                )}
+
+                {/* MAIN CENTRAL GENERATE BUTTON */}
+                <button 
+                  className="btn-generate"
+                  onClick={handleGenerate}
+                  disabled={isGenerating || audioUploadLoading}
+                  style={{ width: '100%', padding: '1rem', fontSize: '1rem' }}
+                >
+                  <Sparkles size={18} />
+                  {activeTab === 'generate_a' 
+                    ? (inpaintRange ? 'Generate A: Inpaint Region' : 'Generate A: Audio-to-Audio') 
+                    : 'Generate B: Extend Audio'}
+                </button>
+              </>
+            )}
+          </div>
           
           {/* TOP SPLIT: EXACTLY TWO COLUMNS WITH A LINE IN THE MIDDLE */}
           <div className="top-split-container">
@@ -2773,191 +3060,6 @@ export default function App() {
                 </>
               )}
 
-              {/* Text Prompt & Generation settings card moved under Source Audio */}
-              {isGenerating ? (
-                /* PROGRESS OVERLAY */
-                <div className="progress-overlay" style={{ marginTop: '1rem' }}>
-                  <div className="progress-loader"></div>
-                  <div className="progress-text">{progressText}</div>
-                  <div className="progress-bar-container">
-                    <div 
-                      className="progress-bar-fill" 
-                      style={{ width: `${progressPercent}%` }}
-                    ></div>
-                  </div>
-                  <div className="progress-subtext">
-                    Processing on Metal GPU (Unified VRAM)...
-                  </div>
-                </div>
-              ) : (
-                <>
-                  {/* Centered Text Prompt Box */}
-                  <div className="prompt-input-container">
-                    <div className="prompt-label">TEXT PROMPT</div>
-                    <textarea
-                      className="prompt-textarea"
-                      placeholder="Enter a prompt to guide the generation..."
-                      value={prompt}
-                      onChange={(e) => setPrompt(e.target.value)}
-                    />
-                  </div>
-
-                  {/* Stable Audio Parameters Box */}
-                  <div className="parameters-box">
-                    <div className="parameters-box-header-tabs">
-                      <button 
-                        className={`model-tab-btn ${activeTab === 'generate_a' ? 'active' : ''}`}
-                        onClick={() => {
-                          setActiveTab('generate_a');
-                          handleClearSourceRegion();
-                        }}
-                      >
-                        Audio-to-Audio / Inpaint
-                      </button>
-                      <button 
-                        className={`model-tab-btn ${activeTab === 'generate_b' ? 'active' : ''}`}
-                        onClick={() => {
-                          setActiveTab('generate_b');
-                          handleClearSourceRegion();
-                        }}
-                      >
-                        Extend Audio
-                      </button>
-                    </div>
-
-                    <div className="parameters-grid">
-                      {/* Mode-specific Slider */}
-                      {activeTab === 'generate_a' ? (
-                        <div className="parameter-group">
-                          <div className="parameter-header">
-                            <span className="parameter-label">Adding Noise / Variation Strength</span>
-                            <span className="parameter-value">{Math.round(noiseLevel * 100)}%</span>
-                          </div>
-                          <input 
-                            type="range" 
-                            min="0.05" 
-                            max="1.0" 
-                            step="0.05"
-                            value={noiseLevel} 
-                            onChange={(e) => setNoiseLevel(Number(e.target.value))}
-                            className="slider-input"
-                          />
-                        </div>
-                      ) : (
-                        <div className="parameter-group">
-                          <div className="parameter-header">
-                            <span className="parameter-label">Extension Duration</span>
-                            <span className="parameter-value">{extendLength} seconds</span>
-                          </div>
-                          <input 
-                            type="range" 
-                            min="5" 
-                            max="30" 
-                            step="1"
-                            value={extendLength} 
-                            onChange={(e) => setExtendLength(Number(e.target.value))}
-                            className="slider-input"
-                          />
-                        </div>
-                      )}
-
-                      {/* CFG Slider */}
-                      <div className="parameter-group">
-                        <div className="parameter-header">
-                          <span className="parameter-label">Control Strength (CFG)</span>
-                          <span className="parameter-value">{cfg}</span>
-                        </div>
-                        <input 
-                          type="range" 
-                          min="1.0" 
-                          max="12.0" 
-                          step="0.5"
-                          value={cfg} 
-                          onChange={(e) => setCfg(Number(e.target.value))}
-                          className="slider-input"
-                        />
-                      </div>
-
-                      {/* Steps Slider */}
-                      <div className="parameter-group">
-                        <div className="parameter-header">
-                          <span className="parameter-label">Denoising Steps</span>
-                          <span className="parameter-value">{steps}</span>
-                        </div>
-                        <input 
-                          type="range" 
-                          min="1" 
-                          max="32" 
-                          step="1"
-                          value={steps} 
-                          onChange={(e) => setSteps(Number(e.target.value))}
-                          className="slider-input"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Advanced Options Toggle */}
-                    <div style={{ alignSelf: 'flex-start' }}>
-                      <button 
-                        onClick={() => setShowAdvanced(!showAdvanced)}
-                        style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.3rem', cursor: 'pointer' }}
-                      >
-                        {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-                        {showAdvanced ? 'Hide Advanced Options' : 'Show Advanced Options'}
-                      </button>
-                    </div>
-
-                    {showAdvanced && (
-                      <div className="parameters-grid" style={{ gap: '1.2rem', borderTop: '1px solid var(--border-color)', paddingTop: '1.2rem' }}>
-                        <div className="parameter-group">
-                          <div className="parameter-header">
-                            <span className="parameter-label">Manual Seed (Optional)</span>
-                          </div>
-                          <input 
-                            type="number"
-                            placeholder="Random seed"
-                            className="numeric-input"
-                            style={{ width: '100%', textAlign: 'left' }}
-                            value={seed}
-                            onChange={(e) => setSeed(e.target.value === '' ? '' : Number(e.target.value))}
-                          />
-                        </div>
-                        
-                        <div className="parameter-group">
-                          <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
-                            <input 
-                              type="checkbox" 
-                              checked={freeModels}
-                              onChange={(e) => setFreeModels(e.target.checked)}
-                              style={{ accentColor: 'var(--accent-cyan)' }}
-                            />
-                            Free VRAM models immediately (recommended for 8GB Macs)
-                          </label>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* ERROR DISPLAY */}
-                  {errorMsg && (
-                    <div style={{ color: 'var(--accent-red)', fontSize: '0.85rem', padding: '0.8rem', background: 'rgba(255, 59, 48, 0.03)', border: '1px solid rgba(255, 59, 48, 0.1)', borderRadius: '8px', width: '100%' }}>
-                      {errorMsg}
-                    </div>
-                  )}
-
-                  {/* GENERATE BUTTON */}
-                  <button 
-                    className="btn-generate"
-                    onClick={handleGenerate}
-                    disabled={isGenerating || audioUploadLoading}
-                  >
-                    <Sparkles size={16} />
-                    {activeTab === 'generate_a' 
-                      ? (inpaintRange ? 'Generate A: Inpaint Region' : 'Generate A: Audio-to-Audio') 
-                      : 'Generate B: Extend Audio'}
-                  </button>
-                </>
-              )}
             </div>
 
             {/* RIGHT COLUMN: GENERATED AUDIO (OUTPUT) & NOISE VARS */}

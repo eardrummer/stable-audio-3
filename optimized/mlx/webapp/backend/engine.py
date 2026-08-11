@@ -104,6 +104,18 @@ class StableAudioEngine:
         }
         return status
 
+    def preload_model_bundle(self, dit_name: str):
+        """Downloads/caches all weights needed for the selected DiT model, codec, and text encoder."""
+        from weights import ensure_local, DIT_BUNDLES
+        print(f"[Engine] Preloading model bundle for '{dit_name}'...")
+        # 1. Text Encoder
+        ensure_local(T5GEMMA_NPZ_REL)
+        # 2. DiT & Codec
+        if dit_name in DIT_BUNDLES:
+            for rel_path in DIT_BUNDLES[dit_name]:
+                ensure_local(rel_path)
+        print(f"[Engine] Model bundle '{dit_name}' successfully cached.")
+
     def load_t5gemma(self):
         if self.t5_gemma is None:
             print("[Engine] Loading T5Gemma text encoder...")

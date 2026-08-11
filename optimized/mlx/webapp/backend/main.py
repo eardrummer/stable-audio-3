@@ -107,6 +107,19 @@ def get_status():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+class PreloadModelRequest(BaseModel):
+    dit_name: str = "sm-music"
+
+@app.post("/api/preload_model")
+def preload_model(req: PreloadModelRequest):
+    """Pre-downloads and caches model weights into local MLX cache."""
+    try:
+        engine.preload_model_bundle(req.dit_name)
+        status = engine.get_models_status()
+        return {"status": "ok", "models": status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/upload")
 async def upload_audio(file: UploadFile = File(...)):
     """Handles uploading an initial audio file or microphone recording."""
