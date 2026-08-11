@@ -2326,7 +2326,194 @@ export default function App() {
             </div>
           )}
           
-          {/* 3-COLUMN WORKSTATION: SOURCE DECK | SYNTHESIS RACK | OUTPUT DECK */}
+          {/* HORIZONTAL GENERATION PANEL (HARDWARE CONSOLE SPREADING UNDER TRANSPORT) */}
+          <div className="horizontal-generation-panel">
+            
+            {/* Top Row: Large Text Prompt with "prompt guide" placeholder & big text font */}
+            <div className="hgen-top-row">
+              <div className="hgen-prompt-wrapper">
+                <input
+                  type="text"
+                  className="hgen-prompt-input"
+                  placeholder="prompt guide"
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {/* Bottom Row: Controls (Model, Mode, Recessed Sliders, Generate Button) */}
+            <div className="hgen-bottom-row">
+              <div className="hgen-controls-left">
+                {/* Model Selector */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                  <span className="hgen-param-label">MODEL:</span>
+                  <select 
+                    className="model-select-dropdown"
+                    value={ditName}
+                    onChange={(e) => setDitName(e.target.value as any)}
+                    style={{ padding: '0.25rem 0.5rem', fontSize: '0.72rem' }}
+                  >
+                    <option value="sm-music">Music (50M)</option>
+                    <option value="sm-sfx">SFX (50M)</option>
+                    <option value="medium">Medium (1.4B)</option>
+                  </select>
+                </div>
+
+                {/* Mode Pill Tabs */}
+                <div className="hgen-mode-pills">
+                  <button 
+                    className={`hgen-mode-pill ${activeTab === 'generate_a' ? 'active' : ''}`}
+                    onClick={() => {
+                      setActiveTab('generate_a');
+                      handleClearSourceRegion();
+                    }}
+                  >
+                    Audio-to-Audio
+                  </button>
+                  <button 
+                    className={`hgen-mode-pill ${activeTab === 'generate_b' ? 'active' : ''}`}
+                    onClick={() => {
+                      setActiveTab('generate_b');
+                      handleClearSourceRegion();
+                    }}
+                  >
+                    Extend Audio
+                  </button>
+                </div>
+
+                {/* Noise / Variation Slider */}
+                {activeTab === 'generate_a' ? (
+                  <div className="hgen-param-group">
+                    <span className="hgen-param-label">NOISE</span>
+                    <input 
+                      type="range" 
+                      min="0.05" 
+                      max="1.0" 
+                      step="0.05"
+                      value={noiseLevel} 
+                      onChange={(e) => setNoiseLevel(Number(e.target.value))}
+                      className="slider-input hgen-slider"
+                      title={`Noise / Variation Strength: ${Math.round(noiseLevel * 100)}%`}
+                    />
+                    <span className="hgen-param-badge">{Math.round(noiseLevel * 100)}%</span>
+                  </div>
+                ) : (
+                  <div className="hgen-param-group">
+                    <span className="hgen-param-label">LENGTH</span>
+                    <input 
+                      type="range" 
+                      min="5" 
+                      max="30" 
+                      step="1"
+                      value={extendLength} 
+                      onChange={(e) => setExtendLength(Number(e.target.value))}
+                      className="slider-input hgen-slider"
+                      title={`Extension Duration: ${extendLength}s`}
+                    />
+                    <span className="hgen-param-badge">{extendLength}s</span>
+                  </div>
+                )}
+
+                {/* Denoising Steps Slider */}
+                <div className="hgen-param-group">
+                  <span className="hgen-param-label">STEPS</span>
+                  <input 
+                    type="range" 
+                    min="1" 
+                    max="32" 
+                    step="1"
+                    value={steps} 
+                    onChange={(e) => setSteps(Number(e.target.value))}
+                    className="slider-input hgen-slider"
+                    title={`Denoising Steps: ${steps}`}
+                  />
+                  <span className="hgen-param-badge">{steps}</span>
+                </div>
+
+                {/* CFG Slider */}
+                <div className="hgen-param-group">
+                  <span className="hgen-param-label">CFG</span>
+                  <input 
+                    type="range" 
+                    min="1.0" 
+                    max="12.0" 
+                    step="0.5"
+                    value={cfg} 
+                    onChange={(e) => setCfg(Number(e.target.value))}
+                    className="slider-input hgen-slider"
+                    title={`CFG Guidance: ${cfg}`}
+                  />
+                  <span className="hgen-param-badge">{cfg}</span>
+                </div>
+
+                {/* Advanced Options Toggle */}
+                <button 
+                  onClick={() => setShowAdvanced(!showAdvanced)}
+                  style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '0.68rem', display: 'flex', alignItems: 'center', gap: '0.2rem', cursor: 'pointer' }}
+                  title="Toggle Advanced Seed & VRAM options"
+                >
+                  {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                  <span>ADV</span>
+                </button>
+              </div>
+
+              {/* Action: Generate Button or Progress Indicator */}
+              {isGenerating ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.8rem', background: 'rgba(0, 240, 255, 0.05)', border: '1px solid rgba(0, 240, 255, 0.2)', borderRadius: '10px', padding: '0.4rem 1rem' }}>
+                  <div className="progress-loader" style={{ width: '18px', height: '18px' }}></div>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--accent-cyan)', fontFamily: 'monospace' }}>
+                    {progressText || 'SYNTHESIZING...'} ({progressPercent}%)
+                  </span>
+                </div>
+              ) : (
+                <button 
+                  className="hgen-btn-generate"
+                  onClick={handleGenerate}
+                  disabled={isGenerating || audioUploadLoading}
+                >
+                  <Sparkles size={14} />
+                  <span>{activeTab === 'generate_a' ? (inpaintRange ? 'INPAINT REGION' : 'GENERATE AUDIO') : 'EXTEND AUDIO'}</span>
+                </button>
+              )}
+            </div>
+
+            {/* Expandable Advanced Options Drawer */}
+            {showAdvanced && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.04)', paddingTop: '0.6rem', fontSize: '0.75rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span className="hgen-param-label">SEED:</span>
+                  <input 
+                    type="number"
+                    placeholder="Random"
+                    className="numeric-input"
+                    style={{ width: '100px', fontSize: '0.72rem', padding: '0.25rem 0.5rem' }}
+                    value={seed}
+                    onChange={(e) => setSeed(e.target.value === '' ? '' : Number(e.target.value))}
+                  />
+                </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                  <input 
+                    type="checkbox" 
+                    checked={freeModels}
+                    onChange={(e) => setFreeModels(e.target.checked)}
+                    style={{ accentColor: 'var(--accent-cyan)' }}
+                  />
+                  Free VRAM immediately (8GB Macs)
+                </label>
+              </div>
+            )}
+
+            {/* Error Message */}
+            {errorMsg && (
+              <div style={{ color: 'var(--accent-red)', fontSize: '0.75rem', padding: '0.4rem 0.8rem', background: 'rgba(255, 59, 48, 0.05)', border: '1px solid rgba(255, 59, 48, 0.15)', borderRadius: '6px' }}>
+                {errorMsg}
+              </div>
+            )}
+
+          </div>
+          
+          {/* 2-COLUMN WORKSTATION: SOURCE DECK (LEFT) | OUTPUT DECK (RIGHT) */}
           <div className="top-split-container">
             
             {/* LEFT COLUMN: AUDIO SOURCE (INPUT) */}
@@ -2851,212 +3038,6 @@ export default function App() {
                 </>
               )}
 
-            </div>
-
-            {/* CENTER COLUMN: HARDWARE SYNTHESIS & GENERATION RACK */}
-            <div className="split-column center">
-              <div className="hardware-synthesis-rack">
-                
-                {/* Rack Header: Title & Model Selector */}
-                <div className="rack-header">
-                  <div className="rack-title-badge">
-                    <Sparkles size={12} className="icon-glow-cyan" />
-                    <span>SYNTHESIS RACK</span>
-                  </div>
-                  <div className="rack-model-select">
-                    <select 
-                      className="model-select-dropdown"
-                      value={ditName}
-                      onChange={(e) => setDitName(e.target.value as any)}
-                      style={{ padding: '0.2rem 0.45rem', fontSize: '0.68rem' }}
-                    >
-                      <option value="sm-music">Music (50M)</option>
-                      <option value="sm-sfx">SFX (50M)</option>
-                      <option value="medium">Medium (1.4B)</option>
-                    </select>
-                  </div>
-                </div>
-
-                {/* Mode Pill Tabs */}
-                <div className="rack-mode-tabs">
-                  <button 
-                    className={`rack-mode-btn ${activeTab === 'generate_a' ? 'active' : ''}`}
-                    onClick={() => {
-                      setActiveTab('generate_a');
-                      handleClearSourceRegion();
-                    }}
-                  >
-                    Audio-to-Audio
-                  </button>
-                  <button 
-                    className={`rack-mode-btn ${activeTab === 'generate_b' ? 'active' : ''}`}
-                    onClick={() => {
-                      setActiveTab('generate_b');
-                      handleClearSourceRegion();
-                    }}
-                  >
-                    Extend Audio
-                  </button>
-                </div>
-
-                {isGenerating ? (
-                  /* PROGRESS DISPLAY IN RACK */
-                  <div className="progress-overlay" style={{ padding: '1rem 0.5rem', margin: 0, minHeight: '180px' }}>
-                    <div className="progress-loader" style={{ width: '28px', height: '28px' }}></div>
-                    <div className="progress-text" style={{ fontSize: '0.75rem' }}>{progressText}</div>
-                    <div className="progress-bar-container">
-                      <div 
-                        className="progress-bar-fill" 
-                        style={{ width: `${progressPercent}%` }}
-                      ></div>
-                    </div>
-                    <div className="progress-subtext" style={{ fontSize: '0.65rem' }}>
-                      Metal GPU Processing...
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    {/* Text Prompt */}
-                    <div className="rack-prompt-box">
-                      <span className="rack-prompt-label">TEXT PROMPT</span>
-                      <textarea
-                        className="rack-prompt-textarea"
-                        placeholder="Prompt to guide generation (e.g. 'deep 808 sub, vinyl crackle, crisp punchy drums')..."
-                        value={prompt}
-                        onChange={(e) => setPrompt(e.target.value)}
-                      />
-                    </div>
-
-                    {/* Mode Parameter: Noise Level or Extend Duration */}
-                    {activeTab === 'generate_a' ? (
-                      <div className="rack-param-row">
-                        <div className="rack-param-header">
-                          <span className="rack-param-label">Variation / Noise</span>
-                          <span className="rack-param-value">{Math.round(noiseLevel * 100)}%</span>
-                        </div>
-                        <input 
-                          type="range" 
-                          min="0.05" 
-                          max="1.0" 
-                          step="0.05"
-                          value={noiseLevel} 
-                          onChange={(e) => setNoiseLevel(Number(e.target.value))}
-                          className="slider-input"
-                          style={{ height: '3px' }}
-                        />
-                      </div>
-                    ) : (
-                      <div className="rack-param-row">
-                        <div className="rack-param-header">
-                          <span className="rack-param-label">Extend Duration</span>
-                          <span className="rack-param-value">{extendLength}s</span>
-                        </div>
-                        <input 
-                          type="range" 
-                          min="5" 
-                          max="30" 
-                          step="1"
-                          value={extendLength} 
-                          onChange={(e) => setExtendLength(Number(e.target.value))}
-                          className="slider-input"
-                          style={{ height: '3px' }}
-                        />
-                      </div>
-                    )}
-
-                    {/* Denoising Steps */}
-                    <div className="rack-param-row">
-                      <div className="rack-param-header">
-                        <span className="rack-param-label">Denoising Steps</span>
-                        <span className="rack-param-value">{steps} STEPS</span>
-                      </div>
-                      <input 
-                        type="range" 
-                        min="1" 
-                        max="32" 
-                        step="1"
-                        value={steps} 
-                        onChange={(e) => setSteps(Number(e.target.value))}
-                        className="slider-input"
-                        style={{ height: '3px' }}
-                      />
-                    </div>
-
-                    {/* Control Strength CFG */}
-                    <div className="rack-param-row">
-                      <div className="rack-param-header">
-                        <span className="rack-param-label">CFG Strength</span>
-                        <span className="rack-param-value">{cfg}</span>
-                      </div>
-                      <input 
-                        type="range" 
-                        min="1.0" 
-                        max="12.0" 
-                        step="0.5"
-                        value={cfg} 
-                        onChange={(e) => setCfg(Number(e.target.value))}
-                        className="slider-input"
-                        style={{ height: '3px' }}
-                      />
-                    </div>
-
-                    {/* Advanced Options Toggle */}
-                    <div style={{ alignSelf: 'flex-start' }}>
-                      <button 
-                        onClick={() => setShowAdvanced(!showAdvanced)}
-                        style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '0.68rem', display: 'flex', alignItems: 'center', gap: '0.2rem', cursor: 'pointer' }}
-                      >
-                        {showAdvanced ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-                        {showAdvanced ? 'Hide Advanced' : 'Advanced (Seed / VRAM)'}
-                      </button>
-                    </div>
-
-                    {showAdvanced && (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', borderTop: '1px solid rgba(255, 255, 255, 0.05)', paddingTop: '0.6rem' }}>
-                        <div className="rack-param-row">
-                          <span className="rack-param-label">Manual Seed</span>
-                          <input 
-                            type="number"
-                            placeholder="Random"
-                            className="numeric-input"
-                            style={{ width: '100%', textAlign: 'left', fontSize: '0.75rem', padding: '0.3rem' }}
-                            value={seed}
-                            onChange={(e) => setSeed(e.target.value === '' ? '' : Number(e.target.value))}
-                          />
-                        </div>
-                        
-                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.68rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
-                          <input 
-                            type="checkbox" 
-                            checked={freeModels}
-                            onChange={(e) => setFreeModels(e.target.checked)}
-                            style={{ accentColor: 'var(--accent-cyan)' }}
-                          />
-                          Free VRAM immediately
-                        </label>
-                      </div>
-                    )}
-
-                    {/* Error Message */}
-                    {errorMsg && (
-                      <div style={{ color: 'var(--accent-red)', fontSize: '0.75rem', padding: '0.5rem', background: 'rgba(255, 59, 48, 0.04)', border: '1px solid rgba(255, 59, 48, 0.15)', borderRadius: '6px', width: '100%' }}>
-                        {errorMsg}
-                      </div>
-                    )}
-
-                    {/* Main Hardware Generate Trigger Button */}
-                    <button 
-                      className="rack-btn-generate"
-                      onClick={handleGenerate}
-                      disabled={isGenerating || audioUploadLoading}
-                    >
-                      <Sparkles size={14} />
-                      <span>{activeTab === 'generate_a' ? (inpaintRange ? 'Inpaint Region' : 'Generate Audio') : 'Extend Audio'}</span>
-                    </button>
-                  </>
-                )}
-
-              </div>
             </div>
 
             {/* RIGHT COLUMN: GENERATED AUDIO (OUTPUT) & NOISE VARS */}
