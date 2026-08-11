@@ -2,20 +2,26 @@
 """
 Batch Audio Variation Processor for Stable Audio 3 (Apple Silicon MLX)
 
-Processes audio files in an input directory (e.g. Google Drive folder) or a single audio file,
-and generates a dedicated folder for each file containing:
+Processes audio files from:
+  1. A Google Drive web sharing link (https://drive.google.com/...)
+  2. A local Google Drive synced directory or audio folder
+  3. A single audio file path
+
+Generates a dedicated subfolder for each file containing:
   - original.wav
   - 5 progressively noisier synthesized variants (+0.02 step)
   - metadata.json
 """
 
 import os
+import re
 import sys
 import time
 import json
 import shutil
 import random
 import argparse
+import subprocess
 from pathlib import Path
 
 # Setup paths to import the MLX Stable Audio Engine
@@ -36,6 +42,55 @@ def format_duration(seconds: float) -> str:
     secs = int(seconds % 60)
     return f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
 
+def clean_input_path(raw_path: str) -> str:
+    """Cleans up paths that were dragged & dropped in terminal with quotes or escaped spaces."""
+    cleaned = raw_path.strip().strip("'\"")
+    # Replace escaped spaces "\ " with normal space " "
+    cleaned = cleaned.replace("\\ ", " ")
+    return cleaned
+
+def is_google_drive_url(path_str: str) -> bool:
+    """Detects if input is a Google Drive web link."""
+    return bool(re.search(r'drive\.google\.com|docs\.google\.com', path_str, re.IGNORECASE))
+
+def download_from_google_drive(url: str, download_dir: Path) -> Path:
+    """
+    Downloads a shared Google Drive folder or file using gdown into download_dir.
+    """
+    download_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if gdown is installed, if not auto-install it
+    try:
+        import gdown
+    except ImportError:
+        print("\n📦 'gdown' package is required to download Google Drive links.")
+        print("⏳ Installing gdown via pip...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"])
+            import gdown
+            print("✅ 'gdown' successfully installed!\n")
+        except Exception as e:
+            print(f"❌ Failed to auto-install gdown: {e}")
+            print("Please run: pip install gdown")
+            sys.exit(1)
+
+    print(f"\n🌐 Detected Google Drive Link: {url}")
+    print(f"⏳ Downloading files to local cache: {download_dir} ...")
+
+    try:
+        if "/folders/" in url:
+            # Shared Folder
+            gdown.download_folder(url, output=str(download_dir), quiet=False, use_cookies=False)
+        else:
+            # Single Shared File
+            gdown.download(url, output=str(download_dir) + "/", quiet=False, fuzzy=True)
+        print("✅ Google Drive download complete!\n")
+        return download_dir
+    except Exception as e:
+        print(f"❌ Error downloading from Google Drive: {e}")
+        print("Please ensure the link permission is set to 'Anyone with the link can view' or use a local path.")
+        sys.exit(1)
+
 def get_audio_files(input_path: Path, recursive: bool = False):
     if input_path.is_file():
         if input_path.suffix.lower() in SUPPORTED_EXTENSIONS:
@@ -53,7 +108,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Stable Audio 3 - Batch Audio Variation Processor (MLX)"
     )
-    parser.add_argument("-i", "--input-dir", "-f", "--file", required=True, type=str, help="Input audio folder OR single audio file path (e.g. Google Drive)")
+    parser.add_argument("-i", "--input-dir", "-f", "--file", required=True, type=str, help="Input Google Drive Link (https://drive.google.com/...) OR Local Audio Folder / File")
     parser.add_argument("-o", "--output-dir", default="./batch_output", type=str, help="Destination directory for output subfolders (default: ./batch_output)")
     parser.add_argument("-p", "--prompt", default="", type=str, help="Global text prompt to guide synthesis (optional, default: unconditional)")
     parser.add_argument("-n", "--noise", default=0.30, type=float, help="Base variation / noise level (default: 0.30)")
@@ -70,12 +125,27 @@ def main():
 
     args = parser.parse_args()
 
-    input_path = Path(args.input_dir).expanduser().resolve()
-    output_path = Path(args.output_dir).expanduser().resolve()
+    raw_input = clean_input_path(args.input_dir)
+    output_path = Path(clean_input_path(args.output_dir)).expanduser().resolve()
 
-    if not input_path.exists():
-        print(f"\n❌ Error: Input path does not exist: {input_path}")
-        sys.exit(1)
+    # 1. Handle Google Drive URL vs Local Path
+    if is_google_drive_url(raw_input):
+        gdrive_cache_dir = REPO_ROOT / "gdrive_downloads"
+        input_path = download_from_google_drive(raw_input, gdrive_cache_dir)
+    else:
+        input_path = Path(raw_input).expanduser().resolve()
+        if not input_path.exists():
+            # Check common Mac CloudStorage locations if not found directly
+            cloud_storage = Path.home() / "Library" / "CloudStorage"
+            matched_cloud_dirs = list(cloud_storage.glob(f"*{raw_input}*")) if cloud_storage.exists() else []
+            if matched_cloud_dirs:
+                input_path = matched_cloud_dirs[0]
+            else:
+                print(f"\n❌ Error: Input path does not exist: {input_path}")
+                print("\nTip:")
+                print("1. If using a Google Drive web link, paste the full URL: https://drive.google.com/drive/folders/...")
+                print("2. If using the Google Drive Mac Desktop App, drag and drop the folder from Finder into the terminal.")
+                sys.exit(1)
 
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -107,7 +177,7 @@ def main():
     print(f"🔢 Steps:           {args.steps} | CFG: {args.cfg}")
     print("="*70 + "\n")
 
-    # 1. Initialize MLX Engine
+    # 2. Initialize MLX Engine
     print("⏳ Initializing MLX Neural Audio Engine...")
     t_init = time.time()
     engine = StableAudioEngine()
@@ -147,7 +217,7 @@ def main():
 
         print(f"[{file_idx}/{total_files}] 🎧 Processing: {audio_file.name}")
 
-        # 2. Read and copy original audio
+        # 3. Read and copy original audio
         try:
             audio_arr = engine.read_wav(str(audio_file))
             audio_duration = audio_arr.shape[-1] / SAMPLE_RATE
@@ -163,7 +233,7 @@ def main():
 
         variant_records = []
 
-        # 3. Generate the 5 noisier variants
+        # 4. Generate the 5 noisier variants
         for v_idx, noise in enumerate(noise_levels, 1):
             out_variant_name = f"variant_{v_idx}_noise_{noise:.2f}.wav"
             out_variant_path = file_out_dir / out_variant_name
@@ -198,7 +268,7 @@ def main():
             except Exception as e:
                 print(f" Failed: {e}")
 
-        # 4. Save metadata.json manifest
+        # 5. Save metadata.json manifest
         metadata = {
             "source_file": audio_file.name,
             "source_path": str(audio_file),
