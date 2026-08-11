@@ -364,14 +364,13 @@ def generate_variants_in_background(
     Initial background queue: Generates ONLY Seed 0 for all other 20 noise levels.
     This provides instant vertical wheel coverage in less than 20 seconds!
     """
-    # 21 noise levels (Center is 0.0)
+    # 11 noise levels (Base is 0.0, plus 10 noisier variants: +0.02 to +0.20)
     deltas = [
         0.0,
-        0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20,
-        -0.02, -0.04, -0.06, -0.08, -0.10, -0.12, -0.14, -0.16, -0.18, -0.20
+        0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20
     ]
     
-    # Initial background queue: Only Seed 0 for all other 20 deltas!
+    # Initial background queue: Only Seed 0 for all 10 noisier deltas!
     tasks = []
     for delta in deltas[1:]:
         tasks.append((delta, 0))
@@ -578,17 +577,17 @@ def generate_finer_variants(req: FinerVariantsRequest, background_tasks: Backgro
     # Identify target indices (current, one up, one down)
     v = req.current_variant_index
     target_indices = []
-    if 0 <= v <= 20:
+    if 0 <= v <= 10:
         target_indices.append(v)
         if v - 1 >= 0:
             target_indices.append(v - 1)
-        if v + 1 <= 20:
+        if v + 1 <= 10:
             target_indices.append(v + 1)
             
     # Build tasks: seeds 1..4 for each target level
     tasks = []
     for idx in target_indices:
-        delta = round(-0.20 + idx * 0.02, 2)
+        delta = round(idx * 0.02, 2)
         for seed_idx in range(1, 5):
             tasks.append((delta, seed_idx))
             

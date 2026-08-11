@@ -412,7 +412,7 @@ export default function App() {
           });
           setActiveOutputUrl(`${API_URL}${data.wav_url}`);
           setActiveSeedIndex(0); // Reset to seed index 0
-          setActiveVariantIndex(10); // Reset to center
+          setActiveVariantIndex(0); // Reset to base 0.0
           fetchHistory();
         } else if (data.type === 'variant_start') {
           // Background variant generation started!
@@ -652,18 +652,26 @@ export default function App() {
       setOutputProgress(0);
 
       const duration = ws.getDuration();
+      const prevTrim = outputTrimRangeRef.current;
+      let startTrim = 0;
+      let endTrim = duration;
+      if (prevTrim) {
+        startTrim = Math.min(prevTrim[0], duration);
+        endTrim = Math.min(prevTrim[1], duration);
+        if (endTrim <= startTrim || endTrim === 0) endTrim = duration;
+      }
       regions.clearRegions();
       regions.addRegion({
-        start: 0,
-        end: duration,
+        start: startTrim,
+        end: endTrim,
         color: 'rgba(0, 240, 255, 0.08)',
         drag: false,
         resize: true
       });
-      setOutputTrimRange([0, Number(duration.toFixed(2))]);
-      outputTrimRangeRef.current = [0, Number(duration.toFixed(2))];
+      setOutputTrimRange([Number(startTrim.toFixed(2)), Number(endTrim.toFixed(2))]);
+      outputTrimRangeRef.current = [Number(startTrim.toFixed(2)), Number(endTrim.toFixed(2))];
 
-      // Synced Playhead & Smooth Crossfade Restoration!
+      // Synced Playhead & Smooth 350ms Equal-Power Crossfade Restoration!
       if (pendingPlayheadRef.current) {
         const { time, play, fadeIn } = pendingPlayheadRef.current;
         const seekTime = time < duration ? time : 0;
@@ -672,20 +680,23 @@ export default function App() {
         if (play) {
           const targetVol = outputVolume * masterVolume;
           if (fadeIn) {
-            // Smooth 140ms equal-power fade-in to blend seamlessly with outgoing audio
+            // Smooth 350ms equal-power sine fade-in to blend seamlessly with outgoing audio
             ws.setVolume(0);
             ws.play();
             setIsOutputPlaying(true);
 
             const startFade = Date.now();
-            const fadeDur = 140;
+            const fadeDur = 350;
             const stepFadeIn = () => {
               const elapsed = Date.now() - startFade;
               const prog = Math.min(1, elapsed / fadeDur);
-              // Linear volume ramp
-              ws.setVolume(targetVol * prog);
+              // Equal power sine curve: sin(prog * pi / 2)
+              const gain = Math.sin(prog * 0.5 * Math.PI);
+              ws.setVolume(targetVol * gain);
               if (prog < 1) {
                 requestAnimationFrame(stepFadeIn);
+              } else {
+                ws.setVolume(targetVol);
               }
             };
             requestAnimationFrame(stepFadeIn);
@@ -1610,7 +1621,7 @@ export default function App() {
         const wasPlaying = isOutputPlaying || isGlobalPlaying;
         
         if (wasPlaying && activeOutputUrl && activeOutputUrl !== seedVar.wav_url) {
-          // Smooth 140ms crossfade with small overlap between adjacent files
+          // Smooth 350ms equal-power crossfade with overlap between adjacent files
           try {
             if (outgoingAudioRef.current) {
               outgoingAudioRef.current.pause();
@@ -1623,13 +1634,15 @@ export default function App() {
             outgoing.play().catch(() => {});
 
             const startFade = Date.now();
-            const fadeDur = 140;
+            const fadeDur = 350;
             const initVol = outputVolume * masterVolume;
             const stepFadeOut = () => {
               const elapsed = Date.now() - startFade;
               const prog = Math.min(1, elapsed / fadeDur);
               if (outgoingAudioRef.current === outgoing) {
-                outgoing.volume = Math.max(0, initVol * (1 - prog));
+                // Equal power cosine curve: cos(prog * pi / 2)
+                const gain = Math.cos(prog * 0.5 * Math.PI);
+                outgoing.volume = Math.max(0, Math.min(1, initVol * gain));
                 if (prog < 1) {
                   requestAnimationFrame(stepFadeOut);
                 } else {
@@ -1745,8 +1758,8 @@ export default function App() {
     setProgressTotal(steps);
     setProgressText('Warming up MLX models in unified VRAM...');
 
-    // Initialize the 21 vertical noise levels, each with 5 horizontal seed variations
-    const deltas = [-0.20, -0.18, -0.16, -0.14, -0.12, -0.10, -0.08, -0.06, -0.04, -0.02, 0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20];
+    // Initialize the 11 vertical noise levels (Base is 0.0, plus 10 noisier variations)
+    const deltas = [0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20];
     const initialVariants = deltas.map(d => {
       const targetNoise = Number((noiseLevel + d).toFixed(2));
       return {
@@ -1761,7 +1774,7 @@ export default function App() {
       };
     });
     setVariants(initialVariants);
-    setActiveVariantIndex(10); // Center is index 10
+    setActiveVariantIndex(0); // Base is index 0
     setActiveSeedIndex(0); // Primary is seed index 0
 
     const payload: any = {
@@ -2070,7 +2083,7 @@ export default function App() {
     
     // Recover 2D variants matrix if present!
     if (item.variants_matrix && item.variants_matrix.length > 0) {
-      const deltas = [-0.20, -0.18, -0.16, -0.14, -0.12, -0.10, -0.08, -0.06, -0.04, -0.02, 0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20];
+      const deltas = [0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20];
       
       const restoredVariants = deltas.map(d => {
         const targetNoise = Number((item.init_noise_level + d).toFixed(2));
@@ -2105,7 +2118,7 @@ export default function App() {
       });
       
       setVariants(restoredVariants);
-      setActiveVariantIndex(10); // Center
+      setActiveVariantIndex(0); // Base is index 0
       setActiveSeedIndex(0); // Primary
     } else {
       setVariants([]); // Clear if no variants saved
@@ -3229,7 +3242,7 @@ export default function App() {
                         <div className="variant-wheel-title">NOISE VARS</div>
                         <div className="variant-wheel-track" style={{ transform: `translateY(${74 - activeVariantIndex * 32}px)` }}>
                           {variants.map((v, idx) => {
-                            const isCenter = idx === 10;
+                            const isBase = idx === 0;
                             const distance = Math.abs(idx - activeVariantIndex);
                             let distClass = "dist-3";
                             if (distance === 0) distClass = "dist-0";
@@ -3248,7 +3261,7 @@ export default function App() {
                               >
                                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px', width: '100%' }}>
                                   <span style={{ fontSize: '0.58rem' }}>
-                                    {isCenter ? 'CENTER' : `${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)}`}
+                                    {isBase ? 'BASE' : `+${v.delta.toFixed(2)}`}
                                   </span>
                                   <div className="seed-dots-row">
                                     {v.seeds.map((s, sIdx) => (
@@ -3312,7 +3325,7 @@ export default function App() {
                   <>
                     <div className="monitor-modal-meta" style={{ gap: '1rem', padding: '0.4rem 0.8rem', marginBottom: '0.8rem' }}>
                       <span className="meta-item"><strong>PROMPT:</strong> "{prompt || 'Unconditional'}"</span>
-                      <span className="meta-item"><strong>BASE SEED:</strong> {variants[10]?.seeds[0]?.seed || 'N/A'}</span>
+                      <span className="meta-item"><strong>BASE SEED:</strong> {variants[0]?.seeds[0]?.seed || 'N/A'}</span>
                     </div>
 
                     <div className="matrix-grid-with-scrubber">
@@ -3321,7 +3334,7 @@ export default function App() {
                         <div className="vslider-header-badge">
                           <Sliders size={12} style={{ color: 'var(--accent-cyan)' }} />
                           <span className="vslider-text">
-                            {variants[activeVariantIndex]?.delta === 0 ? 'CTR' : `${variants[activeVariantIndex]?.delta > 0 ? '+' : ''}${variants[activeVariantIndex]?.delta.toFixed(2)}`}
+                            {variants[activeVariantIndex]?.delta === 0 ? 'BASE' : `+${variants[activeVariantIndex]?.delta.toFixed(2)}`}
                           </span>
                         </div>
                         
@@ -3329,11 +3342,11 @@ export default function App() {
                           <input 
                             type="range"
                             min="0"
-                            max="20"
+                            max={variants.length - 1}
                             step="1"
-                            value={20 - activeVariantIndex}
+                            value={(variants.length - 1) - activeVariantIndex}
                             onChange={(e) => {
-                              const targetIndex = 20 - Number(e.target.value);
+                              const targetIndex = (variants.length - 1) - Number(e.target.value);
                               loadVariant2D(targetIndex, activeSeedIndex);
                             }}
                             className="matrix-vslider"
@@ -3355,10 +3368,10 @@ export default function App() {
                         {/* Rows */}
                         <div className="monitor-modal-rows-container" style={{ gap: '4px' }}>
                           {variants.map((v, vIdx) => {
-                            const isCenter = vIdx === 10;
+                            const isBase = vIdx === 0;
                             return (
                               <div key={vIdx} className="monitor-modal-row" style={{ gridTemplateColumns: '45px repeat(5, 1fr)', gap: '6px' }}>
-                                <div className="row-modal-label" style={{ fontSize: '0.55rem', paddingRight: '6px' }}>{isCenter ? 'CTR' : `${v.delta > 0 ? '+' : ''}${v.delta.toFixed(2)}`}</div>
+                                <div className="row-modal-label" style={{ fontSize: '0.55rem', paddingRight: '6px' }}>{isBase ? 'BASE' : `+${v.delta.toFixed(2)}`}</div>
                                 <div className="row-modal-cells">
                                   {v.seeds.map((s, sIdx) => {
                                     const isGeneratingCell = generatingCell && generatingCell.vIndex === vIdx && generatingCell.sIndex === sIdx;
