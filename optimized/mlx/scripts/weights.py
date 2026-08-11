@@ -123,6 +123,9 @@ def ensure_local(local_rel_path: str, verbose: bool = True) -> Path:
     and symlinked into the project at `local_rel_path` so the on-disk layout
     looks the same whether the file was bundled or downloaded.
     """
+    if isinstance(local_rel_path, (tuple, list)):
+        local_rel_path = local_rel_path[0]
+
     target = SCRIPT_DIR / local_rel_path
     if target.exists() or target.is_symlink():
         return target

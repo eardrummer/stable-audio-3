@@ -112,7 +112,8 @@ class StableAudioEngine:
         ensure_local(T5GEMMA_NPZ_REL)
         # 2. DiT & Codec
         if dit_name in DIT_BUNDLES:
-            for rel_path in DIT_BUNDLES[dit_name]:
+            for item in DIT_BUNDLES[dit_name]:
+                rel_path = item[0] if isinstance(item, tuple) else item
                 ensure_local(rel_path)
         print(f"[Engine] Model bundle '{dit_name}' successfully cached.")
 
