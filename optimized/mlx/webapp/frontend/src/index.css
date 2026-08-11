@@ -339,14 +339,16 @@ body {
 .hgen-top-row {
   display: flex;
   align-items: center;
-  gap: 1.2rem;
+  justify-content: center;
   width: 100%;
 }
 
 .hgen-prompt-wrapper {
-  flex: 1;
+  max-width: 600px;
+  width: 100%;
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 0.25rem;
 }
 
@@ -355,10 +357,11 @@ body {
   background: #000000;
   border: 1.5px solid rgba(255, 255, 255, 0.09);
   border-radius: 12px;
-  padding: 0.75rem 1.1rem;
+  padding: 0.8rem 1.2rem;
   color: #ffffff;
-  font-size: 1.15rem; /* Big font requested by user */
-  font-weight: 600;
+  font-size: 1.35rem; /* Bigger font size requested by user */
+  font-weight: 700;
+  text-align: center; /* Justified/centered text requested by user */
   letter-spacing: 0.02em;
   outline: none;
   transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
@@ -374,8 +377,35 @@ body {
 
 .hgen-prompt-input::placeholder {
   color: rgba(255, 255, 255, 0.25);
-  font-size: 1.05rem;
-  font-weight: 500;
+  font-size: 1.2rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* Output Waveform Trimming Region & Cursors */
+.output-trim-region {
+  border-left: 3px solid var(--accent-cyan) !important;
+  border-right: 3px solid var(--accent-cyan) !important;
+  background: rgba(0, 240, 255, 0.08) !important;
+  box-shadow: 
+    -2px 0 10px rgba(0, 240, 255, 0.4),
+    2px 0 10px rgba(0, 240, 255, 0.4);
+}
+
+.output-trim-region .wavesurfer-handle-start,
+.output-trim-region .wavesurfer-handle-end {
+  width: 6px !important;
+  background: var(--accent-cyan) !important;
+  opacity: 0.85;
+  cursor: ew-resize !important;
+  transition: all 0.2s ease;
+}
+
+.output-trim-region .wavesurfer-handle-start:hover,
+.output-trim-region .wavesurfer-handle-end:hover {
+  opacity: 1;
+  background: #ffffff !important;
+  box-shadow: 0 0 8px #ffffff;
 }
 
 .hgen-bottom-row {

@@ -194,6 +194,7 @@ export default function App() {
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [selectedChannel, setSelectedChannel] = useState<'stereo' | 'ch1' | 'ch2'>('stereo');
   const [isLiveFeedActive, setIsLiveFeedActive] = useState<boolean>(false);
+  const [liveBufferTargetSecs, setLiveBufferTargetSecs] = useState<number>(10); // 3 | 10 | 20 seconds
   const [liveBufferDuration, setLiveBufferDuration] = useState<number>(0);
   const [liveMonitorVolume, setLiveMonitorVolume] = useState<number>(0); // 0.0 default (muted)
   const [livePeakLevel, setLivePeakLevel] = useState<number>(0);
@@ -231,6 +232,8 @@ export default function App() {
   } | null>(null);
   const [activeOutputUrl, setActiveOutputUrl] = useState<string | null>(null);
   const [isOutputPlaying, setIsOutputPlaying] = useState(false);
+  const [isOutputLooping, setIsOutputLooping] = useState(true); // Output loop active by default!
+  const [outputTrimRange, setOutputTrimRange] = useState<[number, number] | null>(null); // Trimming cursors
   const [outputProgress, setOutputProgress] = useState(0);
   const [outputVolume, setOutputVolume] = useState(1.0); // 0.0 - 1.0
   
@@ -308,6 +311,9 @@ export default function App() {
 
   const outputWavesurferRef = useRef<WaveSurfer | null>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
+  const outputRegionsRef = useRef<any>(null);
+  const isOutputLoopingRef = useRef<boolean>(true);
+  const outputTrimRangeRef = useRef<[number, number] | null>(null);
 
   // Playhead synchronization & Smooth Crossfade refs
   const pendingPlayheadRef = useRef<{ time: number; play: boolean; fadeIn?: boolean } | null>(null);
@@ -631,14 +637,35 @@ export default function App() {
     outputWavesurferRef.current = ws;
     ws.setVolume(outputVolume * masterVolume);
 
+    // Register Regions Plugin on Output for Trimming Handles & Boundaries
+    const regions = ws.registerPlugin(RegionsPlugin.create());
+    outputRegionsRef.current = regions;
+
+    regions.on('region-updated', (region: any) => {
+      const range: [number, number] = [Number(region.start.toFixed(2)), Number(region.end.toFixed(2))];
+      setOutputTrimRange(range);
+      outputTrimRangeRef.current = range;
+    });
+
     ws.on('ready', () => {
       setIsOutputPlaying(false);
       setOutputProgress(0);
 
+      const duration = ws.getDuration();
+      regions.clearRegions();
+      regions.addRegion({
+        start: 0,
+        end: duration,
+        color: 'rgba(0, 240, 255, 0.08)',
+        drag: false,
+        resize: true
+      });
+      setOutputTrimRange([0, Number(duration.toFixed(2))]);
+      outputTrimRangeRef.current = [0, Number(duration.toFixed(2))];
+
       // Synced Playhead & Smooth Crossfade Restoration!
       if (pendingPlayheadRef.current) {
         const { time, play, fadeIn } = pendingPlayheadRef.current;
-        const duration = ws.getDuration();
         const seekTime = time < duration ? time : 0;
         ws.setTime(seekTime);
         
@@ -682,14 +709,32 @@ export default function App() {
       const current = ws.getCurrentTime();
       const dur = ws.getDuration();
       setOutputProgress(dur > 0 ? (current / dur) * 100 : 0);
+
+      // Trimming boundary checks!
+      const trim = outputTrimRangeRef.current;
+      if (trim && current >= trim[1]) {
+        if (isOutputLoopingRef.current || isLoopingRef.current) {
+          ws.setTime(trim[0]);
+          ws.play();
+        } else {
+          ws.pause();
+          ws.setTime(trim[0]);
+          setIsOutputPlaying(false);
+          setOutputProgress(dur > 0 ? (trim[0] / dur) * 100 : 0);
+        }
+      }
     });
 
     ws.on('finish', () => {
-      if (isLoopingRef.current) {
+      const trim = outputTrimRangeRef.current;
+      const startSeek = trim ? trim[0] : 0;
+      if (isOutputLoopingRef.current || isLoopingRef.current) {
+        ws.setTime(startSeek);
         ws.play();
       } else {
         setIsOutputPlaying(false);
         setIsGlobalPlaying(false);
+        ws.setTime(startSeek);
         setOutputProgress(0);
       }
     });
@@ -1245,8 +1290,8 @@ export default function App() {
       liveAnalyserRef.current = analyser;
       sourceNode.connect(analyser);
 
-      // 10-Second Circular Ring Buffer
-      const bufferLength = sampleRate * 10;
+      // Up to 20-Second Circular Ring Buffer Capacity (Supports 3s, 10s, 20s selections)
+      const bufferLength = sampleRate * 20;
       const ringBuffer = {
         left: new Float32Array(bufferLength),
         right: new Float32Array(bufferLength),
@@ -1283,7 +1328,7 @@ export default function App() {
           buf.totalSamplesRecorded++;
         }
 
-        const recordedSecs = Math.min(10.0, buf.totalSamplesRecorded / sampleRate);
+        const recordedSecs = Math.min(20.0, buf.totalSamplesRecorded / sampleRate);
         setLiveBufferDuration(Number(recordedSecs.toFixed(1)));
       };
 
@@ -1408,28 +1453,31 @@ export default function App() {
     if (!buf || buf.totalSamplesRecorded === 0) return null;
 
     const sampleRate = buf.sampleRate;
-    const bufferLength = sampleRate * 10;
-    const finalL = new Float32Array(bufferLength);
-    const finalR = new Float32Array(bufferLength);
+    const targetSecs = liveBufferTargetSecs;
+    const targetLength = sampleRate * targetSecs;
+    const finalL = new Float32Array(targetLength);
+    const finalR = new Float32Array(targetLength);
+    const bufferCapacity = sampleRate * 20;
 
-    if (buf.totalSamplesRecorded < bufferLength) {
-      // Padded with silence if not yet 10s
-      for (let i = 0; i < buf.writeIndex; i++) {
+    if (buf.totalSamplesRecorded < targetLength) {
+      // Padded with silence if not yet target length
+      const count = Math.min(buf.writeIndex, targetLength);
+      for (let i = 0; i < count; i++) {
         finalL[i] = buf.left[i];
         finalR[i] = buf.right[i];
       }
     } else {
-      // Unroll ordered 10-second ring buffer (oldest to newest)
-      let readIdx = buf.writeIndex;
-      for (let i = 0; i < bufferLength; i++) {
+      // Unroll the most recent targetLength samples ending at writeIndex
+      let readIdx = (buf.writeIndex - targetLength + bufferCapacity) % bufferCapacity;
+      for (let i = 0; i < targetLength; i++) {
         finalL[i] = buf.left[readIdx];
         finalR[i] = buf.right[readIdx];
-        readIdx = (readIdx + 1) % bufferLength;
+        readIdx = (readIdx + 1) % bufferCapacity;
       }
     }
 
     const wavBlob = encodePcmToWav(finalL, finalR, sampleRate);
-    return new File([wavBlob], `live_snapshot_${Date.now()}.wav`, { type: 'audio/wav' });
+    return new File([wavBlob], `live_snapshot_${targetSecs}s_${Date.now()}.wav`, { type: 'audio/wav' });
   };
 
   // Real-time Mixer Volume Controls
@@ -1945,9 +1993,19 @@ export default function App() {
   };
 
   const handlePlayPauseOutput = () => {
-    if (outputWavesurferRef.current) {
-      outputWavesurferRef.current.playPause();
-      setIsOutputPlaying(!isOutputPlaying);
+    const ws = outputWavesurferRef.current;
+    if (!ws) return;
+    if (ws.isPlaying()) {
+      ws.pause();
+      setIsOutputPlaying(false);
+    } else {
+      const trim = outputTrimRangeRef.current;
+      const current = ws.getCurrentTime();
+      if (trim && (current < trim[0] || current >= trim[1])) {
+        ws.setTime(trim[0]);
+      }
+      ws.play();
+      setIsOutputPlaying(true);
       setIsGlobalPlaying(false);
     }
   };
@@ -2968,24 +3026,50 @@ export default function App() {
                       )}
                     </button>
 
-                    {/* Buffer Status Gauge */}
-                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.2rem' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.7rem' }}>
+                    {/* Buffer Size Selector & Status Gauge */}
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.35rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                        <span style={{ fontSize: '0.62rem', color: 'var(--text-secondary)', fontWeight: 800, letterSpacing: '0.05em' }}>BUFFER:</span>
+                        <div style={{ display: 'flex', background: '#000000', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '6px', padding: '2px', gap: '2px' }}>
+                          {[3, 10, 20].map((secs) => (
+                            <button
+                              key={secs}
+                              onClick={() => setLiveBufferTargetSecs(secs)}
+                              style={{
+                                background: liveBufferTargetSecs === secs ? '#1e1e1e' : 'transparent',
+                                border: liveBufferTargetSecs === secs ? '1px solid rgba(0, 240, 255, 0.3)' : '1px solid transparent',
+                                color: liveBufferTargetSecs === secs ? 'var(--accent-cyan)' : 'var(--text-secondary)',
+                                borderRadius: '4px',
+                                padding: '0.2rem 0.45rem',
+                                fontSize: '0.62rem',
+                                fontWeight: 800,
+                                cursor: 'pointer',
+                                transition: 'all 0.15s ease'
+                              }}
+                              title={`Set rolling buffer window to ${secs} seconds`}
+                            >
+                              {secs}s
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.68rem' }}>
                         <span style={{ 
                           display: 'inline-block', 
-                          width: '8px', 
-                          height: '8px', 
+                          width: '7px', 
+                          height: '7px', 
                           borderRadius: '50%', 
                           background: isLiveFeedActive ? '#00f0ff' : '#666',
                           boxShadow: isLiveFeedActive ? '0 0 8px #00f0ff' : 'none'
                         }}></span>
-                        <span style={{ color: isLiveFeedActive ? 'var(--accent-cyan)' : 'var(--text-muted)', fontWeight: 600 }}>
+                        <span style={{ color: isLiveFeedActive ? 'var(--accent-cyan)' : 'var(--text-muted)', fontWeight: 700 }}>
                           {isLiveFeedActive ? 'LIVE ACTIVE' : 'STANDBY'}
                         </span>
+                        <span style={{ fontSize: '0.65rem', fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
+                          ({Math.min(liveBufferTargetSecs, liveBufferDuration).toFixed(1)}s / {liveBufferTargetSecs}.0s)
+                        </span>
                       </div>
-                      <span style={{ fontSize: '0.68rem', fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
-                        10s Buffer: {liveBufferDuration.toFixed(1)}s / 10.0s
-                      </span>
                     </div>
                   </div>
 
@@ -2994,10 +3078,12 @@ export default function App() {
                     <div className="waveform-meta-row">
                       <span className="waveform-label" style={{ fontSize: '0.7rem', color: isLiveFeedActive ? '#00f0ff' : 'var(--text-muted)' }}>
                         <Activity size={12} />
-                        {isLiveFeedActive ? 'ROLLING 10-SECOND AUDIO BUFFER' : 'LIVE FEED STOPPED'}
+                        {isLiveFeedActive ? `ROLLING ${liveBufferTargetSecs}-SECOND AUDIO BUFFER` : 'LIVE FEED STOPPED'}
                       </span>
                       <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
-                        {liveBufferDuration >= 10.0 ? 'BUFFER READY (10.0s)' : `BUFFERING: ${Math.round((liveBufferDuration / 10) * 100)}%`}
+                        {liveBufferDuration >= liveBufferTargetSecs 
+                          ? `BUFFER READY (${liveBufferTargetSecs}.0s)` 
+                          : `BUFFERING: ${Math.round((Math.min(liveBufferTargetSecs, liveBufferDuration) / liveBufferTargetSecs) * 100)}%`}
                       </span>
                     </div>
 
@@ -3032,7 +3118,7 @@ export default function App() {
 
                     {/* Helper caption */}
                     <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>
-                      💡 Click <strong>GENERATE</strong> at any time to freeze and synthesize the rolling 10-second buffer.
+                      💡 Click <strong>GENERATE</strong> at any time to freeze and synthesize the rolling {liveBufferTargetSecs}-second buffer.
                     </div>
                   </div>
                 </>
@@ -3050,11 +3136,11 @@ export default function App() {
                   <span className="volume-value">{Math.round(outputVolume * 100)}%</span>
                 </div>
                 <input 
-                  type="range"
-                  min="0"
-                  max="1"
+                  type="range" 
+                  min="0" 
+                  max="1" 
                   step="0.05"
-                  value={outputVolume}
+                  value={outputVolume} 
                   onChange={handleOutputVolumeChange}
                   className="slider-input"
                 />
@@ -3086,6 +3172,40 @@ export default function App() {
                       >
                         {isOutputPlaying ? <Square size={16} fill="#fff" /> : <Play size={16} fill="#fff" />}
                       </button>
+
+                      {/* Loop Button for Output Audio */}
+                      <button 
+                        onClick={() => {
+                          const next = !isOutputLooping;
+                          setIsOutputLooping(next);
+                          isOutputLoopingRef.current = next;
+                        }}
+                        title={isOutputLooping ? 'Disable Loop' : 'Enable Loop'}
+                        style={{
+                          padding: '0.45rem 0.8rem',
+                          borderRadius: '8px',
+                          border: isOutputLooping ? '1.5px solid var(--accent-green)' : '1px solid rgba(255, 255, 255, 0.1)',
+                          background: isOutputLooping ? 'rgba(0, 255, 102, 0.12)' : 'rgba(255, 255, 255, 0.03)',
+                          color: isOutputLooping ? 'var(--accent-green)' : 'var(--text-secondary)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.4rem',
+                          fontSize: '0.72rem',
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          transition: 'all 0.2s ease',
+                          boxShadow: isOutputLooping ? '0 0 10px rgba(0, 255, 102, 0.2)' : 'none'
+                        }}
+                      >
+                        <Repeat size={13} />
+                        <span>LOOP</span>
+                      </button>
+
+                      {outputTrimRange && (
+                        <span style={{ fontSize: '0.68rem', fontFamily: 'monospace', color: 'var(--accent-cyan)', background: 'rgba(0, 240, 255, 0.06)', padding: '0.3rem 0.6rem', borderRadius: '6px', border: '1px solid rgba(0, 240, 255, 0.15)' }}>
+                          TRIM: {outputTrimRange[0].toFixed(2)}s – {outputTrimRange[1].toFixed(2)}s ({(outputTrimRange[1] - outputTrimRange[0]).toFixed(2)}s)
+                        </span>
+                      )}
 
                       <button 
                         className="btn-promote-source"
