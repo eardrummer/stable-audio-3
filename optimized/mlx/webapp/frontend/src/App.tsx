@@ -3,7 +3,6 @@ import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.js';
 import {
   Play,
-  Pause,
   Mic,
   Square,
   Upload,
@@ -24,8 +23,7 @@ import {
   SkipBack,
   Grid,
   Activity,
-  RefreshCw,
-  Radio
+  RefreshCw
 } from 'lucide-react';
 
 // API Base URL
@@ -208,7 +206,6 @@ export default function App() {
   } | null>(null);
   const [activeSourceUrl, setActiveSourceUrl] = useState<string | null>(null);
   const [isSourcePlaying, setIsSourcePlaying] = useState(false);
-  const [sourceProgress, setSourceProgress] = useState(0);
   const [sourceVolume, setSourceVolume] = useState(1.0); // 0.0 - 1.0
   const [inpaintRange, setInpaintRange] = useState<[number, number] | null>(null);
 
@@ -221,7 +218,6 @@ export default function App() {
   } | null>(null);
   const [activeSourceUrl2, setActiveSourceUrl2] = useState<string | null>(null);
   const [isSourcePlaying2, setIsSourcePlaying2] = useState(false);
-  const [sourceProgress2, setSourceProgress2] = useState(0);
   const [sourceVolume2, setSourceVolume2] = useState(1.0); // 0.0 - 1.0
   
   // Generated Audio (Output) States
@@ -233,8 +229,6 @@ export default function App() {
   const [activeOutputUrl, setActiveOutputUrl] = useState<string | null>(null);
   const [isOutputPlaying, setIsOutputPlaying] = useState(false);
   const [isOutputLooping, setIsOutputLooping] = useState(true); // Output loop active by default!
-  const [outputTrimRange, setOutputTrimRange] = useState<[number, number] | null>(null); // Trimming cursors
-  const [outputProgress, setOutputProgress] = useState(0);
   const [outputVolume, setOutputVolume] = useState(1.0); // 0.0 - 1.0
   
   // 2D Fine Control Noise Variants (21 noise levels, each with 5 seed variations)
@@ -278,11 +272,8 @@ export default function App() {
   }, [saveHistory]);
 
   // 2D Matrix Generation Monitor States
-  const [showMonitor, setShowMonitor] = useState<boolean>(false);
   const [generatingCell, setGeneratingCell] = useState<{vIndex: number; sIndex: number} | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [progressStep, setProgressStep] = useState(0);
-  const [progressTotal, setProgressTotal] = useState(8);
   const [progressPercent, setProgressPercent] = useState(0);
   const [progressText, setProgressText] = useState('Initializing pipeline...');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -291,7 +282,6 @@ export default function App() {
   
   // History
   const [history, setHistory] = useState<AudioItem[]>([]);
-  const [modelStatus, setModelStatus] = useState<any>(null);
 
   // Refs for audio/recording
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -377,8 +367,6 @@ export default function App() {
         if (data.type === 'progress') {
           const step = data.step;
           const total = data.total;
-          setProgressStep(step);
-          setProgressTotal(total);
           setProgressPercent(Math.round((step / total) * 100));
           setProgressText(`Denoising: Step ${step} of ${total} (${Math.round(data.elapsed_ms)}ms)`);
         } else if (data.type === 'complete') {
@@ -527,13 +515,9 @@ export default function App() {
 
     ws.on('ready', () => {
       setIsSourcePlaying(false);
-      setSourceProgress(0);
     });
 
     ws.on('audioprocess', () => {
-      const current = ws.getCurrentTime();
-      const dur = ws.getDuration();
-      setSourceProgress(dur > 0 ? (current / dur) * 100 : 0);
     });
 
     ws.on('finish', () => {
@@ -542,7 +526,6 @@ export default function App() {
       } else {
         setIsSourcePlaying(false);
         setIsGlobalPlaying(false);
-        setSourceProgress(0);
       }
     });
 
@@ -583,13 +566,9 @@ export default function App() {
 
     ws.on('ready', () => {
       setIsSourcePlaying2(false);
-      setSourceProgress2(0);
     });
 
     ws.on('audioprocess', () => {
-      const current = ws.getCurrentTime();
-      const dur = ws.getDuration();
-      setSourceProgress2(dur > 0 ? (current / dur) * 100 : 0);
     });
 
     ws.on('finish', () => {
@@ -598,7 +577,6 @@ export default function App() {
       } else {
         setIsSourcePlaying2(false);
         setIsGlobalPlaying(false);
-        setSourceProgress2(0);
       }
     });
 
@@ -643,13 +621,11 @@ export default function App() {
 
     regions.on('region-updated', (region: any) => {
       const range: [number, number] = [Number(region.start.toFixed(2)), Number(region.end.toFixed(2))];
-      setOutputTrimRange(range);
       outputTrimRangeRef.current = range;
     });
 
     ws.on('ready', () => {
       setIsOutputPlaying(false);
-      setOutputProgress(0);
 
       const duration = ws.getDuration();
       const prevTrim = outputTrimRangeRef.current;
@@ -668,7 +644,6 @@ export default function App() {
         drag: false,
         resize: true
       });
-      setOutputTrimRange([Number(startTrim.toFixed(2)), Number(endTrim.toFixed(2))]);
       outputTrimRangeRef.current = [Number(startTrim.toFixed(2)), Number(endTrim.toFixed(2))];
 
       // Synced Playhead & Smooth 350ms Equal-Power Crossfade Restoration!
@@ -718,8 +693,6 @@ export default function App() {
 
     ws.on('audioprocess', () => {
       const current = ws.getCurrentTime();
-      const dur = ws.getDuration();
-      setOutputProgress(dur > 0 ? (current / dur) * 100 : 0);
 
       // Trimming boundary checks!
       const trim = outputTrimRangeRef.current;
@@ -731,7 +704,6 @@ export default function App() {
           ws.pause();
           ws.setTime(trim[0]);
           setIsOutputPlaying(false);
-          setOutputProgress(dur > 0 ? (trim[0] / dur) * 100 : 0);
         }
       }
     });
@@ -746,7 +718,6 @@ export default function App() {
         setIsOutputPlaying(false);
         setIsGlobalPlaying(false);
         ws.setTime(startSeek);
-        setOutputProgress(0);
       }
     });
 
@@ -988,7 +959,6 @@ export default function App() {
     try {
       const res = await fetch(`${API_URL}/api/status`);
       const data = await res.json();
-      setModelStatus(data.models);
 
       const activeDit = targetDit || ditName;
       const ditReady = data.models?.[activeDit]?.downloaded;
@@ -1017,8 +987,7 @@ export default function App() {
         const err = await res.json();
         throw new Error(err.detail || 'Failed to download model weights');
       }
-      const data = await res.json();
-      setModelStatus(data.models);
+      await res.json();
       setIsModelMissing(false);
       setIsPreloading(false);
     } catch (e: any) {
@@ -1754,8 +1723,6 @@ export default function App() {
     setIsGenerating(true);
     setErrorMsg(null);
     setProgressPercent(0);
-    setProgressStep(0);
-    setProgressTotal(steps);
     setProgressText('Warming up MLX models in unified VRAM...');
 
     // Initialize the 11 vertical noise levels (Base is 0.0, plus 10 noisier variations)
@@ -1765,7 +1732,7 @@ export default function App() {
       return {
         noise_level: targetNoise,
         delta: Number(d.toFixed(2)),
-        seeds: Array.from({ length: 5 }, (_, sIdx) => ({
+        seeds: Array.from({ length: 5 }, () => ({
           seed: 0,
           wav_url: '',
           filename: '',
@@ -1785,7 +1752,7 @@ export default function App() {
       apg: 1.0,
       seed: seed === '' ? undefined : Number(seed),
       dit_name: ditName,
-      decoder_name: decoder_name => undefined, // Unused parameter mapping
+      decoder_name: 'auto',
       free_models: freeModels,
       connection_id: connectionId,
       save_history: saveHistory  // Support memory toggle!

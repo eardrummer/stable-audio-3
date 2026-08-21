@@ -161,9 +161,20 @@ cython_debug/
 
 *.ckpt
 *.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+*.aif
+*.aiff
 *.asd
 wandb/*
 *.out
+
+# Batch processor outputs & cached downloads
+batch_output/
+gdrive_downloads/
 
 .gradio
 .DS_Store
