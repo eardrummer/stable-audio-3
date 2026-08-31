@@ -223,6 +223,7 @@ class StableAudioEngine:
         prompt: str,
         negative_prompt: str = None,
         init_audio_path: str = None,
+        init_audio_array: np.ndarray = None,
         init_audio_path_2: str = None,
         blend_ratio: float = 0.5,
         blend_method: str = None,
@@ -237,7 +238,10 @@ class StableAudioEngine:
         apg: float = 1.0,
         free_models: bool = False,
         progress_callback = None,
-        out_path: str = None
+        out_path: str = None,
+        channel_weights=None,
+        renormalize: bool = False,
+        latent_sink: list = None,
     ) -> str:
         """
         Runs the Stable Audio 3 generation pipeline.
@@ -253,7 +257,8 @@ class StableAudioEngine:
         if not decoder_name or decoder_name == "auto":
             decoder_name = DIT_CHOICES[dit_name]["default_decoder"]
 
-        print(f"[Engine] Starting generation: prompt='{prompt}', mode={'inpaint' if inpaint_range else 'audio-to-audio' if init_audio_path else 'text-to-audio'}, seed={seed}")
+        has_init = init_audio_path is not None or init_audio_array is not None
+        print(f"[Engine] Starting generation: prompt='{prompt}', mode={'inpaint' if inpaint_range else 'audio-to-audio' if has_init else 'text-to-audio'}, seed={seed}")
 
         # Derivations
         dtype = mx.float16  # Use fp16 for DiT
@@ -318,13 +323,19 @@ class StableAudioEngine:
         print(f"[Engine] Conditioning finished in {(time.time()-t0)*1000:.0f} ms")
 
         # 3a. Audio-to-Audio / Inpaint / Extend encoding
+        # `init_audio_array` is the in-memory equivalent of `init_audio_path`:
+        # the live loop hands over already-decoded (2, T) float32 audio so a
+        # generation every few seconds never has to round-trip through disk.
         init_latents = None
-        if init_audio_path:
+        if init_audio_path or init_audio_array is not None:
             t0 = time.time()
             enc_model, pad_mod = self.load_encoder(decoder_name, mx.float32)
-            
-            def prep_audio(path: str):
-                arr = self.read_wav(path)
+
+            def prep_audio(src):
+                arr = src if isinstance(src, np.ndarray) else self.read_wav(src)
+                arr = np.asarray(arr, dtype=np.float32)
+                if arr.ndim == 1:
+                    arr = np.stack([arr, arr], axis=0)
                 if arr.shape[-1] >= target_samples:
                     arr = arr[:, :target_samples]
                 else:
@@ -340,7 +351,7 @@ class StableAudioEngine:
                 mx.eval(latents)
                 return latents.astype(dtype)
 
-            audio_np = prep_audio(init_audio_path)
+            audio_np = prep_audio(init_audio_array if init_audio_array is not None else init_audio_path)
 
             if init_audio_path_2 and blend_method == "waveform":
                 print(f"[Engine] Performing Pre-Encoder Waveform Mix (A vs B ratio = {blend_ratio:.2f})")
@@ -468,11 +479,69 @@ class StableAudioEngine:
             self.dit_model = None
             self._free_to_pool()
 
-        # 4. Decode latents -> audio patches
+        # 4 & 5. Decode -> unpatch -> WAV.
+        self.decode_latents_to_wav(
+            latents, decoder_name=decoder_name, seconds=seconds,
+            out_path=str(out_wav_path), free_models=free_models,
+            channel_weights=channel_weights, renormalize=renormalize,
+        )
+
+        if latent_sink is not None:
+            # Callers that want to re-decode later (the live app's latent shelf)
+            # keep the pre-decode latents without changing this method's
+            # long-standing return type.
+            latent_sink.append(latents)
+
+        total_time = time.time() - t_start
+        print(f"[Engine] Generation completed successfully in {total_time:.2f}s. Saved to {out_wav_path}")
+
+        return str(out_wav_path)
+
+    def apply_channel_weights(self, latents: mx.array, weights, renormalize: bool = False) -> mx.array:
+        """Scale each of the 256 latent channels by `weights` (a 256-vector in [0,1]).
+
+        This is direct surgery on the latent geometry: channel c is attenuated
+        toward silence as weights[c] -> 0. Because SAME's softnorm bottleneck
+        expects a particular overall scale, heavily attenuated curves drift off
+        the learned manifold; `renormalize` restores the original global RMS so
+        timbral change can be judged separately from a simple loss of level.
+        """
+        if weights is None:
+            return latents
+        w = np.asarray(weights, dtype=np.float32).reshape(-1)
+        n_ch = latents.shape[1]
+        if w.shape[0] != n_ch:
+            raise ValueError(f"expected {n_ch} channel weights, got {w.shape[0]}")
+        wm = mx.array(w).reshape(1, n_ch, 1).astype(latents.dtype)
+        out = latents * wm
+        if renormalize:
+            before = mx.sqrt(mx.mean(latents.astype(mx.float32) ** 2))
+            after = mx.sqrt(mx.mean(out.astype(mx.float32) ** 2))
+            out = out * (before / mx.maximum(after, 1e-6)).astype(out.dtype)
+        mx.eval(out)
+        return out
+
+    def decode_latents_to_wav(
+        self,
+        latents: mx.array,
+        decoder_name: str,
+        seconds: float,
+        out_path: str,
+        free_models: bool = False,
+        channel_weights=None,
+        renormalize: bool = False,
+    ) -> str:
+        """Decode latents to audio and write a WAV. Split out of generate() so the
+        live app can re-decode a cached latent under a new channel-weight curve
+        without paying for sampling again (~49 ms vs ~330 ms for a 5 s clip)."""
+        T_lat = latents.shape[-1]
+
+        latents = self.apply_channel_weights(latents, channel_weights, renormalize)
+
         t0 = time.time()
         decoder_model, chunk_fn, (chunk, ovl) = self.load_decoder(decoder_name, mx.float32)
         latents_fp32 = latents.astype(mx.float32)
-        
+
         kernel = chunk + 2 * ovl
         if T_lat > kernel:
             patches = chunk_fn(decoder_model, latents_fp32, chunk, ovl)
@@ -480,7 +549,7 @@ class StableAudioEngine:
             patches = decoder_model(latents_fp32)
         else:
             patches = chunk_fn(decoder_model, latents_fp32, 2, 2)
-            
+
         mx.eval(patches)
         print(f"[Engine] Decoding finished in {(time.time()-t0)*1000:.0f} ms")
 
@@ -489,22 +558,17 @@ class StableAudioEngine:
             self.decoder = None
             self._free_to_pool()
 
-        # 5. Unpatch -> audio + save WAV
+        # Unpatch -> audio + save WAV
         t0 = time.time()
         audio = patched_decode(patches, patch_size=256, channels=2)
         mx.eval(audio)
         audio_np = np.array(audio.astype(mx.float32))[0]
-        
+
         # Trim to exact requested seconds
         requested_samples = int(round(seconds * SAMPLE_RATE))
         if audio_np.shape[-1] > requested_samples:
             audio_np = audio_np[..., :requested_samples]
-            
-        self.save_wav(str(out_wav_path), audio_np)
+
+        self.save_wav(out_path, audio_np)
         print(f"[Engine] Unpatch & write WAV finished in {(time.time()-t0)*1000:.0f} ms")
-        
-        total_time = time.time() - t_start
-        audio_len_sec = audio_np.shape[-1] / SAMPLE_RATE
-        print(f"[Engine] Generation completed successfully in {total_time:.2f}s ({audio_len_sec / total_time:.2f}x realtime). Saved to {out_wav_path}")
-        
-        return str(out_wav_path)
+        return out_path

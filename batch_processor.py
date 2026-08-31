@@ -242,7 +242,7 @@ def main():
             v_t0 = time.time()
 
             try:
-                res_path, res_dur, res_sr = engine.generate(
+                engine.generate(
                     prompt=args.prompt,
                     negative_prompt="",
                     init_audio_path=str(orig_wav_path),
@@ -262,7 +262,7 @@ def main():
                     "filename": out_variant_name,
                     "noise_level": noise,
                     "seed": file_seed,
-                    "duration": round(res_dur, 2),
+                    "duration": round(audio_duration, 2),
                     "generation_time_seconds": round(v_elapsed, 2)
                 })
             except Exception as e:

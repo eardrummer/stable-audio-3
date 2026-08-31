@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.js';
+import { drawSpectrogram } from './shared/spectrogram';
 import {
   Play,
   Pause,
@@ -31,6 +32,10 @@ import {
 // API Base URL
 const API_URL = 'http://localhost:8000';
 const WS_URL = 'ws://localhost:8000';
+
+// The variant wheel spans 11 levels: delta 0.0 (the primary generation) plus
+// 10 progressively noisier steps of +0.02. Index 0 is the base / primary slot.
+const BASE_VARIANT_INDEX = 0;
 
 interface AudioItem {
   id: string;
@@ -72,56 +77,6 @@ const intFromFilename = (filename: string): number => {
     return parseInt(parts[parts.length - 1], 10);
   } catch (e) {
     return 0;
-  }
-};
-
-// Optimized Canvas Copy-Shift Spectrogram Drawer
-const drawSpectrogram = (
-  canvas: HTMLCanvasElement, 
-  analyser: AnalyserNode, 
-  colorTheme: 'cyan' | 'green'
-) => {
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-  
-  const width = canvas.width;
-  const height = canvas.height;
-  
-  // 1. Scroll canvas down by 2px
-  ctx.drawImage(canvas, 0, 0, width, height, 0, 2, width, height);
-  
-  // 2. Capture and draw the new top slice
-  const bufferLength = analyser.frequencyBinCount;
-  const dataArray = new Uint8Array(bufferLength);
-  analyser.getByteFrequencyData(dataArray);
-  
-  const sliceWidth = width / bufferLength;
-  
-  for (let i = 0; i < bufferLength; i++) {
-    const value = dataArray[i]; // 0 - 255
-    const percent = value / 255.0;
-    
-    if (value > 0) {
-      let color = '';
-      if (colorTheme === 'cyan') {
-        // Cyan theme: deep blue/purple to glowing cyan
-        const r = 0;
-        const g = Math.round(percent * 240);
-        const b = Math.round(150 + percent * 105);
-        color = `rgba(${r}, ${g}, ${b}, ${percent * 0.45})`; // Semi-transparent glow
-      } else {
-        // Green theme: deep forest jade to glowing neon green
-        const r = 0;
-        const g = Math.round(180 + percent * 75);
-        const b = Math.round(percent * 102);
-        color = `rgba(${r}, ${g}, ${b}, ${percent * 0.45})`; // Semi-transparent glow
-      }
-      ctx.fillStyle = color;
-      ctx.fillRect(i * sliceWidth, 0, sliceWidth + 1, 2);
-    } else {
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
-      ctx.fillRect(i * sliceWidth, 0, sliceWidth + 1, 2);
-    }
   }
 };
 
@@ -239,7 +194,7 @@ export default function App() {
   
   // 2D Fine Control Noise Variants (21 noise levels, each with 5 seed variations)
   const [variants, setVariants] = useState<VariantItem[]>([]);
-  const [activeVariantIndex, setActiveVariantIndex] = useState<number>(10); // Index 10 is delta = 0.0 (Center)
+  const [activeVariantIndex, setActiveVariantIndex] = useState<number>(BASE_VARIANT_INDEX); // delta = 0.0 (the primary generation)
   const [activeSeedIndex, setActiveSeedIndex] = useState<number>(0); // Index 0 is primary generation
   
   // Global Tape Deck Transport States
@@ -387,10 +342,10 @@ export default function App() {
           
           const actualSeed = intFromFilename(data.filename);
 
-          // Populate the Center (CTR) Variant 0
+          // Populate the base (delta 0.0) row, seed 0
           setVariants(prev => {
             return prev.map((v, idx) => {
-              if (idx === 10) {
+              if (idx === BASE_VARIANT_INDEX) {
                 const updatedSeeds = [...v.seeds];
                 updatedSeeds[0] = {
                   seed: actualSeed,
@@ -412,7 +367,7 @@ export default function App() {
           });
           setActiveOutputUrl(`${API_URL}${data.wav_url}`);
           setActiveSeedIndex(0); // Reset to seed index 0
-          setActiveVariantIndex(0); // Reset to base 0.0
+          setActiveVariantIndex(BASE_VARIANT_INDEX); // Reset to base 0.0
           fetchHistory();
         } else if (data.type === 'variant_start') {
           // Background variant generation started!
@@ -1774,7 +1729,7 @@ export default function App() {
       };
     });
     setVariants(initialVariants);
-    setActiveVariantIndex(0); // Base is index 0
+    setActiveVariantIndex(BASE_VARIANT_INDEX); // Base is delta 0.0
     setActiveSeedIndex(0); // Primary is seed index 0
 
     const payload: any = {
@@ -1785,7 +1740,7 @@ export default function App() {
       apg: 1.0,
       seed: seed === '' ? undefined : Number(seed),
       dit_name: ditName,
-      decoder_name: decoder_name => undefined, // Unused parameter mapping
+      decoder_name: 'auto', // Let the backend pair the codec to the chosen DiT
       free_models: freeModels,
       connection_id: connectionId,
       save_history: saveHistory  // Support memory toggle!
@@ -1888,10 +1843,10 @@ export default function App() {
       });
       setActiveOutputUrl(`${API_URL}${data.wav_url}`);
       
-      // Update Center node (index 10, seed 0) in the variations matrix to be ready and store its seed!
+      // Update the base node (delta 0.0, seed 0) in the variations matrix to be ready and store its seed!
       setVariants(prev => {
         return prev.map((v, idx) => {
-          if (idx === 10) { // Center
+          if (idx === BASE_VARIANT_INDEX) {
             const updatedSeeds = [...v.seeds];
             updatedSeeds[0] = {
               seed: data.variants_matrix?.[0]?.seeds?.[0]?.seed || (seed === '' ? 0 : Number(seed)),
@@ -1941,8 +1896,8 @@ export default function App() {
       return;
     }
 
-    // Retrieve the actual base seed from the Center node (index 10, seed 0)
-    const baseSeed = variants[10]?.seeds[0]?.seed || 0;
+    // Retrieve the actual base seed from the base node (delta 0.0, seed 0)
+    const baseSeed = variants[BASE_VARIANT_INDEX]?.seeds[0]?.seed || 0;
     
     setIsGenerating(true);
     setErrorMsg(null);
@@ -3325,7 +3280,7 @@ export default function App() {
                   <>
                     <div className="monitor-modal-meta" style={{ gap: '1rem', padding: '0.4rem 0.8rem', marginBottom: '0.8rem' }}>
                       <span className="meta-item"><strong>PROMPT:</strong> "{prompt || 'Unconditional'}"</span>
-                      <span className="meta-item"><strong>BASE SEED:</strong> {variants[0]?.seeds[0]?.seed || 'N/A'}</span>
+                      <span className="meta-item"><strong>BASE SEED:</strong> {variants[BASE_VARIANT_INDEX]?.seeds[0]?.seed || 'N/A'}</span>
                     </div>
 
                     <div className="matrix-grid-with-scrubber">

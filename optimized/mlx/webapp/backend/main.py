@@ -17,6 +17,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BACKEND_DIR))
 
 from engine import StableAudioEngine, SAMPLE_RATE
+import live as live_module
 
 app = FastAPI(title="Stable Audio 3 MLX Local UI Backend")
 
@@ -32,6 +33,9 @@ app.add_middleware(
 # Initialize Engine
 engine = StableAudioEngine()
 
+# Live app (separate UI at live.html) shares this engine and process.
+app.include_router(live_module.build_router(engine))
+
 # Active WebSocket connections for streaming progress
 # connection_id -> WebSocket
 active_connections = {}
@@ -44,6 +48,7 @@ event_loop = None
 async def startup_event():
     global event_loop
     event_loop = asyncio.get_running_loop()
+    live_module.set_event_loop(event_loop)
     print("[Server] FastAPI Startup complete. Event loop captured.")
 
 # History Database Helper
