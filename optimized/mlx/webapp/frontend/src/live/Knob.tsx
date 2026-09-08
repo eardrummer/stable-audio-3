@@ -15,6 +15,7 @@ export interface KnobProps {
   armed?: boolean;            // this control is the one awaiting a CC
   bound?: string | null;      // e.g. "CC 16" once assigned
   onArm?: (id: string) => void;
+  disabled?: boolean;
 }
 
 const SWEEP = 270;            // degrees of travel, classic 7-o'clock to 5-o'clock
@@ -27,6 +28,7 @@ const SWEEP = 270;            // degrees of travel, classic 7-o'clock to 5-o'clo
 export default function Knob({
   id, label, value, min = 0, max = 1, step = 0.01, values,
   format, onChange, learning = false, armed = false, bound = null, onArm,
+  disabled = false,
 }: KnobProps) {
   const dragRef = useRef<{ y: number; v: number } | null>(null);
   // onChange identity changes every render; keep the pointer handlers stable.
@@ -50,6 +52,7 @@ export default function Knob({
   }, [lo, hi, step, values]);
 
   const onPointerDown = (e: React.PointerEvent) => {
+    if (disabled) return;
     if (learning) { onArm?.(id); return; }
     (e.target as Element).setPointerCapture(e.pointerId);
     dragRef.current = { y: e.clientY, v: pos };
@@ -71,7 +74,7 @@ export default function Knob({
   };
 
   const onWheel = (e: React.WheelEvent) => {
-    if (learning) return;
+    if (learning || disabled) return;
     const inc = values ? 1 : step;
     commit(pos + (e.deltaY < 0 ? inc : -inc));
   };
@@ -93,7 +96,7 @@ export default function Knob({
     : values ? String(value) : value.toFixed(step < 0.1 ? 2 : 1);
 
   return (
-    <div className={`knob ${learning ? 'learning' : ''} ${armed ? 'armed' : ''}`}>
+    <div className={`knob ${learning ? 'learning' : ''} ${armed ? 'armed' : ''} ${disabled ? 'disabled' : ''}`}>
       <svg
         width="64" height="64" viewBox="0 0 64 64"
         className="knob-dial"
@@ -102,7 +105,7 @@ export default function Knob({
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
         onWheel={onWheel}
-        onDoubleClick={() => !learning && commit((hi - lo) / 2 + lo)}
+        onDoubleClick={() => !learning && !disabled && commit((hi - lo) / 2 + lo)}
         role="slider"
         aria-label={label}
         aria-valuenow={value}

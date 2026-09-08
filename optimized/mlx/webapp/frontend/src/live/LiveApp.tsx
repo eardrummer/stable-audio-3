@@ -1,35 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight } from 'lucide-react';
+import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2, RefreshCw } from 'lucide-react';
 import Knob from './Knob';
 import LatentShelf from './LatentShelf';
-import { drawSpectrogram } from '../shared/spectrogram';
+import StrudelPanel from './StrudelPanel';
+import MidiSlider from './MidiSlider';
+import TrackOutput, { type TrackHandle } from './TrackOutput';
+import {
+  API_URL, VARIANTS, VARIANT_DELTA, MAX_NUDGE, TRACK_THEME,
+  defaultTrack, type TrackParams,
+} from './trackTypes';
+import type { StrudelHandle } from './strudel/strudelEngine';
 import './live.css';
 
-const API_URL = 'http://localhost:8000';
-const WS_URL = 'ws://localhost:8000';
 
-const MODEL_SR = 44100;      // Stable Audio 3 is 44.1 kHz end to end
 // 32 beats at 60 BPM is 32 s, so the ring must hold that much for the longest
 // beat-denominated window. ~12 MB of Float32 at 48 kHz stereo.
 const MAX_BUFFER_SECS = 32;  // largest InputRate the ring buffer must hold
-// Crossfade timing. A new cycle overlaps the outgoing clip for as long as that
-// clip still has material left (capped below), so consecutive generations blend
-// instead of one being cut short. Variant switches stay snappy.
-const XF_MAX_CYCLE = 2.0;    // longest overlap between consecutive generations
-const XF_SWITCH = 0.25;      // variant switch / shelf re-decode
-const XF_MIN = 0.12;         // shortest fade that still avoids a click
+const MAX_LOOP_SECS = 60;    // ceiling on a recorded loop
 
-// Equal-power crossfade curves. sin²+cos² = 1, so the summed power stays flat
-// across the whole transition. (An exponential ramp is linear in *log* space —
-// at the midpoint both clips sit near -37 dB, which is an audible hole.)
-const CURVE_N = 128;
-const FADE_IN_CURVE = new Float32Array(CURVE_N);
-const FADE_OUT_CURVE = new Float32Array(CURVE_N);
-for (let i = 0; i < CURVE_N; i++) {
-  const th = (i / (CURVE_N - 1)) * (Math.PI / 2);
-  FADE_IN_CURVE[i] = Math.sin(th);
-  FADE_OUT_CURVE[i] = Math.cos(th);
-}
 const RATES = [1, 3, 5, 10];               // seconds, when Tempo is off
 const BEATS = [4, 8, 16, 32];              // beats, when Tempo is on
                                            // (1 beat is too short to diffuse well)
@@ -37,7 +25,6 @@ const TAP_RESET_MS = 2500;                 // gap after which a tap starts a new
 const TAP_HISTORY = 8;                     // intervals averaged for the estimate
 const CLICK_LOOKAHEAD_MS = 25;             // scheduler wake interval
 const CLICK_SCHEDULE_AHEAD = 0.12;         // seconds of clicks queued in advance
-const VARIANT_DELTA = 0.02;  // fixed noise step between successive variants
 
 type Bindings = Record<string, { channel: number; control: number }>;
 
@@ -62,9 +49,25 @@ function channelOptions(n: number): { value: string; label: string }[] {
   return opts;
 }
 
-interface CycleAudio {
-  cycle: number;
-  buffers: (AudioBuffer | null)[];
+/** Pre-rendered grain tiles: per-pixel randomness is too slow to redo each frame. */
+function makeGrain() {
+  const tiles: HTMLCanvasElement[] = [];
+  for (let t = 0; t < 4; t++) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d')!;
+    const img = g.createImageData(128, 128);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const v = Math.random() * 255;
+      img.data[i] = v * 0.72;          // slight green cast, to match the middle bar
+      img.data[i + 1] = v;
+      img.data[i + 2] = v * 0.72;
+      img.data[i + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    tiles.push(c);
+  }
+  return { tiles, pats: tiles.map(() => null as CanvasPattern | null) };
 }
 
 export default function LiveApp() {
@@ -73,36 +76,78 @@ export default function LiveApp() {
   const [connected, setConnected] = useState(false);
 
   // --- parameters -----------------------------------------------------
-  const [prompt, setPrompt] = useState('');
-  const [inputRate, setInputRate] = useState(5);        // seconds (Tempo off)
-  const [generateRate, setGenerateRate] = useState(5);
+  // One entry per output track. Track 2 appears when you press + .
+  const [tracks, setTracks] = useState<TrackParams[]>(() => [defaultTrack()]);
+  const [activeTab, setActiveTab] = useState(0);
+  // Index of the soloed track, or null. Solo silences the others.
+  const [solo, setSolo] = useState<number | null>(null);
+  // Master: knob (and MIDI) moves land on every track at once instead of just
+  // the active one, which converges tracks that have drifted apart.
+  const [masterMode, setMasterMode] = useState(false);
+  const masterRef = useRef(false);
+  useEffect(() => { masterRef.current = masterMode; }, [masterMode]);
+  const trackRefs = useRef<(TrackHandle | null)[]>([]);
+  const activeTabRef = useRef(0);
+  useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+
+  const patchTrack = useCallback((i: number, patch: Partial<TrackParams>) => {
+    setTracks(ts => ts.map((t, j) => (j === i ? { ...t, ...patch } : t)));
+  }, []);
+  /** Knobs and MIDI act on the active track — or on every track when MASTER
+   *  is engaged. Reads still come from the active track, so a knob shows one
+   *  value; turning it in master mode makes the tracks agree. */
+  const patchActive = useCallback((patch: Partial<TrackParams>) => {
+    setTracks(ts => ts.map((t, j) =>
+      (masterRef.current || j === activeTabRef.current ? { ...t, ...patch } : t)));
+  }, []);
+  const [inputRate, setInputRate] = useState(10);       // seconds (Tempo off)
+  const [generateRate, setGenerateRate] = useState(10);
   const [tempoOn, setTempoOn] = useState(false);
   const [bpm, setBpm] = useState<number | null>(null);
-  const [inputBeats, setInputBeats] = useState(8);       // beats  (Tempo on)
-  const [generateBeats, setGenerateBeats] = useState(4);
+  const [inputBeats, setInputBeats] = useState(32);      // beats  (Tempo on)
+  const [generateBeats, setGenerateBeats] = useState(32);
   const tapsRef = useRef<number[]>([]);
   const [bpmText, setBpmText] = useState('');
   const [clickOn, setClickOn] = useState(false);
   const [clickLevel, setClickLevel] = useState(0.5);
-  const [loopback, setLoopback] = useState(0);
-  const [noise, setNoise] = useState(0.35);
-  const [steps, setSteps] = useState(8);
-  const [cfg, setCfg] = useState(4.0);
+
+  // Looper (Live Input only) and the optional live-input blend for the other modes.
+  const [loopState, setLoopState] = useState<'idle' | 'recording' | 'stopped' | 'playing'>('idle');
+  const [loopLen, setLoopLen] = useState(0);
+  const [trim, setTrim] = useState<[number, number]>([0, 0]);
+  const [recSecs, setRecSecs] = useState(0);
+  const [auxOn, setAuxOn] = useState(false);
+  const [auxLevel, setAuxLevel] = useState(0.6);
+  // Align the analysis window to the loop's own boundary rather than to the
+  // moment START was pressed. Off by default so the old behaviour is intact.
+  const [syncLoop, setSyncLoop] = useState(false);
+  const [syncBack, setSyncBack] = useState(0);
+  const syncRef = useRef(false);
+  useEffect(() => { syncRef.current = syncLoop; }, [syncLoop]);
+  const fileLoopRef = useRef<{ origin: number; period: number } | null>(null);
   const [model, setModel] = useState<'sm-music' | 'sm-sfx' | 'medium'>('sm-music');
-  const [variant, setVariant] = useState(0);
-  const VARIANTS = 5;
+  // Off by default: one generation per cycle is 5x faster, and the ladder is
+  // only worth paying for when you are actually auditioning across it.
+  const cur = tracks[activeTab] ?? tracks[0];
+  const activeVariants = cur.multiVariant ? VARIANTS : 1;
 
   const [inputMonitor, setInputMonitor] = useState(0);   // muted by default
-  const [outputMonitor, setOutputMonitor] = useState(0.8);
 
   // --- latent shelf ----------------------------------------------------
   const [shelfOpen, setShelfOpen] = useState(false);
-  const [renormalize, setRenormalize] = useState(false);
   const [shelfBusy, setShelfBusy] = useState(false);
+  const [renormalize, setRenormalize] = useState(false);
 
   // --- input source: live hardware, or a file looped as a stand-in ------
-  const [inputSource, setInputSource] = useState<'mic' | 'file'>('mic');
+  const [inputSource, setInputSource] = useState<'mic' | 'file' | 'code'>('mic');
+  const [strudelReady, setStrudelReady] = useState(false);
+  const [strudelPlaying, setStrudelPlaying] = useState(false);
+  const [strudelBanks, setStrudelBanks] = useState<string[]>([]);
+  const [strudelError, setStrudelError] = useState<string | null>(null);
+  const strudelRef = useRef<StrudelHandle | null>(null);
   const [fileInfo, setFileInfo] = useState<{ name: string; duration: number } | null>(null);
+  const inputSourceRef = useRef(inputSource);
+  useEffect(() => { inputSourceRef.current = inputSource; }, [inputSource]);
 
   // --- devices / status ----------------------------------------------
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -113,9 +158,6 @@ export default function LiveApp() {
   const [detectedChannels, setDetectedChannels] = useState(2);
   const [captureRate, setCaptureRate] = useState<number | null>(null);
   const [status, setStatus] = useState('Idle');
-  const [cycleInfo, setCycleInfo] = useState<{ n: number; ms: number } | null>(null);
-  const [dropped, setDropped] = useState(0);
-  const [fadeInfo, setFadeInfo] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // --- MIDI ------------------------------------------------------------
@@ -129,14 +171,10 @@ export default function LiveApp() {
   });
 
   // --- refs ------------------------------------------------------------
-  const wsRef = useRef<WebSocket | null>(null);
   const inCtxRef = useRef<AudioContext | null>(null);
-  const outCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const inGainRef = useRef<GainNode | null>(null);
-  const outGainRef = useRef<GainNode | null>(null);
   const inAnalyserRef = useRef<AnalyserNode | null>(null);
-  const outAnalyserRef = useRef<AnalyserNode | null>(null);
   const procRef = useRef<ScriptProcessorNode | null>(null);
   const fileRef = useRef<File | null>(null);
   const fileSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -145,18 +183,28 @@ export default function LiveApp() {
   const nextClickRef = useRef(0);
   const clickBeatRef = useRef(0);
   const bpmRef = useRef<number | null>(null);
+  const inputMixerRef = useRef<GainNode | null>(null);
+  const micGainRef = useRef<GainNode | null>(null);
+  const mainGainRef = useRef<GainNode | null>(null);
+  const loopGainRef = useRef<GainNode | null>(null);
+  const loopSrcRef = useRef<AudioBufferSourceNode | null>(null);
+  const loopBufRef = useRef<AudioBuffer | null>(null);
+  const loopPeaksRef = useRef<Float32Array | null>(null);
+  const recRef = useRef<{ chunks: Float32Array[][]; frames: number } | null>(null);
+  const loopStartedAtRef = useRef(0);
+  const dragHandleRef = useRef<0 | 1 | null>(null);
+  const auxStreamRef = useRef<MediaStream | null>(null);
   const splitterRef = useRef<ChannelSplitterNode | null>(null);
   const mergerRef = useRef<ChannelMergerNode | null>(null);
   const filePickerRef = useRef<HTMLInputElement | null>(null);
   const waveCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const specCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const noiseCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const grainRef = useRef<{ tiles: HTMLCanvasElement[]; pats: (CanvasPattern | null)[] } | null>(null);
+  const frameRef = useRef(0);
   const rafRef = useRef<number | null>(null);
   const timerRef = useRef<number | null>(null);
 
   const ringRef = useRef<{ l: Float32Array; r: Float32Array; w: number; filled: number; sr: number } | null>(null);
-  const cycleRef = useRef<CycleAudio | null>(null);
-  const pendingHeaderRef = useRef<any>(null);
-  const playingRef = useRef<{ src: AudioBufferSourceNode; gain: GainNode; startedAt: number } | null>(null);
 
   // With Tempo engaged the rate knobs are denominated in beats; everything
   // downstream still works in seconds, so convert here and clamp the window to
@@ -202,21 +250,24 @@ export default function LiveApp() {
     }
   }, [bpmText, bpm]);
 
-  // Params the socket send path reads; refs avoid re-opening the WS per edit.
-  const paramsRef = useRef({ prompt, inputRate: effInputRate, generateRate: effGenerateRate,
-                             noise, steps, cfg, model, loopback, variant });
+  // Only shared, input-side values now; each track owns its own generation
+  // parameters and sends them over its own socket.
+  const paramsRef = useRef({ inputRate: effInputRate, generateRate: effGenerateRate });
   useEffect(() => {
-    paramsRef.current = { prompt, inputRate: effInputRate, generateRate: effGenerateRate,
-                          noise, steps, cfg, model, loopback, variant };
-  }, [prompt, effInputRate, effGenerateRate, noise, steps, cfg, model, loopback, variant]);
-  const variantRef = useRef(variant);
-  useEffect(() => { variantRef.current = variant; }, [variant]);
+    paramsRef.current = { inputRate: effInputRate, generateRate: effGenerateRate };
+  }, [effInputRate, effGenerateRate]);
   // The canvas loop runs once and reads this, so noise can drive the wash
   // without restarting the animation frame on every knob move.
   const tempoRef = useRef(false);
   useEffect(() => { tempoRef.current = tempoOn && bpm !== null; }, [tempoOn, bpm]);
-  const noiseRef = useRef(noise);
-  useEffect(() => { noiseRef.current = noise; }, [noise]);
+  const loopStateRef = useRef(loopState);
+  useEffect(() => { loopStateRef.current = loopState; }, [loopState]);
+  const trimRef = useRef(trim);
+  useEffect(() => { trimRef.current = trim; }, [trim]);
+  const loopLenRef = useRef(loopLen);
+  useEffect(() => { loopLenRef.current = loopLen; }, [loopLen]);
+  const noiseRef = useRef(cur.noise);
+  useEffect(() => { noiseRef.current = cur.noise; }, [cur.noise]);
   const runningRef = useRef(running);
   useEffect(() => { runningRef.current = running; }, [running]);
 
@@ -334,14 +385,19 @@ export default function LiveApp() {
     } else if (id === 'generateRate') {
       if (tempoRef.current) setGenerateBeats(pick(BEATS)); else setGenerateRate(pick(RATES));
     }
-    else if (id === 'noise') setNoise(Number(lerp(0.05, 1).toFixed(2)));
-    else if (id === 'steps') setSteps(Math.round(lerp(1, 16)));
-    else if (id === 'cfg') setCfg(Number(lerp(1, 10).toFixed(1)));
-    else if (id === 'variant') setVariant(Math.min(VARIANTS - 1, Math.floor(norm * VARIANTS)));
-    else if (id === 'loopback') setLoopback(Number(norm.toFixed(2)));
+    // Everything below is per track and lands on whichever tab is showing.
+    else if (id === 'noise') patchActive({ noise: Number(lerp(0.05, 1).toFixed(2)) });
+    else if (id === 'steps') patchActive({ steps: Math.round(lerp(1, 16)) });
+    else if (id === 'cfg') patchActive({ cfg: Number(lerp(1, 10).toFixed(1)) });
+    else if (id === 'variant') patchActive({ variant: Math.floor(norm * VARIANTS) });
+    else if (id === 'loopback') patchActive({ loopback: Number(norm.toFixed(2)) });
+    else if (id === 'nudge') patchActive({ nudge: Number((norm * MAX_NUDGE).toFixed(2)) });
     else if (id === 'inputMonitor') setInputMonitor(Number(norm.toFixed(2)));
-    else if (id === 'outputMonitor') setOutputMonitor(Number(norm.toFixed(2)));
-  }, []);
+    else if (id.startsWith('outputMonitor')) {
+      const t = Number(id.slice('outputMonitor'.length)) || 0;
+      patchTrack(t, { outputMonitor: Number(norm.toFixed(2)) });
+    }
+  }, [patchActive, patchTrack]);
 
   const bindingLabel = (id: string) => {
     const b = bindings[id];
@@ -351,86 +407,6 @@ export default function LiveApp() {
   // ─────────────────────────────────────────────────────────────────────
   // Output playback: decode, crossfade, drive the falling spectrogram
   // ─────────────────────────────────────────────────────────────────────
-  const ensureOutputCtx = () => {
-    if (!outCtxRef.current) {
-      const ctx = new AudioContext();
-      const gain = ctx.createGain();
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.6;
-      analyser.connect(gain);
-      gain.connect(ctx.destination);
-      gain.gain.value = outputMonitor;
-      outCtxRef.current = ctx;
-      outGainRef.current = gain;
-      outAnalyserRef.current = analyser;
-    }
-    return outCtxRef.current!;
-  };
-
-  /** Start `buf`, equal-power crossfading out whatever is currently playing.
-   *  The fade lasts as long as the outgoing clip still has audio left (up to
-   *  `maxFade`), so the two genuinely overlap rather than one being truncated. */
-  const crossfadeTo = useCallback((buf: AudioBuffer, offset = 0, maxFade = XF_MAX_CYCLE) => {
-    const ctx = ensureOutputCtx();
-    const now = ctx.currentTime;
-    const prev = playingRef.current;
-
-    let fade: number;
-    if (prev?.src.buffer) {
-      const remaining = prev.src.buffer.duration - (now - prev.startedAt);
-      fade = Math.max(XF_MIN, Math.min(maxFade, remaining));
-    } else {
-      fade = 0.02;   // nothing to fade from — just de-click the attack
-    }
-    // Never fade for longer than the incoming clip actually lasts.
-    fade = Math.min(fade, Math.max(0.02, buf.duration - offset));
-    setFadeInfo(fade);
-
-    const gain = ctx.createGain();
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(gain);
-    gain.connect(outAnalyserRef.current!);
-
-    try {
-      gain.gain.setValueCurveAtTime(FADE_IN_CURVE, now, fade);
-    } catch {
-      // A curve can be rejected if one is still running on this param.
-      gain.gain.setValueAtTime(0, now);
-      gain.gain.linearRampToValueAtTime(1, now + fade);
-    }
-
-    if (prev) {
-      const g = prev.gain.gain;
-      const from = g.value;
-      try {
-        g.cancelScheduledValues(now);
-        // Scale the curve so a clip still fading in descends from where it is.
-        g.setValueCurveAtTime(FADE_OUT_CURVE.map(v => v * from), now, fade);
-      } catch {
-        g.cancelScheduledValues(now);
-        g.setValueAtTime(from, now);
-        g.linearRampToValueAtTime(0, now + fade);
-      }
-      prev.src.stop(now + fade + 0.03);
-    }
-
-    src.start(now, Math.min(offset, Math.max(0, buf.duration - 0.05)));
-    playingRef.current = { src, gain, startedAt: now - offset };
-  }, []);
-
-  // Switching the variant knob mid-clip swaps lanes at the same position.
-  useEffect(() => {
-    const cyc = cycleRef.current;
-    const cur = playingRef.current;
-    if (!cyc || !cur || !outCtxRef.current) return;
-    const buf = cyc.buffers[variant];
-    if (!buf) return;
-    const offset = outCtxRef.current.currentTime - cur.startedAt;
-    if (offset >= 0 && offset < buf.duration - 0.1) crossfadeTo(buf, offset, XF_SWITCH);
-  }, [variant, crossfadeTo]);
-
   // Re-pick the input channel(s) without stopping the loop — useful for moving
   // from, say, a guitar on input 1 to a mic on input 2 mid-performance.
   useEffect(() => {
@@ -446,7 +422,6 @@ export default function LiveApp() {
     }
   }, [chanSel, detectedChannels]);
 
-  useEffect(() => { if (outGainRef.current) outGainRef.current.gain.value = outputMonitor; }, [outputMonitor]);
   useEffect(() => { if (inGainRef.current) inGainRef.current.gain.value = inputMonitor; }, [inputMonitor]);
 
   // ─────────────────────────────────────────────────────────────────────
@@ -458,26 +433,48 @@ export default function LiveApp() {
 
       const wc = waveCanvasRef.current;
       const an = inAnalyserRef.current;
-      if (wc && an) {
+      const peaks = loopPeaksRef.current;
+      const showLoop = peaks && (loopStateRef.current === 'stopped' || loopStateRef.current === 'playing');
+
+      if (wc && showLoop && peaks) {
+        // Static view of the captured loop, with the trimmed region lit and a
+        // playhead sweeping the part that actually sounds.
+        const ctx2 = wc.getContext('2d');
+        if (ctx2) {
+          const w = wc.width, h = wc.height, mid = h / 2;
+          ctx2.clearRect(0, 0, w, h);
+          const [t0, t1] = trimRef.current;
+          const len = loopLenRef.current || 1;
+          const x0 = (t0 / len) * w, x1 = (t1 / len) * w;
+          ctx2.fillStyle = 'rgba(0,0,0,.45)';
+          ctx2.fillRect(0, 0, x0, h);
+          ctx2.fillRect(x1, 0, w - x1, h);
+          for (let c = 0; c < peaks.length; c++) {
+            const x = (c / peaks.length) * w;
+            const inTrim = x >= x0 && x <= x1;
+            ctx2.fillStyle = inTrim ? 'rgba(255,255,255,.85)' : 'rgba(255,255,255,.22)';
+            const a = Math.max(1, peaks[c] * mid);
+            ctx2.fillRect(x, mid - a, Math.max(1, w / peaks.length), a * 2);
+          }
+          ctx2.fillStyle = '#8ad18a';
+          ctx2.fillRect(x0 - 1, 0, 3, h);
+          ctx2.fillRect(x1 - 1, 0, 3, h);
+          const c2 = inCtxRef.current;
+          if (loopStateRef.current === 'playing' && c2) {
+            const span = Math.max(0.05, t1 - t0);
+            const pos = t0 + ((c2.currentTime - loopStartedAtRef.current) % span);
+            ctx2.fillStyle = 'rgba(138,209,138,.9)';
+            ctx2.fillRect((pos / len) * w, 0, 2, h);
+          }
+        }
+      } else if (wc && an) {
         const ctx = wc.getContext('2d');
         if (ctx) {
           const w = wc.width, h = wc.height;
           const data = new Uint8Array(an.fftSize);
           an.getByteTimeDomainData(data);
-          ctx.fillStyle = '#000';
-          ctx.fillRect(0, 0, w, h);
-
-          // Noise wash: the middle rectangle's green bleeds leftward into the
-          // input's background, reaching further and sitting heavier as more
-          // noise is added — the input is visibly being obscured by it.
-          const nz = noiseRef.current;
-          const wash = ctx.createLinearGradient(w, 0, 0, 0);
-          const reach = Math.min(1, 0.12 + nz * 0.88);
-          wash.addColorStop(0, `rgba(140, 205, 150, ${0.08 + nz * 0.42})`);
-          wash.addColorStop(reach, 'rgba(140, 205, 150, 0)');
-          ctx.fillStyle = wash;
-          ctx.fillRect(0, 0, w, h);
-
+          // Transparent, so the grain layer behind it shows through.
+          ctx.clearRect(0, 0, w, h);
           ctx.strokeStyle = '#fff';
           ctx.lineWidth = 1.5;
           ctx.beginPath();
@@ -490,131 +487,250 @@ export default function LiveApp() {
         }
       }
 
-      const sc = specCanvasRef.current;
-      const oa = outAnalyserRef.current;
-      if (sc && oa) drawSpectrogram(sc, oa, 'green');
+      // Noise texture across the whole input side. It sits behind the waveform
+      // and behind the (translucent) code panel, so the amount of noise being
+      // added to the source is legible in every input mode.
+      const nc = noiseCanvasRef.current;
+      if (nc) {
+        if (!grainRef.current) grainRef.current = makeGrain();
+        const g = nc.getContext('2d');
+        const rect = nc.getBoundingClientRect();
+        if (g && rect.width > 0) {
+          if (nc.width !== Math.round(rect.width) || nc.height !== Math.round(rect.height)) {
+            nc.width = Math.round(rect.width);
+            nc.height = Math.round(rect.height);
+            grainRef.current.pats = grainRef.current.tiles.map(() => null);
+          }
+          g.clearRect(0, 0, nc.width, nc.height);
+          // Perceptual ramp: half-way on the knob should already read as heavy.
+          const alpha = 0.78 * Math.pow(noiseRef.current, 0.6);
+          if (alpha > 0.012) {
+            // Swap tiles every few frames so the grain shimmers rather than
+            // sitting still, without paying for per-pixel work each frame.
+            const i = Math.floor(frameRef.current / 3) % grainRef.current.tiles.length;
+            if (!grainRef.current.pats[i]) {
+              grainRef.current.pats[i] = g.createPattern(grainRef.current.tiles[i], 'repeat');
+            }
+            const pat = grainRef.current.pats[i];
+            if (pat) {
+              g.globalAlpha = alpha;
+              g.fillStyle = pat;
+              g.fillRect(0, 0, nc.width, nc.height);
+              g.globalAlpha = 1;
+            }
+          }
+        }
+      }
+      if (recRef.current && ringRef.current) {
+        setRecSecs(recRef.current.frames / ringRef.current.sr);
+      }
+      frameRef.current++;
+
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, []);
 
   // ─────────────────────────────────────────────────────────────────────
-  // WebSocket
-  // ─────────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const ws = new WebSocket(`${WS_URL}/ws/live/${connectionId}`);
-    ws.binaryType = 'arraybuffer';
-    wsRef.current = ws;
-
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => { setConnected(false); setRunning(false); };
-    ws.onerror = () => setError('WebSocket error — is the backend running?');
-
-    ws.onmessage = async (ev) => {
-      if (typeof ev.data !== 'string') {
-        const hdr = pendingHeaderRef.current;
-        pendingHeaderRef.current = null;
-        if (!hdr) return;
-        const ctx = ensureOutputCtx();
-        const buf = await ctx.decodeAudioData(ev.data as ArrayBuffer);
-        let cyc = cycleRef.current;
-        if (!cyc || cyc.cycle !== hdr.cycle) {
-          cyc = { cycle: hdr.cycle, buffers: new Array(VARIANTS).fill(null) };
-          cycleRef.current = cyc;
-        }
-        cyc.buffers[hdr.index] = buf;
-
-        if (hdr.redecode) {
-          // Same latent, new channel curve: swap it in at the position we are
-          // already at, so shaping the shelf is heard as a morph rather than a
-          // restart. Only if this lane is the one currently sounding.
-          setShelfBusy(false);
-          const cur = playingRef.current;
-          if (hdr.index === variantRef.current && cur && outCtxRef.current) {
-            const off = outCtxRef.current.currentTime - cur.startedAt;
-            crossfadeTo(buf, off >= 0 && off < buf.duration - 0.1 ? off : 0, XF_SWITCH);
-          }
-          return;
-        }
-
-        // Begin the new cycle as soon as the selected lane lands, rather than
-        // waiting for the whole family — keeps output continuous.
-        if (hdr.index === variantRef.current) crossfadeTo(buf, 0);
-        return;
-      }
-
-      const d = JSON.parse(ev.data);
-      switch (d.type) {
-        case 'variant': pendingHeaderRef.current = d; break;
-        case 'cycle_start': setStatus(`Generating cycle ${d.cycle}…`); break;
-        case 'cycle_complete':
-          setCycleInfo({ n: d.cycle, ms: d.total_ms });
-          setStatus('Listening');
-          break;
-        case 'dropped': setDropped(n => n + 1); break;
-        case 'midi_cc': applyMidi(d.channel, d.control, d.norm); break;
-        case 'error': setError(d.error); break;
-      }
-    };
-
-    return () => ws.close();
-  }, [connectionId, applyMidi, crossfadeTo]);
-
-  /** Push a new channel curve and ask the backend to re-render the audible
-   *  variant through it — a decode, not a regeneration. */
-  const sendWeights = useCallback((weights: Float32Array, renorm: boolean) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    setShelfBusy(true);
-    ws.send(JSON.stringify({
-      type: 'weights',
-      weights: Array.from(weights),
-      renormalize: renorm,
-      redecode_index: variantRef.current,
-    }));
-  }, []);
-
-  const sendParams = useCallback(() => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const p = paramsRef.current;
-    ws.send(JSON.stringify({
-      type: 'params',
-      params: {
-        prompt: p.prompt, input_rate: p.inputRate, generate_rate: p.generateRate,
-        noise: p.noise, variant_delta: VARIANT_DELTA, steps: p.steps,
-        cfg: p.cfg, variants: VARIANTS, model: p.model,
-        loopback: p.loopback, selected_variant: p.variant,
-      },
-    }));
-  }, []);
-
-  useEffect(() => { if (running) sendParams(); },
-    [prompt, noise, steps, cfg, model, effInputRate, effGenerateRate, loopback, variant,
-     running, sendParams]);
-
-  // ─────────────────────────────────────────────────────────────────────
   // Transport
   // ─────────────────────────────────────────────────────────────────────
+  /** Seconds elapsed since the current source's last loop boundary. */
+  const loopPhase = useCallback((): { phase: number; period: number } | null => {
+    const ctx = inCtxRef.current;
+    if (!ctx) return null;
+    const wrap = (v: number, m: number) => ((v % m) + m) % m;
+
+    if (inputSourceRef.current === 'code') return strudelRef.current?.getCyclePhase() ?? null;
+    if (loopStateRef.current === 'playing') {
+      const period = Math.max(0.05, trimRef.current[1] - trimRef.current[0]);
+      return { phase: wrap(ctx.currentTime - loopStartedAtRef.current, period), period };
+    }
+    const f = fileLoopRef.current;
+    if (inputSourceRef.current === 'file' && f && f.period > 0.05) {
+      return { phase: wrap(ctx.currentTime - f.origin, f.period), period: f.period };
+    }
+    return null;
+  }, []);
+
   const pushSnapshot = useCallback(() => {
-    const ws = wsRef.current;
     const ring = ringRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN || !ring) return;
+    if (!ring) return;
 
     const want = Math.min(Math.floor(paramsRef.current.inputRate * ring.sr), ring.filled);
     if (want < ring.sr * 0.25) return;    // less than 250 ms captured; nothing useful yet
 
-    // Unwrap the newest `want` samples out of the circular buffer.
+    // Loop sync: rewind so the window ENDS on a loop boundary instead of
+    // wherever the timer happened to fire. Costs up to one loop period of
+    // extra latency, and needs that much history behind the window.
+    let back = 0;
+    if (syncRef.current) {
+      const lp = loopPhase();
+      if (lp && lp.period > 0.05) {
+        const b = Math.floor(lp.phase * ring.sr);
+        if (want + b <= ring.filled && want + b <= ring.l.length) back = b;
+      }
+    }
+    setSyncBack(back / ring.sr);
+
+    // Unwrap `want` samples ending `back` samples before the write head.
     const inter = new Float32Array(want * 2);
-    const start = (ring.w - want + ring.l.length) % ring.l.length;
+    const end = (ring.w - back + ring.l.length) % ring.l.length;
+    const start = (end - want + ring.l.length) % ring.l.length;
     for (let i = 0; i < want; i++) {
       const j = (start + i) % ring.l.length;
       inter[i * 2] = ring.l[j];
       inter[i * 2 + 1] = ring.r[j];
     }
-    ws.send(JSON.stringify({ type: 'audio_header', channels: 2, sample_rate: ring.sr }));
-    ws.send(inter.buffer);
+    // Every track generates from the same snapshot.
+    const header = { type: 'audio_header', channels: 2, sample_rate: ring.sr };
+    for (const t of trackRefs.current) t?.push(header, inter.buffer);
   }, []);
+
+  const [isStarting, setIsStarting] = useState(false);
+
+  /** Lazily pull in the AGPL Strudel bundle, only when Live Code is used. */
+  const ensureStrudel = useCallback(async (): Promise<StrudelHandle | null> => {
+    if (strudelRef.current) return strudelRef.current;
+    try {
+      setStrudelError(null);
+      const { loadStrudel } = await import('./strudel/strudelEngine');
+      const h = await loadStrudel();
+      strudelRef.current = h;
+      setStrudelBanks(h.sampleBanks);
+      setStrudelReady(true);
+      const b = h.getBpm();
+      if (b) { setBpm(Math.round(b * 10) / 10); setTempoOn(true); }
+      return h;
+    } catch (e: any) {
+      setStrudelError(e?.message || String(e));
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (inputSource === 'code') void ensureStrudel();
+  }, [inputSource, ensureStrudel]);
+
+  const runStrudel = useCallback(async (code: string) => {
+    const h = strudelRef.current ?? await ensureStrudel();
+    if (!h) return;
+    try {
+      setStrudelError(null);
+      await h.evaluate(code);
+      setStrudelPlaying(true);
+      // Strudel is the tempo authority on evaluate: a setcpm in the pattern
+      // re-times the beat-denominated rate knobs to match what you hear.
+      const b = h.getBpm();
+      if (b && isFinite(b)) { setBpm(Math.round(b * 10) / 10); setTempoOn(true); }
+    } catch (e: any) {
+      setStrudelError(e?.message || String(e));
+    }
+  }, [ensureStrudel]);
+
+  const hushStrudel = useCallback(() => {
+    strudelRef.current?.hush();
+    setStrudelPlaying(false);
+  }, []);
+
+  // ...and the other direction: tapping or typing a BPM re-times the pattern.
+  useEffect(() => {
+    if (inputSource !== 'code' || !bpm) return;
+    const h = strudelRef.current;
+    if (!h) return;
+    const cur = h.getBpm();
+    if (cur == null || Math.abs(cur - bpm) > 0.05) h.setBpm(bpm);
+  }, [bpm, inputSource]);
+
+  // ── looper (Live Input) ──────────────────────────────────────────────
+  const startRec = useCallback(() => {
+    recRef.current = { chunks: [], frames: 0 };
+    setRecSecs(0);
+    setLoopState('recording');
+  }, []);
+
+  const stopRec = useCallback(() => {
+    const rec = recRef.current;
+    recRef.current = null;
+    const ctx = inCtxRef.current;
+    if (!rec || !ctx || rec.frames === 0) { setLoopState('idle'); return; }
+
+    const buf = ctx.createBuffer(2, rec.frames, ctx.sampleRate);
+    const L = buf.getChannelData(0), R = buf.getChannelData(1);
+    let off = 0;
+    for (const [l, r] of rec.chunks) { L.set(l, off); R.set(r, off); off += l.length; }
+    loopBufRef.current = buf;
+
+    // Pre-reduce to per-column peaks; redrawing 60x a second from the raw
+    // buffer would be far too slow for a minute of audio.
+    const COLS = 900;
+    const peaks = new Float32Array(COLS);
+    const per = Math.max(1, Math.floor(buf.length / COLS));
+    for (let c = 0; c < COLS; c++) {
+      let m = 0;
+      const s0 = c * per, s1 = Math.min(buf.length, s0 + per);
+      for (let i = s0; i < s1; i++) m = Math.max(m, Math.abs(L[i]));
+      peaks[c] = m;
+    }
+    loopPeaksRef.current = peaks;
+    setLoopLen(buf.duration);
+    setTrim([0, buf.duration]);
+    setLoopState('stopped');
+  }, []);
+
+  const playLoop = useCallback(() => {
+    const ctx = inCtxRef.current, buf = loopBufRef.current, g = loopGainRef.current;
+    if (!ctx || !buf || !g) return;
+    try { loopSrcRef.current?.stop(); } catch { /* not started */ }
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    src.loopStart = trim[0];
+    src.loopEnd = Math.max(trim[0] + 0.05, trim[1]);
+    src.connect(g);
+    src.start(0, trim[0]);
+    loopSrcRef.current = src;
+    loopStartedAtRef.current = ctx.currentTime;
+    g.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
+    // The loop replaces the hardware input as the model's source.
+    micGainRef.current?.gain.setTargetAtTime(0, ctx.currentTime, 0.01);
+    setLoopState('playing');
+  }, [trim]);
+
+  const stopLoop = useCallback(() => {
+    const ctx = inCtxRef.current;
+    try { loopSrcRef.current?.stop(); } catch { /* not started */ }
+    loopSrcRef.current = null;
+    if (ctx) {
+      loopGainRef.current?.gain.setTargetAtTime(0, ctx.currentTime, 0.01);
+      if (inputSource === 'mic') micGainRef.current?.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
+    }
+    setLoopState(loopBufRef.current ? 'stopped' : 'idle');
+  }, [inputSource]);
+
+  const deleteLoop = useCallback(() => {
+    stopLoop();
+    loopBufRef.current = null;
+    loopPeaksRef.current = null;
+    recRef.current = null;
+    setLoopLen(0);
+    setTrim([0, 0]);
+    setLoopState('idle');
+  }, [stopLoop]);
+
+  // Re-arm the loop points live while the trim handles are dragged.
+  useEffect(() => {
+    const src = loopSrcRef.current;
+    if (src && loopState === 'playing') {
+      src.loopStart = trim[0];
+      src.loopEnd = Math.max(trim[0] + 0.05, trim[1]);
+    }
+  }, [trim, loopState]);
+
+  useEffect(() => {
+    const ctx = inCtxRef.current;
+    if (!ctx || inputSource === 'mic') return;
+    micGainRef.current?.gain.setTargetAtTime(auxOn ? auxLevel : 0, ctx.currentTime, 0.02);
+  }, [auxOn, auxLevel, inputSource]);
 
   /** Load an audio file to stand in for the live feed while testing. */
   const pickFile = async (file: File) => {
@@ -642,20 +758,37 @@ export default function LiveApp() {
       setError('Load an audio file first, or switch back to the live input.');
       return;
     }
+    setIsStarting(true);
     try {
       // Run at the device's native rate (48 kHz on most interfaces) and let the
       // backend resample to the model's 44.1 kHz — forcing the hardware to a
       // rate it doesn't run hides a resample we can't inspect.
-      const ctx = new AudioContext();
+      // In Live Code mode we instead adopt Strudel's own context, so pattern
+      // playback and capture share one clock.
+      let ctx: AudioContext;
+      if (inputSource === 'code') {
+        const h = strudelRef.current ?? await ensureStrudel();
+        if (!h) { setIsStarting(false); return; }
+        ctx = h.ctx;
+        h.reattach();
+      } else {
+        ctx = new AudioContext();
+      }
       inCtxRef.current = ctx;
       setCaptureRate(ctx.sampleRate);
 
       // Either head feeds the identical downstream graph, so the ring buffer,
       // the snapshot timer and everything after it cannot tell the difference.
-      let source: AudioNode;
+      let source: AudioNode | null = null;
+      let micSource: AudioNode | null = null;
+      let micChannels = 2;
       let fileBuf: AudioBuffer | null = null;
       let nChannels = 2;
-      if (inputSource === 'file') {
+      if (inputSource === 'code') {
+        // Strudel's intercepted output stands in for a microphone.
+        source = strudelRef.current!.tap;
+        nChannels = 2;
+      } else if (inputSource === 'file') {
         fileBuf = await ctx.decodeAudioData(await fileRef.current!.arrayBuffer());
         const node = ctx.createBufferSource();
         node.buffer = fileBuf;
@@ -675,12 +808,33 @@ export default function LiveApp() {
           },
         });
         streamRef.current = stream;
-        source = ctx.createMediaStreamSource(stream);
+        micSource = ctx.createMediaStreamSource(stream);
+        source = micSource;
         nChannels = stream.getAudioTracks()[0]?.getSettings().channelCount
-          ?? (source as MediaStreamAudioSourceNode).channelCount ?? 2;
+          ?? (micSource as MediaStreamAudioSourceNode).channelCount ?? 2;
       }
       nChannels = Math.max(1, nChannels);
+      micChannels = nChannels;
       setDetectedChannels(nChannels);
+
+      // File and Live Code can additionally blend the hardware input in, so a
+      // player can sit on top of the loop or the pattern.
+      if (inputSource !== 'mic' && auxOn) {
+        try {
+          const aux = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              deviceId: deviceId ? { exact: deviceId } : undefined,
+              echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+              channelCount: { ideal: 8 },
+            },
+          });
+          auxStreamRef.current = aux;
+          micSource = ctx.createMediaStreamSource(aux);
+          micChannels = Math.max(1, aux.getAudioTracks()[0]?.getSettings().channelCount ?? 2);
+        } catch (e: any) {
+          setError(`Live input monitor unavailable: ${e.message || e}`);
+        }
+      }
 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
@@ -714,7 +868,11 @@ export default function LiveApp() {
         ring.w = seed % cap;
         ring.filled = seed;
         seedSeconds = seed / ctx.sampleRate;
-        fileSourceRef.current!.start(0, seedSeconds % fileBuf.duration);
+        const off = seedSeconds % fileBuf.duration;
+        fileSourceRef.current!.start(0, off);
+        // Where file position 0 sits on the context clock, so the window can be
+        // rewound to a file boundary later.
+        fileLoopRef.current = { origin: ctx.currentTime - off, period: fileBuf.duration };
       }
 
       proc.onaudioprocess = (e) => {
@@ -728,23 +886,60 @@ export default function LiveApp() {
           ring.w = (ring.w + 1) % ring.l.length;
         }
         ring.filled = Math.min(ring.filled + L.length, ring.l.length);
+
+        // Loop recorder taps the same block. During recording the loop is not
+        // playing, so the mixer carries the hardware input alone.
+        const rec = recRef.current;
+        if (rec && rec.frames < MAX_LOOP_SECS * ring.sr) {
+          rec.chunks.push([new Float32Array(L), new Float32Array(R)]);
+          rec.frames += L.length;
+        }
       };
 
-      // Channel selection: split the device's inputs out, then merge exactly
-      // the chosen one or two back into a stereo pair. Everything downstream
-      // stays 2-channel, and re-picking a channel is just a rewire of these
-      // two connections rather than a rebuild of the whole graph.
-      const splitter = ctx.createChannelSplitter(nChannels);
-      const merger = ctx.createChannelMerger(2);
-      source.connect(splitter);
-      const [selA, selB] = parseChannelSel(chanSel, nChannels);
-      splitter.connect(merger, selA, 0);
-      splitter.connect(merger, selB, 1);
-      splitterRef.current = splitter;
-      mergerRef.current = merger;
+      // Everything that should reach the model sums here: the hardware input,
+      // a file or Strudel, and the recorded loop. One mixer means the capture
+      // tap and the monitor each need only a single connection.
+      const inputMixer = ctx.createGain();
+      inputMixerRef.current = inputMixer;
+
+      // Channel selection happens on the mic alone — splitting the summed
+      // mixer would be meaningless once a stereo file or loop is added to it.
+      if (micSource) {
+        const splitter = ctx.createChannelSplitter(micChannels);
+        const merger = ctx.createChannelMerger(2);
+        micSource.connect(splitter);
+        const [selA, selB] = parseChannelSel(chanSel, micChannels);
+        splitter.connect(merger, selA, 0);
+        splitter.connect(merger, selB, 1);
+        splitterRef.current = splitter;
+        mergerRef.current = merger;
+
+        const micGain = ctx.createGain();
+        // In Live Input the mic is the source; elsewhere it is the optional
+        // monitor blend, which stays silent until you turn it on.
+        micGain.gain.value = inputSource === 'mic' ? 1 : (auxOn ? auxLevel : 0);
+        merger.connect(micGain);
+        micGain.connect(inputMixer);
+        micGainRef.current = micGain;
+      }
+
+      // File or Strudel, when one of them is the primary source.
+      if (source && source !== micSource) {
+        const mainGain = ctx.createGain();
+        mainGain.gain.value = 1;
+        source.connect(mainGain);
+        mainGain.connect(inputMixer);
+        mainGainRef.current = mainGain;
+      }
+
+      // Recorded loop. Silent until playback starts; the player attaches here.
+      const loopGain = ctx.createGain();
+      loopGain.gain.value = 0;
+      loopGain.connect(inputMixer);
+      loopGainRef.current = loopGain;
 
       // Capture tap: feeds the waveform display and the ring buffer.
-      merger.connect(analyser);
+      inputMixer.connect(analyser);
       analyser.connect(proc);
       proc.connect(tapSink);
       tapSink.connect(ctx.destination);
@@ -757,9 +952,9 @@ export default function LiveApp() {
       clickGain.connect(ctx.destination);
       clickGainRef.current = clickGain;
 
-      // Monitoring is its own direct path off the selected channels, so what
-      // you hear is what feeds the model, with none of the processor's latency.
-      merger.connect(monitorGain);
+      // Monitoring taps the same mixer, so what you hear is exactly what feeds
+      // the model, with none of the processor's buffer latency.
+      inputMixer.connect(monitorGain);
       monitorGain.connect(ctx.destination);
 
       inAnalyserRef.current = analyser;
@@ -770,20 +965,10 @@ export default function LiveApp() {
       // side of an await; without this the tap never fires and nothing is heard.
       if (ctx.state === 'suspended') await ctx.resume();
 
-      const outCtx = ensureOutputCtx();
-      if (outCtx.state === 'suspended') await outCtx.resume();
-
-      wsRef.current?.send(JSON.stringify({
-        type: 'start',
-        params: {
-          prompt, input_rate: effInputRate, generate_rate: effGenerateRate,
-          noise, variant_delta: VARIANT_DELTA, steps, cfg,
-          variants: VARIANTS, model, loopback, selected_variant: variant,
-        },
-      }));
+      for (const t of trackRefs.current) t?.begin();
 
       setRunning(true);
-      setDropped(0);
+      setIsStarting(false);
 
       // The mic has to wait a full buffer so the model never sees a short clip;
       // a seeded file already has one, so it can generate right away.
@@ -797,21 +982,28 @@ export default function LiveApp() {
         timerRef.current = window.setTimeout(fire, paramsRef.current.generateRate * 1000);
       }, firstDelay);
     } catch (e: any) {
+      setIsStarting(false);
       setError(e.message || 'Could not open the audio input');
     }
   };
 
   const stop = () => {
     setRunning(false);
+    if (inputSource === 'code') { strudelRef.current?.hush(); setStrudelPlaying(false); }
     setStatus('Idle');
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
-    wsRef.current?.send(JSON.stringify({ type: 'stop' }));
+    for (const t of trackRefs.current) t?.finish();
     procRef.current?.disconnect();
     if (fileSourceRef.current) {
       try { fileSourceRef.current.stop(); } catch { /* never started */ }
       fileSourceRef.current.disconnect();
       fileSourceRef.current = null;
     }
+    try { loopSrcRef.current?.stop(); } catch { /* not started */ }
+    loopSrcRef.current = null;
+    recRef.current = null;
+    auxStreamRef.current?.getTracks().forEach(t => t.stop());
+    auxStreamRef.current = null;
     if (clickTimerRef.current) { clearInterval(clickTimerRef.current); clickTimerRef.current = null; }
     clickGainRef.current?.disconnect();
     clickGainRef.current = null;
@@ -821,22 +1013,45 @@ export default function LiveApp() {
     mergerRef.current = null;
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
-    inCtxRef.current?.close().catch(() => {});
+    if (inputSource !== 'code') inCtxRef.current?.close().catch(() => {});
     inCtxRef.current = null;
     inAnalyserRef.current = null;
     procRef.current = null;
-    const prev = playingRef.current;
-    if (prev && outCtxRef.current) {
-      const now = outCtxRef.current.currentTime;
-      prev.gain.gain.cancelScheduledValues(now);
-      prev.gain.gain.setValueAtTime(Math.max(prev.gain.gain.value, 0.0001), now);
-      prev.gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
-      prev.src.stop(now + 0.25);
-      playingRef.current = null;
-    }
   };
 
   useEffect(() => () => { stop(); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  const showLoopView = loopState === 'stopped' || loopState === 'playing';
+  const posToTime = (e: React.PointerEvent) => {
+    const r = (e.target as HTMLCanvasElement).getBoundingClientRect();
+    return Math.max(0, Math.min(loopLen, ((e.clientX - r.left) / r.width) * loopLen));
+  };
+  const applyTrim = (at: number) => {
+    const h = dragHandleRef.current;
+    if (h === null) return;
+    setTrim(([a, b]) => h === 0
+      ? [Math.min(at, b - 0.05), b]
+      : [a, Math.max(at, a + 0.05)]);
+  };
+
+  /** The latent shelf edits whichever track's tab is showing. */
+  const sendWeights = useCallback((weights: Float32Array, renorm: boolean) => {
+    setShelfBusy(true);
+    trackRefs.current[activeTabRef.current]?.sendWeights(weights, renorm);
+  }, []);
+
+  const addTrack = useCallback(() => {
+    setTracks(ts => (ts.length > 1 ? ts : [...ts, defaultTrack()]));
+    setActiveTab(1);
+  }, []);
+  const removeTrack = useCallback(() => {
+    trackRefs.current[1]?.finish();
+    trackRefs.current = trackRefs.current.slice(0, 1);
+    setTracks(ts => ts.slice(0, 1));
+    setActiveTab(0);
+    // Otherwise a solo on the departed track would silence the survivor.
+    setSolo(null);
+  }, []);
 
   const arm = (id: string) => setArmed(a => (a === id ? null : id));
   const knobProps = (id: string) => ({
@@ -846,9 +1061,9 @@ export default function LiveApp() {
 
   // The middle bar's thickness is the diffusion step count; noise instead
   // shows up as the wash bleeding into the input pane.
-  const barWidth = 18 + (Math.min(steps, 16) / 16) * 104;
+  const barWidth = 18 + (Math.min(cur.steps, 16) / 16) * 104;
   // Variant 0 sits at the top of the bar and the ladder descends from there.
-  const variantPct = VARIANTS > 1 ? (variant / (VARIANTS - 1)) * 100 : 0;
+  const variantPct = activeVariants > 1 ? (cur.variant / (activeVariants - 1)) * 100 : 0;
 
   return (
     <div className="live-root">
@@ -856,7 +1071,7 @@ export default function LiveApp() {
       <header className="live-bar">
         <button className={`transport ${running ? 'stop' : 'start'}`}
                 onClick={running ? stop : start}
-                disabled={!connected}>
+                disabled={!connected || isStarting || (inputSource === 'code' && !strudelReady)}>
           {running ? <Square size={16} /> : <Play size={16} />}
           {running ? 'STOP' : 'START'}
         </button>
@@ -909,11 +1124,9 @@ export default function LiveApp() {
           <Circle size={8} className={connected ? 'dot ok' : 'dot bad'} />
           {status}
           {captureRate && <span className="dim"> · capture {(captureRate / 1000).toFixed(1)}k → 44.1k · {detectedChannels}ch in</span>}
-          {cycleInfo && <span className="dim"> · cycle {cycleInfo.n} in {(cycleInfo.ms / 1000).toFixed(2)}s</span>}
-          {fadeInfo !== null && <span className="dim"> · xfade {fadeInfo.toFixed(2)}s</span>}
+          {syncLoop && <span className="dim"> · sync −{syncBack.toFixed(2)}s</span>}
           {beatSec && inputBeats * beatSec > MAX_BUFFER_SECS &&
             <span className="warn"> · {inputBeats}b needs {(inputBeats * beatSec).toFixed(1)}s, clamped to {MAX_BUFFER_SECS}s</span>}
-          {dropped > 0 && <span className="warn"> · {dropped} dropped (loop behind)</span>}
         </div>
       </header>
 
@@ -921,11 +1134,85 @@ export default function LiveApp() {
 
       {/* ── the two halves ─────────────────────────────────────── */}
       <main className="live-main">
-        <section className="pane">
+        <section className="pane input-pane">
+          <canvas ref={noiseCanvasRef} className="pane-noise" />
           <div className="pane-title">Live-Input Feed</div>
-          <input className="prompt-box" value={prompt} placeholder="Text prompt"
-                 onChange={e => setPrompt(e.target.value)} />
-          <canvas ref={waveCanvasRef} width={900} height={420} className="pane-canvas" />
+          <div className="wave-wrap">
+            <canvas
+              ref={waveCanvasRef} width={900} height={420} className="pane-canvas"
+              style={{ cursor: showLoopView ? 'ew-resize' : 'default' }}
+              onPointerDown={(e) => {
+                if (!showLoopView || !loopLen) return;
+                (e.target as Element).setPointerCapture(e.pointerId);
+                const at = posToTime(e);
+                // Grab whichever handle is nearer to where you pressed.
+                dragHandleRef.current =
+                  Math.abs(at - trim[0]) <= Math.abs(at - trim[1]) ? 0 : 1;
+                applyTrim(at);
+              }}
+              onPointerMove={(e) => { if (dragHandleRef.current !== null) applyTrim(posToTime(e)); }}
+              onPointerUp={(e) => {
+                dragHandleRef.current = null;
+                try { (e.target as Element).releasePointerCapture(e.pointerId); } catch { /* done */ }
+              }}
+            />
+
+            {inputSource === 'mic' && (
+              <div className="canvas-tools">
+                <div className="tools-row">
+                  {loopState !== 'recording' ? (
+                    <button className="tool rec" onClick={startRec} disabled={!running}
+                            title={running ? 'Record a loop' : 'Start the transport first'}>
+                      <Circle size={10} /> REC
+                    </button>
+                  ) : (
+                    <button className="tool recording" onClick={stopRec}>
+                      <Square size={10} /> STOP {recSecs.toFixed(1)}s
+                    </button>
+                  )}
+                  {loopState === 'playing'
+                    ? <button className="tool on" onClick={stopLoop}><Square size={10} /> STOP</button>
+                    : <button className="tool" onClick={playLoop} disabled={!loopLen}><Play size={10} /> PLAY</button>}
+                  <button className="tool del" onClick={deleteLoop} disabled={!loopLen}>
+                    <Trash2 size={10} /> DEL
+                  </button>
+                </div>
+                {loopLen > 0 && (
+                  <div className="tools-meta">
+                    loop {(trim[1] - trim[0]).toFixed(2)}s of {loopLen.toFixed(2)}s · drag edges to trim
+                  </div>
+                )}
+              </div>
+            )}
+
+            {inputSource !== 'mic' && (
+              <div className="canvas-tools">
+                <div className="tools-row">
+                  <button className={`tool ${auxOn ? 'on' : ''}`} onClick={() => setAuxOn(v => !v)}>
+                    <Mic size={10} /> LIVE INPUT MONITOR
+                  </button>
+                </div>
+                {auxOn && (
+                  <div className="tools-meta">
+                    <input type="range" min={0} max={1} step={0.01} value={auxLevel}
+                           onChange={e => setAuxLevel(Number(e.target.value))}
+                           aria-label="Live input blend" />
+                    <span>{Math.round(auxLevel * 100)}%</span>
+                  </div>
+                )}
+              </div>
+            )}
+            {inputSource === 'code' && (
+              <StrudelPanel
+                onEvaluate={runStrudel}
+                onHush={hushStrudel}
+                running={strudelPlaying}
+                ready={strudelReady}
+                banks={strudelBanks}
+                error={strudelError}
+              />
+            )}
+          </div>
 
           <div className="source-row">
             <div className="source-toggle">
@@ -939,12 +1226,29 @@ export default function LiveApp() {
                       onClick={() => (fileRef.current ? setInputSource('file') : filePickerRef.current?.click())}>
                 <Repeat size={13} /> File Loop
               </button>
+              <button className={inputSource === 'code' ? 'on' : ''}
+                      disabled={running}
+                      onClick={() => setInputSource('code')}>
+                <Code2 size={13} /> Live Code
+              </button>
             </div>
 
-            <button className="file-btn" disabled={running}
-                    onClick={() => filePickerRef.current?.click()}>
-              <FolderOpen size={13} /> {fileInfo ? 'Change…' : 'Import file…'}
-            </button>
+            {(inputSource !== 'mic' || loopLen > 0) && (
+              <button
+                className={`file-btn ${syncLoop ? 'sync-on' : ''}`}
+                onClick={() => setSyncLoop(v => !v)}
+                title="Align the analysis window to the loop's boundary instead of to when START was pressed"
+              >
+                <RefreshCw size={13} /> SYNC
+              </button>
+            )}
+
+            {inputSource === 'file' && (
+              <button className="file-btn" disabled={running}
+                      onClick={() => filePickerRef.current?.click()}>
+                <FolderOpen size={13} /> {fileInfo ? 'Change…' : 'Import file…'}
+              </button>
+            )}
 
             {fileInfo && (
               <span className="file-info" title={fileInfo.name}>
@@ -960,32 +1264,47 @@ export default function LiveApp() {
                    }} />
           </div>
 
-          <div className="monitor">
-            <span>Monitor</span>
-            <input type="range" min={0} max={1} step={0.01} value={inputMonitor}
-                   onChange={e => setInputMonitor(Number(e.target.value))} />
-            <span className="dim">{Math.round(inputMonitor * 100)}%</span>
-          </div>
+          <MidiSlider {...knobProps('inputMonitor')} label="Monitor"
+                      value={inputMonitor} onChange={setInputMonitor} />
         </section>
 
-        <div className="middle" title={`${steps} steps · variant ${variant} at noise ${(noise + variant * VARIANT_DELTA).toFixed(2)}`}>
+        <div className="middle" title={`${cur.steps} steps · variant ${cur.variant} at noise ${(cur.noise + cur.variant * VARIANT_DELTA).toFixed(2)}`}>
           <div className="middle-bar" style={{ width: `${barWidth}px` }}>
             <div className="variant-marker" style={{ top: `${2 + variantPct * 0.96}%` }}>
-              <span className="variant-marker-tag">{variant}</span>
+              <span className="variant-marker-tag">{cur.variant}</span>
             </div>
           </div>
         </div>
 
-        <section className="pane">
-          <div className="pane-title right">Live-Output Feed</div>
-          <canvas ref={specCanvasRef} width={900} height={420} className="pane-canvas" />
-          <div className="monitor">
-            <span>Monitor</span>
-            <input type="range" min={0} max={1} step={0.01} value={outputMonitor}
-                   onChange={e => setOutputMonitor(Number(e.target.value))} />
-            <span className="dim">{Math.round(outputMonitor * 100)}%</span>
-          </div>
-        </section>
+        <div className="out-stack">
+          {tracks.map((t, i) => (
+            <TrackOutput
+              key={i}
+              ref={(h) => { trackRefs.current[i] = h; }}
+              index={i}
+              connectionId={connectionId}
+              params={t}
+              shared={{ inputRate: effInputRate, generateRate: effGenerateRate, model }}
+              onParam={(patch) => patchTrack(i, patch)}
+              // The MIDI bridge broadcasts to every session; only track 1 acts
+              // on it, or one CC would be applied twice.
+              onMidi={i === 0 ? applyMidi : undefined}
+              onAdd={i === 0 && tracks.length === 1 ? addTrack : undefined}
+              onRemove={i === 1 ? removeTrack : undefined}
+              onError={setError}
+              onConnected={i === 0 ? setConnected : undefined}
+              active={activeTab === i}
+              onActivate={() => setActiveTab(i)}
+              soloed={solo === i}
+              muted={solo !== null && solo !== i}
+              onSolo={() => setSolo(cur => (cur === i ? null : i))}
+              soloVisible={tracks.length > 1}
+              onShelfDone={() => setShelfBusy(false)}
+              learnProps={knobProps}
+              running={running}
+            />
+          ))}
+        </div>
 
         <LatentShelf
           open={shelfOpen}
@@ -998,7 +1317,8 @@ export default function LiveApp() {
       </main>
 
       {/* ── knobs ──────────────────────────────────────────────── */}
-      <footer className={`live-knobs ${midiLearn ? 'learning' : ''}`}>
+      <footer className={`live-knobs ${midiLearn ? 'learning' : ''} ${masterMode ? 'master' : ''}`}
+              style={{ ['--track' as string]: masterMode ? '#e6e6e6' : TRACK_THEME[activeTab]?.accent }}>
         <div className="tempo-box">
           <div className="tempo-row">
             <button className={`tempo-btn ${tempoOn ? 'on' : ''}`}
@@ -1074,24 +1394,49 @@ export default function LiveApp() {
 
         <div className="knob-group">
           <Knob {...knobProps('noise')} label="Noise" min={0.05} max={1} step={0.01}
-                value={noise} onChange={setNoise} />
+                value={cur.noise} onChange={v => patchActive({ noise: v })} />
           <Knob {...knobProps('steps')} label="Steps" min={1} max={16} step={1}
-                value={steps} onChange={setSteps} format={v => String(Math.round(v))} />
+                value={cur.steps} onChange={v => patchActive({ steps: v })} format={v => String(Math.round(v))} />
           <Knob {...knobProps('cfg')} label="CFG" min={1} max={10} step={0.1}
-                value={cfg} onChange={setCfg} format={v => v.toFixed(1)} />
+                value={cur.cfg} onChange={v => patchActive({ cfg: v })} format={v => v.toFixed(1)} />
         </div>
 
         <div className="knob-group">
-          <Knob {...knobProps('variant')} label="Variant" min={0} max={VARIANTS - 1} step={1}
-                value={variant} onChange={setVariant}
-                format={v => `${Math.round(v)} · ${(noise + v * VARIANT_DELTA).toFixed(2)}`} />
+          <div className="variant-cell">
+            <Knob {...knobProps('variant')} label="Variant"
+                  min={0} max={Math.max(0, activeVariants - 1)} step={1}
+                  disabled={!cur.multiVariant}
+                  value={cur.variant} onChange={v => patchActive({ variant: v })}
+                  format={v => cur.multiVariant
+                    ? `${Math.round(v)} · ${(cur.noise + v * VARIANT_DELTA).toFixed(2)}`
+                    : 'off'} />
+            <label className="variant-toggle" title={`Generate ${VARIANTS} progressively noisier variants each cycle (${VARIANTS}x slower)`}>
+              <input type="checkbox" checked={cur.multiVariant}
+                     onChange={e => patchActive({ multiVariant: e.target.checked, variant: 0 })} />
+              {VARIANTS} variants
+            </label>
+          </div>
         </div>
 
         <div className="knob-group">
           <Knob {...knobProps('loopback')} label="Loopback" min={0} max={1} step={0.01}
-                value={loopback} onChange={setLoopback}
+                value={cur.loopback} onChange={v => patchActive({ loopback: v })}
                 format={v => `${Math.round(v * 100)}%`} />
+          <Knob {...knobProps('nudge')} label="Nudge" min={0} max={MAX_NUDGE} step={0.01}
+                value={cur.nudge} onChange={v => patchActive({ nudge: v })}
+                format={v => `${v.toFixed(2)}s`} />
         </div>
+
+        {tracks.length > 1 && (
+          <button
+            className={`master-btn ${masterMode ? 'on' : ''}`}
+            onClick={() => setMasterMode(v => !v)}
+            title="Apply knob and MIDI changes to every track at once"
+          >
+            <span>MASTER</span>
+            <span className="master-sub">{masterMode ? 'all tracks' : `track ${activeTab + 1}`}</span>
+          </button>
+        )}
       </footer>
     </div>
   );

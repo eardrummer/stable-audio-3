@@ -109,6 +109,14 @@ fi
 echo "[Launcher] Starting React Frontend..."
 cd "$FRONTEND_DIR" || exit 1
 
+# Live Code mode plays Strudel patterns as the input source. Its sample banks
+# are vendored locally so a performance never depends on the network; synth
+# sounds work without them, but drums and piano do not.
+if [ ! -d "$FRONTEND_DIR/public/strudel-samples" ]; then
+    echo -e "\033[33m[Launcher] Strudel sample banks not vendored yet.\033[0m"
+    echo -e "  Run \033[36mnpm run fetch-samples\033[0m in $FRONTEND_DIR for offline drums/piano (~1.2 MB)."
+fi
+
 npm run dev &
 FRONTEND_PID=$!
 

@@ -37,6 +37,13 @@ router = APIRouter()
 # Set from main.py's startup hook so worker threads can drive the socket.
 _event_loop: asyncio.AbstractEventLoop | None = None
 
+# Shared across ALL sessions, not per session: MLX model handles live on the
+# engine and are not thread-safe, so two tracks generating at once must
+# serialize here. Everything else a session owns (latent cache, loopback
+# memory, output directory, channel weights) is deliberately per session, which
+# is what keeps two tracks independent.
+_ENGINE_LOCK = threading.Lock()
+
 
 def set_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     global _event_loop
@@ -158,7 +165,6 @@ class LiveSession:
         # Only one thing may touch the engine at a time — MLX model handles are
         # shared and not thread-safe. Taken per variant, so a re-decode can slip
         # between two variants rather than waiting out the whole cycle.
-        self._engine_lock = threading.Lock()
         self._redecode_req: dict | None = None
         self._redecode_wake = threading.Event()
         self._redecode_thread: threading.Thread | None = None
@@ -258,7 +264,7 @@ class LiveSession:
             try:
                 out_path = self.out_dir / f"v{req['index']}.wav"
                 t0 = time.time()
-                with self._engine_lock:
+                with _ENGINE_LOCK:
                     self.engine.decode_latents_to_wav(
                         latents, decoder_name=self.decoder_name, seconds=seconds,
                         out_path=str(out_path), channel_weights=weights,
@@ -367,7 +373,7 @@ class LiveSession:
 
             t0 = time.time()
             sink: list = []
-            with self._engine_lock:
+            with _ENGINE_LOCK:
                 self.engine.generate(
                     prompt=params["prompt"],
                     negative_prompt=params["negative_prompt"] or None,

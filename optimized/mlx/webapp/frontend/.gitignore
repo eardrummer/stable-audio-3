@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Vendored Strudel sample banks (fetched by npm run fetch-samples)
+public/strudel-samples/

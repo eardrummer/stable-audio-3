@@ -488,3 +488,241 @@ html, body, #live-root {
   border-radius: 9px;
   background: #0a0a0a;
 }
+
+/* ── live code (Strudel) ───────────────────────────────────────── */
+.wave-wrap { position: relative; flex: 1 1 auto; min-height: 0; display: flex; }
+
+.strudel-panel {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  background: rgba(0, 0, 0, .55);   /* waveform stays visible behind the code */
+  border: 1px solid #1d1d1d;
+  border-radius: 4px;
+  transition: box-shadow .18s ease;
+}
+.strudel-panel.flash { box-shadow: inset 0 0 0 2px var(--accent); }
+
+.strudel-bar { display: flex; align-items: center; gap: 7px; }
+.strudel-run, .strudel-hush {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 11px; font-size: 11px; font-weight: 700; letter-spacing: .07em;
+  border: 1px solid #2a2a2a; border-radius: 4px;
+  background: #0d0d0d; color: #bbb; cursor: pointer;
+}
+.strudel-run:hover:not(:disabled) { border-color: #2f6f3f; color: #cfe8cf; }
+.strudel-hush:hover:not(:disabled) { border-color: #7a2b2b; color: #ffbcbc; }
+.strudel-run:disabled, .strudel-hush:disabled { opacity: .4; cursor: not-allowed; }
+.strudel-hint { font-size: 9px; color: #666; }
+.strudel-state { margin-left: auto; font-size: 10px; color: var(--dim); }
+.strudel-state.on { color: var(--accent); }
+
+.strudel-code {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  background: rgba(6, 10, 6, .72);
+  border: 1px solid #1e1e1e;
+  border-radius: 3px;
+}
+.strudel-code:focus-within { border-color: #2f6f3f; }
+.strudel-code .cm-editor { height: 100%; }
+
+.strudel-error {
+  font-size: 10px; color: #ffb4b4;
+  background: #2a1010; border: 1px solid #4a1c1c;
+  border-radius: 3px; padding: 5px 8px;
+  max-height: 64px; overflow: auto;
+}
+.strudel-foot {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 9px; color: #666;
+}
+
+/* ── noise texture across the input side ───────────────────────── */
+.input-pane { isolation: isolate; }
+.pane-noise {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+}
+/* Everything else in the input pane sits above the grain; the waveform canvas
+   and the code panel are both translucent so it reads through them. */
+.input-pane > *:not(.pane-noise) { position: relative; z-index: 1; }
+.input-pane .pane-canvas { background: transparent; }
+
+/* ── overlay tools, top-right of the input canvas ──────────────── */
+.canvas-tools {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  padding: 6px 7px;
+  background: rgba(0, 0, 0, .62);
+  border: 1px solid #232323;
+  border-radius: 5px;
+}
+.tools-row { display: flex; gap: 4px; }
+.tool {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 8px; font-size: 9.5px; font-weight: 700; letter-spacing: .06em;
+  border: 1px solid #2a2a2a; border-radius: 3px;
+  background: #0d0d0d; color: #9a9a9a; cursor: pointer;
+}
+.tool:hover:not(:disabled) { color: #eee; border-color: #3a3a3a; }
+.tool:disabled { opacity: .35; cursor: not-allowed; }
+.tool.on { background: #17301c; border-color: #2f6f3f; color: #cfe8cf; }
+.tool.rec:hover:not(:disabled) { border-color: #7a2b2b; color: #ffbcbc; }
+.tool.recording { background: #2a1111; border-color: #7a2b2b; color: #ffbcbc; }
+.tool.del:hover:not(:disabled) { border-color: #7a2b2b; color: #ffbcbc; }
+.tools-meta {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 9px; color: var(--dim);
+}
+.tools-meta input[type=range] { width: 96px; accent-color: var(--accent); }
+
+.knob.disabled { opacity: .42; }
+.knob.disabled .knob-dial { cursor: not-allowed; }
+.variant-cell { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.variant-toggle {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 9px; color: var(--dim); cursor: pointer; white-space: nowrap;
+}
+.variant-toggle input { accent-color: var(--accent); margin: 0; }
+
+/* Monitor sliders join MIDI learn on the same terms as the knobs. */
+.monitor {
+  border: 2px dashed transparent;
+  border-radius: 6px;
+  padding-left: 4px;
+  padding-right: 4px;
+}
+.monitor.learning { border-color: rgba(59, 130, 246, .55); cursor: pointer; }
+.monitor.armed { border-color: var(--learn); background: rgba(59, 130, 246, .12); }
+.monitor.learning input[type=range] { pointer-events: none; }
+.slider-binding { font-size: 9px; color: #6f9bdd; }
+
+/* ── multi-track output ────────────────────────────────────────── */
+.out-stack {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: row;      /* a vertical split down the output half */
+  min-height: 0;
+}
+
+.out-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 12px 14px;
+  gap: 4px;
+}
+.out-pane + .out-pane { border-left: 1px solid var(--line); }
+
+.out-head { display: flex; align-items: center; gap: 10px; }
+.out-title {
+  font-size: 20px;
+  font-weight: 500;
+  color: var(--track, var(--accent));
+}
+.out-stat { margin-left: auto; font-size: 10px; color: #aaa; }
+.out-foot { font-size: 9px; text-align: right; }
+
+.track-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px;
+  border: 1px solid #2a2a2a; border-radius: 4px;
+  background: #0d0d0d; color: var(--track, var(--accent)); cursor: pointer;
+}
+.track-btn:hover { border-color: var(--track, var(--accent)); }
+.track-btn.del { color: #d88; }
+.track-btn.del:hover { border-color: #7a2b2b; }
+
+/* The output pane's own prompt sits under its title, full width. */
+.out-pane .prompt-box {
+  align-self: stretch;
+  width: 100%;
+  font-size: 17px;
+  padding: 8px 14px;
+  margin-bottom: 2px;
+}
+.out-pane .pane-canvas { flex: 1 1 auto; min-height: 0; }
+
+/* The knob row picks up the active track's colour so it is obvious which
+   stream the controls are touching. */
+.live-knobs .knob-fill { stroke: var(--track, var(--accent)); }
+
+/* Active track: the one the knob row edits. Click its prompt to switch. */
+.out-pane {
+  border: 2px solid transparent;
+  border-radius: 8px;
+  margin: 4px;
+  opacity: .55;                      /* inactive tracks recede */
+  transition: opacity .16s ease, border-color .16s ease;
+}
+.out-pane.active {
+  opacity: 1;
+  border-color: var(--track);
+  background: rgba(255, 255, 255, .022);
+}
+.out-pane.muted .pane-canvas { filter: grayscale(1) brightness(.5); }
+
+.track-btn.solo { color: #9a9a9a; }
+.track-btn.solo.on {
+  color: #06210c;
+  background: var(--track);
+  border-color: var(--track);
+}
+
+/* ── master: knobs drive every track at once ───────────────────── */
+.master-btn {
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin-left: 6px;
+  padding: 10px 14px;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  background: #0d0d0d;
+  color: #9a9a9a;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .09em;
+  cursor: pointer;
+}
+.master-btn:hover { color: #ddd; border-color: #3a3a3a; }
+.master-btn.on {
+  background: #1d1d1d;
+  border-color: #e6e6e6;
+  color: #f2f2f2;
+}
+.master-sub {
+  font-size: 8px;
+  font-weight: 400;
+  letter-spacing: .04em;
+  color: var(--dim);
+}
+.master-btn.on .master-sub { color: #cfcfcf; }
+/* In master mode the knobs are not tied to one track, so drop the track tint. */
+.live-knobs.master .knob-fill { stroke: #e6e6e6; }
+
+.file-btn.sync-on {
+  background: #17301c;
+  border-color: #2f6f3f;
+  color: #cfe8cf;
+}
