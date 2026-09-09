@@ -1,7 +1,15 @@
 # Loop Phase Synchronisation
 
-How the live app aligns its analysis window to a looping source, why it is built
-the way it is, and what it still does not fix.
+> **Status: designed and implemented, then removed.** SYNC shipped as described
+> below and was subsequently taken out of the code to make way for multi-source
+> input routing, where several sources with different loop periods can feed one
+> track and "the" loop boundary is no longer well defined. This document is kept
+> as the design record and the plan for reimplementing it once routing settles —
+> the analysis, the per-source phase anchors and the limitations all still hold.
+> Section 7 (inter-track synchronisation) was always future work and remains so.
+
+How the live app aligned its analysis window to a looping source, why it was
+built that way, and what it did not fix.
 
 Applies to the three input modes that repeat a fixed length of audio: **File
 Loop**, a **recorded loop** played back in Live Input, and **Live Code**
@@ -116,13 +124,16 @@ produced a plausible-looking but entirely wrong offset.
 
 ## 4. Implementation
 
-| Piece | Location |
+These pieces existed while the feature was in the tree and were removed
+together; the list records what a reimplementation needs to restore.
+
+| Piece | Was in |
 | :--- | :--- |
 | `syncLoop` state and the SYNC toggle | `LiveApp.tsx` |
-| `loopPhase()` — per-source phase | `LiveApp.tsx` (~L538) |
-| Rewind applied to the ring read | `LiveApp.tsx` (~L562) |
-| File loop origin captured at start | `LiveApp.tsx` (~L875) |
-| `getCyclePhase()` | `strudel/strudelEngine.ts` (~L98) |
+| `loopPhase()` — per-source phase | `LiveApp.tsx` |
+| Rewind applied to the ring read | `LiveApp.tsx` |
+| File loop origin captured at start | `LiveApp.tsx` |
+| `getCyclePhase()` | `strudel/strudelEngine.ts` |
 
 **SYNC is off by default.** The toggle sits beside the source buttons and only
 appears when a loop is available. It was left opt-in for two reasons: existing
@@ -296,3 +307,32 @@ textures, roughly a beat of slop may be acceptable and this is a large amount of
 machinery for little gain. If they are meant to be rhythmically locked — which is
 what the tempo work and the beat-denominated rate knobs imply — then the barrier
 is the right investment.
+
+
+---
+
+## 8. Why It Was Removed, and What Reimplementation Must Handle
+
+SYNC assumed **one input source per track**, so "the loop boundary" was
+unambiguous. Multi-source input routing breaks that assumption: a single track
+can now be fed by a recorded loop, a file and a Strudel pattern at once, each
+with its own period. There is no single boundary to rewind to.
+
+Rather than leave a feature that silently aligned to whichever source happened to
+be checked first, it was taken out until the routing model is settled.
+
+When it returns it needs to answer, explicitly:
+
+* **Which source is the timing reference** when several looping sources feed the
+  same track. A designated sync source — one clock badge on one input section —
+  is the option that explains itself; deriving it from routing order changes the
+  reference silently when you repatch.
+* **What happens to the sources that are not the reference.** They cannot also be
+  aligned; summing two loops of different periods means at most one can start on
+  its boundary. This should be visible in the UI rather than surprising.
+* **Whether alignment is per track.** Two tracks fed by different sources may
+  want different references, which argues for the setting living on the routing
+  matrix rather than on a single global toggle.
+
+The mechanism itself — rewind the ring read by the source's current phase — is
+unchanged and still correct. Only the choice of *which* phase is now open.

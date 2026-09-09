@@ -27,9 +27,6 @@ export interface StrudelHandle {
   setBpm(bpm: number): void;
   /** Re-assert the output interception (superdough restores it on reset). */
   reattach(): void;
-  /** Seconds since the last cycle boundary, and the cycle length. Used to
-   *  align the analysis window to the pattern rather than to the START button. */
-  getCyclePhase(): { phase: number; period: number } | null;
   dispose(): void;
   sampleBanks: string[];
 }
@@ -95,16 +92,6 @@ export function loadStrudel(): Promise<StrudelHandle> {
         else S.setcps?.(cps);
       },
       reattach,
-      getCyclePhase() {
-        const cps = repl?.scheduler?.cps;
-        const nowCycles = repl?.scheduler?.now?.();
-        // Cyclist.now() returns a fractional *cycle* position.
-        if (typeof cps !== 'number' || cps <= 0) return null;
-        if (typeof nowCycles !== 'number' || !isFinite(nowCycles)) return null;
-        const period = 1 / cps;
-        const frac = ((nowCycles % 1) + 1) % 1;
-        return { phase: frac * period, period };
-      },
       dispose() { try { repl.stop(); } catch { /* already stopped */ } },
     };
     return handle;

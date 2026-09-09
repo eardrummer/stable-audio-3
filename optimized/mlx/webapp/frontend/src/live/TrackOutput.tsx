@@ -49,6 +49,10 @@ interface Props {
   muted: boolean;
   onSolo: () => void;
   soloVisible: boolean;
+  /** Registers this track's patch anchor with the cable overlay. */
+  onNode: (el: HTMLDivElement | null) => void;
+  /** A cable is being dragged and could land here. */
+  patchTarget: boolean;
 }
 
 interface CycleAudio { cycle: number; buffers: (AudioBuffer | null)[]; }
@@ -56,7 +60,7 @@ interface CycleAudio { cycle: number; buffers: (AudioBuffer | null)[]; }
 const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   index, connectionId, params, shared, onParam, onMidi, onAdd, onRemove,
   onError, onShelfDone, onConnected, learnProps, running,
-  active, onActivate, soloed, muted, onSolo, soloVisible,
+  active, onActivate, soloed, muted, onSolo, soloVisible, onNode, patchTarget,
 }, ref) {
   const theme = TRACK_THEME[index] ?? TRACK_THEME[0];
 
@@ -316,10 +320,13 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
 
   return (
     <section
-      className={`out-pane ${active ? 'active' : ''} ${muted ? 'muted' : ''}`}
+      className={`out-pane ${active ? 'active' : ''} ${muted ? 'muted' : ''}` + (patchTarget ? ' patch-target' : '')}
       style={{ ['--track' as string]: theme.accent }}
       onPointerDown={onActivate}
     >
+      {/* Cables from the input sources land here. */}
+      <div ref={onNode} className="patch-node in" data-track={index} />
+
       <div className="out-head">
         <span className="out-title">{index === 0 ? 'Live-Output Feed' : theme.name}</span>
         <span className="out-stat">

@@ -73,3 +73,32 @@ export interface LearnProps {
   bound: string | null;
   onArm: (id: string) => void;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Input sources and routing
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Sources can be enabled independently and patched to any set of tracks. */
+export type SourceId = 'mic' | 'file' | 'code';
+export const SOURCE_IDS: SourceId[] = ['mic', 'file', 'code'];
+
+export const SOURCE_META: Record<SourceId, { name: string; accent: string }> = {
+  mic:  { name: 'Live Input', accent: '#8ad18a' },
+  file: { name: 'File Loop',  accent: '#d8c05f' },
+  code: { name: 'Live Code',  accent: '#b98ad1' },
+};
+
+export interface SourceState {
+  enabled: boolean;
+  /** Send level: how much of this source reaches the tracks it is patched to.
+   *  Monitoring scales the same mix, so you hear the balance you are sending. */
+  level: number;
+  /** One flag per track index. */
+  to: boolean[];
+}
+
+export const defaultSources = (): Record<SourceId, SourceState> => ({
+  mic:  { enabled: true,  level: 1, to: [true, true] },
+  file: { enabled: false, level: 1, to: [true, true] },
+  code: { enabled: false, level: 1, to: [true, true] },
+});
