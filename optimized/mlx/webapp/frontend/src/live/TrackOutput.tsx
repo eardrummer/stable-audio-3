@@ -5,7 +5,7 @@ import { Plus, Minus, Headphones } from 'lucide-react';
 import MidiSlider from './MidiSlider';
 import { drawSpectrogram } from '../shared/spectrogram';
 import {
-  WS_URL, VARIANTS, VARIANT_DELTA, MAX_NUDGE, XF_MAX_CYCLE, XF_SWITCH, XF_MIN,
+  WS_URL, VARIANTS, MAX_NUDGE, XF_MAX_CYCLE, XF_SWITCH, XF_MIN,
   FADE_IN_CURVE, FADE_OUT_CURVE, TRACK_THEME,
   type TrackParams, type SharedParams, type LearnProps,
 } from './trackTypes';
@@ -57,6 +57,69 @@ interface Props {
 
 interface CycleAudio { cycle: number; buffers: (AudioBuffer | null)[]; }
 
+/** One sounding clip. In ALL mode a track runs several of these at once. */
+/** How many DISTINCT clips a cycle needs.
+ *
+ *  At spread 0 every variant would get the same noise level, and the backend
+ *  already shares one seed across the family, so all five come out bit-identical
+ *  — generating them is five times the work for the same audio. We ask for one
+ *  and fan it across the pan positions instead, which sounds the same. */
+const familySize = (p: { multiVariant: boolean; spread: number }) =>
+  (p.multiVariant && p.spread > 0 ? VARIANTS : 1);
+
+interface Voice {
+  src: AudioBufferSourceNode;
+  gain: GainNode;
+  startedAt: number;
+}
+
+/** Variants spread evenly left to right; a lone variant sits centre. */
+const panFor = (i: number, n: number) => (n <= 1 ? 0 : -1 + (2 * i) / (n - 1));
+
+/** StereoPannerNode's stereo-input law, so the estimate below matches what the
+ *  graph will actually produce rather than an idealised equal-power curve. */
+function panMatrix(pan: number) {
+  if (pan <= 0) {
+    const x = (pan + 1) * Math.PI / 2;
+    return { ll: 1, lr: Math.cos(x), rl: 0, rr: Math.sin(x) };
+  }
+  const x = pan * Math.PI / 2;
+  return { ll: Math.cos(x), lr: 0, rl: Math.sin(x), rr: 1 };
+}
+
+/** Peak of the summed, panned set — so ALL mode plays at the level of a single
+ *  variant instead of stacking to N times as loud.
+ *
+ *  A fixed 1/N or 1/sqrt(N) cannot work here: the variants share a seed and an
+ *  input, so at small spread they are nearly identical (amplitudes add, needing
+ *  1/N) and at large spread they decorrelate (power adds, needing 1/sqrt(N)).
+ *  Measuring the actual sum covers the whole range. */
+const NORM_TARGET = 0.89;      // headroom below full scale
+const NORM_STRIDE = 2;         // every other frame; peak error is negligible
+
+function sumGain(entries: { buf: AudioBuffer; pan: number }[]): number {
+  if (entries.length <= 1) return 1;
+  const chans = entries.map(({ buf, pan }) => ({
+    L: buf.getChannelData(0),
+    R: buf.numberOfChannels > 1 ? buf.getChannelData(1) : buf.getChannelData(0),
+    m: panMatrix(pan),
+  }));
+  const n = Math.min(...entries.map(e => e.buf.length));
+  let peak = 0;
+  for (let i = 0; i < n; i += NORM_STRIDE) {
+    let sl = 0, sr = 0;
+    for (const c of chans) {
+      const l = c.L[i], r = c.R[i];
+      sl += l * c.m.ll + r * c.m.lr;
+      sr += l * c.m.rl + r * c.m.rr;
+    }
+    const a = Math.abs(sl), b = Math.abs(sr);
+    if (a > peak) peak = a;
+    if (b > peak) peak = b;
+  }
+  return peak > 1e-6 ? Math.min(1, NORM_TARGET / peak) : 1;
+}
+
 const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   index, connectionId, params, shared, onParam, onMidi, onAdd, onRemove,
   onError, onShelfDone, onConnected, learnProps, running,
@@ -78,7 +141,7 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   const rafRef = useRef<number | null>(null);
   const cycleRef = useRef<CycleAudio | null>(null);
   const pendingHeaderRef = useRef<any>(null);
-  const playingRef = useRef<{ src: AudioBufferSourceNode; gain: GainNode; startedAt: number } | null>(null);
+  const voicesRef = useRef<Voice[]>([]);
 
   // The socket handler is created once; live values reach it through refs.
   const paramsRef = useRef(params);
@@ -114,45 +177,86 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
     return ctxRef.current!;
   }, []);
 
-  const crossfadeTo = useCallback((buf: AudioBuffer, offset = 0, maxFade = XF_MAX_CYCLE) => {
+  /** Start a set of clips together, equal-power crossfading out whatever is
+   *  sounding. One entry in single-variant mode; one per variant in ALL mode,
+   *  each panned to its own place in the stereo field. */
+  const playSet = useCallback((
+    entries: { buf: AudioBuffer; pan: number }[],
+    offset = 0,
+    maxFade = XF_MAX_CYCLE,
+  ) => {
+    if (!entries.length) return;
     const ctx = ensureCtx();
     const now = ctx.currentTime;
-    const prev = playingRef.current;
-    const fade = Math.max(XF_MIN, Math.min(maxFade, buf.duration - offset));
+    const prev = voicesRef.current;
 
-    const gain = ctx.createGain();
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(gain);
-    gain.connect(delayRef.current ?? analyserRef.current!);
+    const shortest = Math.min(...entries.map(e => e.buf.duration));
+    const fade = Math.max(XF_MIN, Math.min(maxFade, shortest - offset));
+    // One gain for the whole set, measured from the actual summed peak.
+    const k = sumGain(entries);
+    const fadeIn = k === 1 ? FADE_IN_CURVE : FADE_IN_CURVE.map(v => v * k);
 
-    try {
-      gain.gain.setValueCurveAtTime(FADE_IN_CURVE, now, fade);
-    } catch {
-      gain.gain.setValueAtTime(0, now);
-      gain.gain.linearRampToValueAtTime(1, now + fade);
-    }
+    const next: Voice[] = entries.map(({ buf, pan }) => {
+      const gain = ctx.createGain();
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(gain);
+      // A panner per voice; at pan 0 this is transparent, so the single-variant
+      // path behaves exactly as it did before.
+      if (pan !== 0) {
+        const panner = ctx.createStereoPanner();
+        panner.pan.value = Math.max(-1, Math.min(1, pan));
+        gain.connect(panner);
+        panner.connect(delayRef.current ?? analyserRef.current!);
+      } else {
+        gain.connect(delayRef.current ?? analyserRef.current!);
+      }
 
-    if (prev) {
-      const g = prev.gain.gain;
+      try {
+        gain.gain.setValueCurveAtTime(fadeIn, now, fade);
+      } catch {
+        gain.gain.setValueAtTime(0, now);
+        gain.gain.linearRampToValueAtTime(k, now + fade);
+      }
+      src.start(now, Math.min(offset, Math.max(0, buf.duration - 0.05)));
+      return { src, gain, startedAt: now - offset };
+    });
+
+    for (const v of prev) {
+      const g = v.gain.gain;
       const from = g.value;
       try {
         g.cancelScheduledValues(now);
-        g.setValueCurveAtTime(FADE_OUT_CURVE.map(v => v * from), now, fade);
+        g.setValueCurveAtTime(FADE_OUT_CURVE.map(x => x * from), now, fade);
       } catch {
         g.cancelScheduledValues(now);
         g.setValueAtTime(from, now);
         g.linearRampToValueAtTime(0, now + fade);
       }
-      prev.src.stop(now + fade + 0.03);
+      v.src.stop(now + fade + 0.03);
     }
-
-    src.start(now, Math.min(offset, Math.max(0, buf.duration - 0.05)));
-    playingRef.current = { src, gain, startedAt: now - offset };
+    voicesRef.current = next;
   }, [ensureCtx]);
 
-  // Solo silences the other track rather than changing its level, so its
-  // own monitor slider still reads what it will return to.
+  /** Everything a cycle should currently be sounding. */
+  const setFromCycle = useCallback((cyc: CycleAudio, offset = 0, maxFade = XF_MAX_CYCLE) => {
+    const p = paramsRef.current;
+    const lanes = p.multiVariant ? VARIANTS : 1;   // pan positions to fill
+    const made = familySize(p);                    // distinct clips available
+    if (p.multiVariant && p.allVariants) {
+      const entries = [];
+      for (let i = 0; i < lanes; i++) {
+        // At spread 0 every lane draws the same clip; only the pan differs.
+        const buf = cyc.buffers[Math.min(i, made - 1)];
+        if (buf) entries.push({ buf, pan: panFor(i, lanes) });
+      }
+      playSet(entries, offset, maxFade);
+    } else {
+      const buf = cyc.buffers[Math.min(p.variant, made - 1)];
+      if (buf) playSet([{ buf, pan: 0 }], offset, maxFade);
+    }
+  }, [playSet]);
+
   useEffect(() => {
     if (gainRef.current) gainRef.current.gain.value = muted ? 0 : params.outputMonitor;
   }, [params.outputMonitor, muted]);
@@ -166,14 +270,24 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   }, [params.nudge]);
 
   // Switching the variant knob mid-clip swaps lanes at the same position.
+  // In ALL mode every variant is already sounding, so there is nothing to swap.
   useEffect(() => {
-    const cyc = cycleRef.current, cur = playingRef.current;
-    if (!cyc || !cur || !ctxRef.current) return;
+    const cyc = cycleRef.current, cur = voicesRef.current[0];
+    if (!cyc || !cur || !ctxRef.current || params.allVariants) return;
     const buf = cyc.buffers[params.variant];
     if (!buf) return;
     const off = ctxRef.current.currentTime - cur.startedAt;
-    if (off >= 0 && off < buf.duration - 0.1) crossfadeTo(buf, off, XF_SWITCH);
-  }, [params.variant, crossfadeTo]);
+    if (off >= 0 && off < buf.duration - 0.1) setFromCycle(cyc, off, XF_SWITCH);
+  }, [params.variant, params.allVariants, setFromCycle]);
+
+  // Turning ALL on or off re-voices the current cycle in place.
+  useEffect(() => {
+    const cyc = cycleRef.current, cur = voicesRef.current[0];
+    if (!cyc || !cur || !ctxRef.current) return;
+    const off = ctxRef.current.currentTime - cur.startedAt;
+    setFromCycle(cyc, off > 0 ? off : 0, XF_SWITCH);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.allVariants]);
 
   // ── spectrogram ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -195,8 +309,8 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       type: 'params',
       params: {
         prompt: p.prompt, input_rate: sh.inputRate, generate_rate: sh.generateRate,
-        noise: p.noise, variant_delta: VARIANT_DELTA, steps: p.steps,
-        cfg: p.cfg, variants: p.multiVariant ? VARIANTS : 1, model: sh.model,
+        noise: p.noise, variant_delta: p.spread, steps: p.steps,
+        cfg: p.cfg, variants: familySize(p), model: sh.model,
         loopback: p.loopback, selected_variant: p.variant,
       },
     }));
@@ -227,17 +341,30 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
         }
         cyc.buffers[hdr.index] = buf;
 
+        const pp = paramsRef.current;
+        const wantAll = pp.multiVariant && pp.allVariants;
+        const family = familySize(pp);
+
         if (hdr.redecode) {
           onShelfDone?.();
-          const cur = playingRef.current;
-          if (hdr.index === paramsRef.current.variant && cur && ctxRef.current) {
+          const cur = voicesRef.current[0];
+          const audible = wantAll || hdr.index === pp.variant;
+          if (audible && cur && ctxRef.current) {
             const off = ctxRef.current.currentTime - cur.startedAt;
-            crossfadeTo(buf, off >= 0 && off < buf.duration - 0.1 ? off : 0, XF_SWITCH);
+            setFromCycle(cyc, off >= 0 && off < buf.duration - 0.1 ? off : 0, XF_SWITCH);
           }
           return;
         }
-        // Start the new cycle as soon as the audible lane lands.
-        if (hdr.index === paramsRef.current.variant) crossfadeTo(buf, 0);
+
+        if (wantAll) {
+          // Hold until the whole family has landed, so the variants start
+          // together as one panned image rather than trickling in.
+          const ready = cyc.buffers.slice(0, family).every(Boolean);
+          if (ready) setFromCycle(cyc, 0);
+        } else if (hdr.index === pp.variant) {
+          // Single variant: start as soon as the audible lane lands.
+          setFromCycle(cyc, 0);
+        }
         return;
       }
 
@@ -259,12 +386,12 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
 
     return () => ws.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionId, index, crossfadeTo, ensureCtx]);
+  }, [connectionId, index, setFromCycle, ensureCtx]);
 
   useEffect(() => { if (running) sendParams(); }, [
     running, sendParams,
     params.prompt, params.noise, params.steps, params.cfg,
-    params.loopback, params.variant, params.multiVariant,
+    params.loopback, params.variant, params.multiVariant, params.spread, params.allVariants,
     shared.inputRate, shared.generateRate, shared.model,
   ]);
 
@@ -287,8 +414,8 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
         type: 'start',
         params: {
           prompt: p.prompt, input_rate: sh.inputRate, generate_rate: sh.generateRate,
-          noise: p.noise, variant_delta: VARIANT_DELTA, steps: p.steps, cfg: p.cfg,
-          variants: p.multiVariant ? VARIANTS : 1, model: sh.model,
+          noise: p.noise, variant_delta: p.spread, steps: p.steps, cfg: p.cfg,
+          variants: familySize(p), model: sh.model,
           loopback: p.loopback, selected_variant: p.variant,
         },
       }));
@@ -296,14 +423,16 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
     finish() {
       wsRef.current?.send(JSON.stringify({ type: 'stop' }));
       setStatus('Idle');
-      const prev = playingRef.current, ctx = ctxRef.current;
-      if (prev && ctx) {
+      const ctx = ctxRef.current;
+      if (ctx) {
         const now = ctx.currentTime;
-        prev.gain.gain.cancelScheduledValues(now);
-        prev.gain.gain.setValueAtTime(Math.max(prev.gain.gain.value, 0.0001), now);
-        prev.gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
-        prev.src.stop(now + 0.25);
-        playingRef.current = null;
+        for (const v of voicesRef.current) {
+          v.gain.gain.cancelScheduledValues(now);
+          v.gain.gain.setValueAtTime(Math.max(v.gain.gain.value, 0.0001), now);
+          v.gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+          v.src.stop(now + 0.25);
+        }
+        voicesRef.current = [];
       }
     },
     sendWeights(weights, renorm) {
@@ -328,7 +457,7 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       <div ref={onNode} className="patch-node in" data-track={index} />
 
       <div className="out-head">
-        <span className="out-title">{index === 0 ? 'Live-Output Feed' : theme.name}</span>
+        <span className="out-title">{theme.name}</span>
         <span className="out-stat">
           {connected ? status : 'disconnected'}
           {cycleInfo && <span className="dim"> · {(cycleInfo.ms / 1000).toFixed(2)}s</span>}

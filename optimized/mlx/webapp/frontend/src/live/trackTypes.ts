@@ -4,7 +4,15 @@ export const API_URL = 'http://localhost:8000';
 export const WS_URL = 'ws://localhost:8000';
 
 export const VARIANTS = 5;
-export const VARIANT_DELTA = 0.02;   // fixed noise step between variants
+// Noise distance between successive variants. The 5-variant ladder spans
+// 4 x spread, so 0.08 puts the top variant 0.32 above the base — clearly
+// different but still tethered to the input. Past ~0.1 the ladder starts
+// clamping at 1.0 at ordinary base levels and the top variants stop varying.
+// At 0 every variant gets the same noise level, and the backend already shares
+// one seed across the family — so the generations are bit-identical and the only
+// remaining effect is the panning spread across the stereo field.
+export const SPREAD_MIN = 0;
+export const SPREAD_MAX = 0.08;
 export const MAX_NUDGE = 5;          // seconds of output delay for alignment
 
 // Crossfade timing. Consecutive generations blend over a fixed window; true
@@ -34,6 +42,10 @@ export interface TrackParams {
   cfg: number;
   multiVariant: boolean;
   variant: number;
+  /** Noise distance between successive variants (was the fixed VARIANT_DELTA). */
+  spread: number;
+  /** Play every variant at once, panned across the stereo field. */
+  allVariants: boolean;
   loopback: number;
   nudge: number;
   outputMonitor: number;
@@ -46,6 +58,8 @@ export const defaultTrack = (): TrackParams => ({
   cfg: 4.0,
   multiVariant: false,
   variant: 0,
+  spread: 0.02,
+  allVariants: false,
   loopback: 0,
   nudge: 0,
   outputMonitor: 0.8,
@@ -56,6 +70,8 @@ export const defaultTrack = (): TrackParams => ({
 export const TRACK_THEME = [
   { name: 'Track 1', accent: '#8ad18a', spec: 'green' as const },
   { name: 'Track 2', accent: '#5fc6d8', spec: 'cyan' as const },
+  { name: 'Track 3', accent: '#d8c05f', spec: 'green' as const },
+  { name: 'Track 4', accent: '#c98ad1', spec: 'cyan' as const },
 ];
 
 /** Shared, input-side parameters every track generates against. */
@@ -78,27 +94,46 @@ export interface LearnProps {
 // Input sources and routing
 // ─────────────────────────────────────────────────────────────────────────
 
-/** Sources can be enabled independently and patched to any set of tracks. */
-export type SourceId = 'mic' | 'file' | 'code';
-export const SOURCE_IDS: SourceId[] = ['mic', 'file', 'code'];
+/** Up to four input boxes and four output tracks. */
+export const MAX_SLOTS = 4;
 
-export const SOURCE_META: Record<SourceId, { name: string; accent: string }> = {
+export type SourceKind = 'mic' | 'file' | 'code';
+export const SOURCE_KINDS: SourceKind[] = ['mic', 'file', 'code'];
+
+export const SOURCE_META: Record<SourceKind, { name: string; accent: string }> = {
   mic:  { name: 'Live Input', accent: '#8ad18a' },
   file: { name: 'File Loop',  accent: '#d8c05f' },
   code: { name: 'Live Code',  accent: '#b98ad1' },
 };
 
-export interface SourceState {
-  enabled: boolean;
-  /** Send level: how much of this source reaches the tracks it is patched to.
-   *  Monitoring scales the same mix, so you hear the balance you are sending. */
+/**
+ * One input box. Sources are instances rather than a fixed set of kinds, so two
+ * Live Inputs can carry different channels of the same interface.
+ *
+ * Live Code is the exception: Strudel is a singleton (one repl, one context, one
+ * output tap), so at most one instance of that kind can exist.
+ */
+export interface SourceInstance {
+  id: string;
+  kind: SourceKind;
+  /** Send level into the tracks this box is patched to. */
   level: number;
   /** One flag per track index. */
   to: boolean[];
+  /** Mic only: which hardware channel(s) this box takes. */
+  chanSel: string;
+  /** File only, for display; the File object itself lives in a ref. */
+  fileName?: string;
+  fileDuration?: number;
 }
 
-export const defaultSources = (): Record<SourceId, SourceState> => ({
-  mic:  { enabled: true,  level: 1, to: [true, true] },
-  file: { enabled: false, level: 1, to: [true, true] },
-  code: { enabled: false, level: 1, to: [true, true] },
+let sourceSeq = 0;
+export const newSource = (kind: SourceKind, nTracks: number): SourceInstance => ({
+  id: `src${++sourceSeq}`,
+  kind,
+  level: 1,
+  to: Array.from({ length: nTracks }, () => true),
+  chanSel: '0+1',
 });
+
+export const defaultSources = (nTracks: number): SourceInstance[] => [newSource('mic', nTracks)];

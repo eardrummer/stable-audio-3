@@ -80,6 +80,9 @@ LIMITS: dict[str, tuple[float, float]] = {
     "input_rate": (0.25, 32.0),
     "generate_rate": (0.2, 40.0),
     "noise": (0.05, 1.0),
+    # Spread: how far apart the variants' noise levels sit. The UI tops out at
+    # 0.08 (beyond which the ladder clamps at ordinary base levels); this is the
+    # guard rail, not the control.
     "variant_delta": (0.0, 0.2),
     "steps": (1, 32),
     "cfg": (1.0, 15.0),

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2 } from 'lucide-react';
+import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2, Plus } from 'lucide-react';
 import Knob from './Knob';
 import LatentShelf from './LatentShelf';
 import StrudelPanel from './StrudelPanel';
@@ -7,13 +7,19 @@ import InputSection from './InputSection';
 import MidiSlider from './MidiSlider';
 import TrackOutput, { type TrackHandle } from './TrackOutput';
 import {
-  API_URL, VARIANTS, VARIANT_DELTA, MAX_NUDGE, TRACK_THEME,
-  SOURCE_IDS, SOURCE_META, defaultSources, defaultTrack,
-  type TrackParams, type SourceId, type SourceState,
+  API_URL, VARIANTS, SPREAD_MIN, SPREAD_MAX, MAX_NUDGE, TRACK_THEME,
+  SOURCE_KINDS, SOURCE_META, MAX_SLOTS, defaultSources, defaultTrack, newSource,
+  type TrackParams, type SourceKind, type SourceInstance,
 } from './trackTypes';
 
 interface RingBuf { l: Float32Array; r: Float32Array; w: number; filled: number; sr: number }
-interface SourceNodes { head: AudioNode; gain: GainNode; analyser: AnalyserNode }
+interface SourceNodes {
+  head: AudioNode;
+  gain: GainNode;
+  analyser: AnalyserNode;
+  /** Mic boxes only: kept so the channel pick can be rewired live. */
+  merger?: ChannelMergerNode;
+}
 import type { StrudelHandle } from './strudel/strudelEngine';
 import './live.css';
 
@@ -133,31 +139,31 @@ export default function LiveApp() {
   const [shelfOpen, setShelfOpen] = useState(false);
   const [shelfBusy, setShelfBusy] = useState(false);
   // Cable being dragged from a source node, and where the pointer is now.
-  const [patchFrom, setPatchFrom] = useState<SourceId | null>(null);
+  const [patchFrom, setPatchFrom] = useState<string | null>(null);
   const [patchTo, setPatchTo] = useState<{ x: number; y: number } | null>(null);
   const [renormalize, setRenormalize] = useState(false);
 
   // --- input source: live hardware, or a file looped as a stand-in ------
-  // Sources are independently enabled and each is patched to a set of tracks.
-  const [sources, setSources] = useState<Record<SourceId, SourceState>>(defaultSources);
+  // Input boxes are instances, not a fixed set of kinds, so two Live Inputs can
+  // carry different channels and be patched to different tracks.
+  const [sources, setSources] = useState<SourceInstance[]>(() => defaultSources(1));
   const sourcesRef = useRef(sources);
   useEffect(() => { sourcesRef.current = sources; }, [sources]);
-  const patchSource = useCallback((id: SourceId, patch: Partial<SourceState>) => {
-    setSources(s => ({ ...s, [id]: { ...s[id], ...patch } }));
+  const patchSource = useCallback((id: string, patch: Partial<SourceInstance>) => {
+    setSources(list => list.map(x => (x.id === id ? { ...x, ...patch } : x)));
   }, []);
+  const [addMenu, setAddMenu] = useState(false);
+  /** Ceiling on both input boxes and output tracks. */
+  const [maxSlots, setMaxSlots] = useState(MAX_SLOTS);
   const [strudelReady, setStrudelReady] = useState(false);
   const [strudelPlaying, setStrudelPlaying] = useState(false);
   const [strudelBanks, setStrudelBanks] = useState<string[]>([]);
   const [strudelError, setStrudelError] = useState<string | null>(null);
   const strudelRef = useRef<StrudelHandle | null>(null);
-  const [fileInfo, setFileInfo] = useState<{ name: string; duration: number } | null>(null);
 
   // --- devices / status ----------------------------------------------
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState('');
-  // Which physical input(s) feed the model. Defaults to the first stereo pair;
-  // the option list grows once we see how many channels the device really has.
-  const [chanSel, setChanSel] = useState('0+1');
   const [detectedChannels, setDetectedChannels] = useState(2);
   const [captureRate, setCaptureRate] = useState<number | null>(null);
   const [status, setStatus] = useState('Idle');
@@ -178,23 +184,26 @@ export default function LiveApp() {
   const streamRef = useRef<MediaStream | null>(null);
   const inGainRef = useRef<GainNode | null>(null);
   const inAnalyserRef = useRef<AnalyserNode | null>(null);
-  const procRef = useRef<ScriptProcessorNode | null>(null);
-  const fileRef = useRef<File | null>(null);
   const fileSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const clickGainRef = useRef<GainNode | null>(null);
   const clickTimerRef = useRef<number | null>(null);
   const nextClickRef = useRef(0);
   const clickBeatRef = useRef(0);
   const bpmRef = useRef<number | null>(null);
-  const srcNodesRef = useRef<Partial<Record<SourceId, SourceNodes>>>({});
+  const srcNodesRef = useRef<Record<string, SourceNodes>>({});
+  // One shared capture of the interface; each mic box picks its own channels
+  // out of it rather than opening the device several times.
+  const micSplitRef = useRef<ChannelSplitterNode | null>(null);
+  const micChanRef = useRef(2);
+  const filesRef = useRef<Record<string, File>>({});
   const trackMixRef = useRef<GainNode[]>([]);
   const ringsRef = useRef<RingBuf[]>([]);
   const procsRef = useRef<ScriptProcessorNode[]>([]);
   const recProcRef = useRef<ScriptProcessorNode | null>(null);
   const tapSinkRef = useRef<GainNode | null>(null);
   const fileBufRef = useRef<AudioBuffer | null>(null);
-  const srcCanvasRefs = useRef<Partial<Record<SourceId, HTMLCanvasElement | null>>>({});
-  const srcNodeEls = useRef<Partial<Record<SourceId, HTMLDivElement | null>>>({});
+  const srcCanvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
+  const srcNodeEls = useRef<Record<string, HTMLDivElement | null>>({});
   const trackNodeEls = useRef<(HTMLDivElement | null)[]>([]);
   const patchLayerRef = useRef<HTMLDivElement | null>(null);
   const micGainRef = useRef<GainNode | null>(null);
@@ -202,7 +211,7 @@ export default function LiveApp() {
   const loopSrcRef = useRef<AudioBufferSourceNode | null>(null);
   const loopBufRef = useRef<AudioBuffer | null>(null);
   const loopPeaksRef = useRef<Float32Array | null>(null);
-  const recRef = useRef<{ chunks: Float32Array[][]; frames: number } | null>(null);
+  const recRef = useRef<{ chunks: Float32Array[][]; frames: number; srcId: string } | null>(null);
   const loopStartedAtRef = useRef(0);
   const dragHandleRef = useRef<0 | 1 | null>(null);
   const splitterRef = useRef<ChannelSplitterNode | null>(null);
@@ -401,6 +410,9 @@ export default function LiveApp() {
     else if (id === 'variant') patchActive({ variant: Math.floor(norm * VARIANTS) });
     else if (id === 'loopback') patchActive({ loopback: Number(norm.toFixed(2)) });
     else if (id === 'nudge') patchActive({ nudge: Number((norm * MAX_NUDGE).toFixed(2)) });
+    else if (id === 'spread') {
+      patchActive({ spread: Number((SPREAD_MIN + norm * (SPREAD_MAX - SPREAD_MIN)).toFixed(3)) });
+    }
     else if (id === 'inputMonitor') setInputMonitor(Number(norm.toFixed(2)));
     else if (id.startsWith('outputMonitor')) {
       const t = Number(id.slice('outputMonitor'.length)) || 0;
@@ -416,20 +428,27 @@ export default function LiveApp() {
   // ─────────────────────────────────────────────────────────────────────
   // Output playback: decode, crossfade, drive the falling spectrogram
   // ─────────────────────────────────────────────────────────────────────
-  // Re-pick the input channel(s) without stopping the loop — useful for moving
-  // from, say, a guitar on input 1 to a mic on input 2 mid-performance.
+  // Re-pick a box's channel(s) without stopping the loop — useful for moving
+  // one input from, say, a guitar on channel 1 to a mic on channel 2 mid-set.
+  // Disconnecting by target only detaches THIS box, leaving the others alone.
+  const chanKey = sources.map(x => `${x.id}:${x.chanSel}`).join('|');
   useEffect(() => {
-    const sp = splitterRef.current, mg = mergerRef.current;
-    if (!sp || !mg) return;
-    const [a, b] = parseChannelSel(chanSel, detectedChannels);
-    try {
-      sp.disconnect();
-      sp.connect(mg, a, 0);
-      sp.connect(mg, b, 1);
-    } catch (e: any) {
-      setError(`Could not select channel: ${e.message || e}`);
+    const sp = micSplitRef.current;
+    if (!sp) return;
+    for (const inst of sourcesRef.current) {
+      if (inst.kind !== 'mic') continue;
+      const mg = srcNodesRef.current[inst.id]?.merger;
+      if (!mg) continue;
+      const [a, b] = parseChannelSel(inst.chanSel, micChanRef.current);
+      try {
+        sp.disconnect(mg);
+        sp.connect(mg, a, 0);
+        sp.connect(mg, b, 1);
+      } catch (e: any) {
+        setError(`Could not select channel: ${e.message || e}`);
+      }
     }
-  }, [chanSel, detectedChannels]);
+  }, [chanKey]);
 
   useEffect(() => { if (inGainRef.current) inGainRef.current.gain.value = inputMonitor; }, [inputMonitor]);
 
@@ -442,7 +461,8 @@ export default function LiveApp() {
 
       // One scope per enabled source. The mic's canvas switches to the
       // recorded loop (with its trim handles) once a take exists.
-      for (const id of SOURCE_IDS) {
+      for (const inst of sourcesRef.current) {
+        const id = inst.id;
         const wc = srcCanvasRefs.current[id];
         if (!wc) continue;
         const ctx2 = wc.getContext('2d');
@@ -450,7 +470,7 @@ export default function LiveApp() {
         const w = wc.width, h = wc.height, mid = h / 2;
 
         const peaks = loopPeaksRef.current;
-        const loopView = id === 'mic' && peaks &&
+        const loopView = inst.kind === 'mic' && peaks &&
           (loopStateRef.current === 'stopped' || loopStateRef.current === 'playing');
 
         if (loopView && peaks) {
@@ -486,7 +506,7 @@ export default function LiveApp() {
         if (!an) continue;
         const data = new Uint8Array(an.fftSize);
         an.getByteTimeDomainData(data);
-        ctx2.strokeStyle = SOURCE_META[id].accent;
+        ctx2.strokeStyle = SOURCE_META[inst.kind].accent;
         ctx2.lineWidth = 1.5;
         ctx2.beginPath();
         for (let i = 0; i < data.length; i++) {
@@ -592,8 +612,8 @@ export default function LiveApp() {
   }, []);
 
   useEffect(() => {
-    if (sources.code.enabled) void ensureStrudel();
-  }, [sources.code.enabled, ensureStrudel]);
+    if (sources.some(x => x.kind === 'code')) void ensureStrudel();
+  }, [sources, ensureStrudel]);
 
   const runStrudel = useCallback(async (code: string) => {
     const h = strudelRef.current ?? await ensureStrudel();
@@ -618,16 +638,16 @@ export default function LiveApp() {
 
   // ...and the other direction: tapping or typing a BPM re-times the pattern.
   useEffect(() => {
-    if (!sources.code.enabled || !bpm) return;
+    if (!sources.some(x => x.kind === 'code') || !bpm) return;
     const h = strudelRef.current;
     if (!h) return;
     const cur = h.getBpm();
     if (cur == null || Math.abs(cur - bpm) > 0.05) h.setBpm(bpm);
-  }, [bpm, sources.code.enabled]);
+  }, [bpm, sources]);
 
   // ── looper (Live Input) ──────────────────────────────────────────────
-  const startRec = useCallback(() => {
-    recRef.current = { chunks: [], frames: 0 };
+  const startRec = useCallback((srcId: string) => {
+    recRef.current = { chunks: [], frames: 0, srcId };
     setRecSecs(0);
     setLoopState('recording');
   }, []);
@@ -712,6 +732,8 @@ export default function LiveApp() {
 
 
   /** Load an audio file to stand in for the live feed while testing. */
+  const filePickTargetRef = useRef<string | null>(null);
+
   const pickFile = async (file: File) => {
     setError(null);
     try {
@@ -720,9 +742,11 @@ export default function LiveApp() {
       const probe = new AudioContext();
       const buf = await probe.decodeAudioData(await file.arrayBuffer());
       await probe.close();
-      fileRef.current = file;
-      setFileInfo({ name: file.name, duration: buf.duration });
-      patchSource('file', { enabled: true });
+      const target = filePickTargetRef.current;
+      if (target) {
+        filesRef.current[target] = file;
+        patchSource(target, { fileName: file.name, fileDuration: buf.duration });
+      }
       // A file can't feed back into the mic, so make it audible by default —
       // unlike the hardware input, which stays muted until you ask for it.
       setInputMonitor(m => (m === 0 ? 0.7 : m));
@@ -730,37 +754,44 @@ export default function LiveApp() {
       setError(`Could not decode ${file.name}: ${e.message || e}`);
     }
   };
+  /** Open the interface once; every mic box picks its channels out of it. */
+  const ensureMicCapture = async (ctx: AudioContext) => {
+    if (micSplitRef.current) return micSplitRef.current;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: deviceId ? { exact: deviceId } : undefined,
+        echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+        // Ask for everything the interface offers; a 2-in device reports 2.
+        channelCount: { ideal: 8 },
+      },
+    });
+    streamRef.current = stream;
+    const raw = ctx.createMediaStreamSource(stream);
+    const nCh = Math.max(1, stream.getAudioTracks()[0]?.getSettings().channelCount ?? 2);
+    micChanRef.current = nCh;
+    setDetectedChannels(nCh);
+    const splitter = ctx.createChannelSplitter(nCh);
+    raw.connect(splitter);
+    micSplitRef.current = splitter;
+    return splitter;
+  };
 
-  /** Build one enabled source: its head node, fader and display analyser. */
-  const buildSource = async (id: SourceId, ctx: AudioContext) => {
+  /** Build one input box: its head node, fader and display analyser. */
+  const buildSource = async (inst: SourceInstance, ctx: AudioContext) => {
     let head: AudioNode | null = null;
 
-    if (id === 'mic') {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: deviceId ? { exact: deviceId } : undefined,
-          echoCancellation: false, noiseSuppression: false, autoGainControl: false,
-          // Ask for everything the interface offers; a 2-in device reports 2.
-          channelCount: { ideal: 8 },
-        },
-      });
-      streamRef.current = stream;
-      const raw = ctx.createMediaStreamSource(stream);
-      const nCh = Math.max(1, stream.getAudioTracks()[0]?.getSettings().channelCount ?? 2);
-      setDetectedChannels(nCh);
-      // Channel selection belongs to the mic alone — it is meaningless once a
-      // stereo file or pattern has been summed in.
-      const splitter = ctx.createChannelSplitter(nCh);
+    let micMerger: ChannelMergerNode | undefined;
+    if (inst.kind === 'mic') {
+      const splitter = await ensureMicCapture(ctx);
+      const nCh = micChanRef.current;
+      // Per-box channel pick, so two Live Inputs can carry different channels.
       const merger = ctx.createChannelMerger(2);
-      raw.connect(splitter);
-      const [selA, selB] = parseChannelSel(chanSel, nCh);
+      micMerger = merger;
+      const [selA, selB] = parseChannelSel(inst.chanSel, nCh);
       splitter.connect(merger, selA, 0);
       splitter.connect(merger, selB, 1);
-      splitterRef.current = splitter;
-      mergerRef.current = merger;
 
-      // The live mic and the recorded loop share this source's fader; loop
-      // playback swaps between them rather than adding a fourth channel.
+      // The live signal and this box's recorded loop share its fader.
       const liveGain = ctx.createGain();
       liveGain.gain.value = loopStateRef.current === 'playing' ? 0 : 1;
       merger.connect(liveGain);
@@ -775,12 +806,12 @@ export default function LiveApp() {
       loopGain.connect(bus);
       head = bus;
 
-      // The looper records the mic alone, so it needs its own tap rather than
-      // reading a track mix that may contain a file or a pattern.
+      // The looper records this box alone, not a track mix that may also carry
+      // a file or a pattern, so it needs its own tap.
       const recProc = ctx.createScriptProcessor(4096, 2, 2);
       recProc.onaudioprocess = (e) => {
         const rec = recRef.current;
-        if (!rec) return;
+        if (!rec || rec.srcId !== inst.id) return;
         const Lc = e.inputBuffer.getChannelData(0);
         const Rc = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : Lc;
         if (rec.frames < MAX_LOOP_SECS * ctx.sampleRate) {
@@ -789,11 +820,15 @@ export default function LiveApp() {
         }
       };
       merger.connect(recProc);
+      // A ScriptProcessor only fires while it has a path to the destination.
+      if (tapSinkRef.current) recProc.connect(tapSinkRef.current);
       recProcRef.current = recProc;
     }
 
-    if (id === 'file') {
-      const buf = await ctx.decodeAudioData(await fileRef.current!.arrayBuffer());
+    if (inst.kind === 'file') {
+      const f = filesRef.current[inst.id];
+      if (!f) return null;
+      const buf = await ctx.decodeAudioData(await f.arrayBuffer());
       const node = ctx.createBufferSource();
       node.buffer = buf;
       node.loop = true;            // sample-accurate loop, no gap at the seam
@@ -802,36 +837,35 @@ export default function LiveApp() {
       head = node;                 // started below, once the seed is known
     }
 
-    if (id === 'code') head = strudelRef.current!.tap;
+    if (inst.kind === 'code') head = strudelRef.current!.tap;
     if (!head) return null;
 
     const gain = ctx.createGain();
-    gain.gain.value = sourcesRef.current[id].level;
+    gain.gain.value = inst.level;
     head.connect(gain);
 
-    // Display tap is PRE-fader, so a source stays visible at level 0.
+    // Display tap is PRE-fader, so a box stays visible at level 0.
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 2048;
     head.connect(analyser);
 
-    return { head, gain, analyser };
+    return { head, gain, analyser, merger: micMerger };
   };
+
 
   const start = async () => {
     setError(null);
-    const active = SOURCE_IDS.filter(id => sources[id].enabled);
-    if (!active.length) { setError('Enable at least one input source.'); return; }
-    if (sources.file.enabled && !fileRef.current) {
-      setError('Load an audio file, or turn off the File Loop source.');
-      return;
-    }
+    const active = sources;
+    if (!active.length) { setError('Add at least one input box.'); return; }
+    const missing = active.find(x => x.kind === 'file' && !filesRef.current[x.id]);
+    if (missing) { setError('Load an audio file into the File Loop box, or remove it.'); return; }
     setIsStarting(true);
     try {
       // Adopt Strudel's context when Live Code is in play, so pattern playback
       // and capture share one clock; otherwise make our own. Either way we run
       // at the device's native rate and let the backend resample to 44.1 kHz.
       let ctx: AudioContext;
-      if (sources.code.enabled) {
+      if (active.some(x => x.kind === 'code')) {
         const h = strudelRef.current ?? await ensureStrudel();
         if (!h) { setIsStarting(false); return; }
         ctx = h.ctx;
@@ -896,14 +930,14 @@ export default function LiveApp() {
       clickGain.connect(ctx.destination);
       clickGainRef.current = clickGain;
 
-      const built: Partial<Record<SourceId, SourceNodes>> = {};
-      for (const id of active) {
-        const n = await buildSource(id, ctx);
+      const built: Record<string, SourceNodes> = {};
+      for (const inst of active) {
+        const n = await buildSource(inst, ctx);
         if (!n) continue;
-        built[id] = n;
+        built[inst.id] = n;
         n.gain.connect(monitorGain);
-        // Patch into whichever tracks this source is routed to.
-        sourcesRef.current[id].to.forEach((on, ti) => {
+        // Patch into whichever tracks this box is routed to.
+        inst.to.forEach((on, ti) => {
           if (on && mixes[ti]) n.gain.connect(mixes[ti]);
         });
       }
@@ -915,13 +949,13 @@ export default function LiveApp() {
       // would be wrong, so it is skipped.
       let seeded = false;
       const fbuf = fileBufRef.current;
-      if (sources.file.enabled && fbuf) {
+      if (active.some(x => x.kind === 'file') && fbuf) {
         const seedLen = Math.min(Math.floor(effInputRate * ctx.sampleRate), fbuf.length);
         const Lc = fbuf.getChannelData(0);
         const Rc = fbuf.numberOfChannels > 1 ? fbuf.getChannelData(1) : Lc;
         rings.forEach((ring, ti) => {
           const only = active.length === 1 ||
-            active.every(id => id === 'file' || !sourcesRef.current[id].to[ti]);
+            active.every(x => x.kind === 'file' || !x.to[ti]);
           if (!only) return;
           ring.l.set(Lc.subarray(0, seedLen), 0);
           ring.r.set(Rc.subarray(0, seedLen), 0);
@@ -957,11 +991,23 @@ export default function LiveApp() {
 
   const stop = () => {
     setRunning(false);
-    if (sourcesRef.current.code.enabled) { strudelRef.current?.hush(); setStrudelPlaying(false); }
+    if (sourcesRef.current.some(x => x.kind === 'code')) { strudelRef.current?.hush(); setStrudelPlaying(false); }
     setStatus('Idle');
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
     for (const t of trackRefs.current) t?.finish();
-    procRef.current?.disconnect();
+    for (const pr of procsRef.current) pr.disconnect();
+    procsRef.current = [];
+    recProcRef.current?.disconnect();
+    recProcRef.current = null;
+    for (const m of trackMixRef.current) m.disconnect();
+    trackMixRef.current = [];
+    tapSinkRef.current?.disconnect();
+    tapSinkRef.current = null;
+    for (const n of Object.values(srcNodesRef.current)) {
+      n?.gain.disconnect();
+      n?.analyser.disconnect();
+    }
+    srcNodesRef.current = {};
     if (fileSourceRef.current) {
       try { fileSourceRef.current.stop(); } catch { /* never started */ }
       fileSourceRef.current.disconnect();
@@ -973,6 +1019,8 @@ export default function LiveApp() {
     if (clickTimerRef.current) { clearInterval(clickTimerRef.current); clickTimerRef.current = null; }
     clickGainRef.current?.disconnect();
     clickGainRef.current = null;
+    micSplitRef.current?.disconnect();
+    micSplitRef.current = null;
     splitterRef.current?.disconnect();
     mergerRef.current?.disconnect();
     splitterRef.current = null;
@@ -980,10 +1028,9 @@ export default function LiveApp() {
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
     // Strudel owns its context; closing it would kill the engine.
-    if (!sourcesRef.current.code.enabled) inCtxRef.current?.close().catch(() => {});
+    if (!sourcesRef.current.some(x => x.kind === 'code')) inCtxRef.current?.close().catch(() => {});
     inCtxRef.current = null;
     inAnalyserRef.current = null;
-    procRef.current = null;
   };
 
   useEffect(() => () => { stop(); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
@@ -1009,19 +1056,19 @@ export default function LiveApp() {
 
   // Serialised routing, so the rewire below fires on patch changes only —
   // keying it on `sources` would disconnect and reconnect on every fader move.
-  const routingKey = SOURCE_IDS
-    .map(id => sources[id].to.slice(0, tracks.length).map(b => (b ? 1 : 0)).join(''))
+  const routingKey = sources
+    .map(x => `${x.id}:${x.to.slice(0, tracks.length).map(b => (b ? 1 : 0)).join('')}`)
     .join('|');
   useEffect(() => {
     const mixes = trackMixRef.current;
     if (!mixes.length) return;
-    for (const id of SOURCE_IDS) {
-      const n = srcNodesRef.current[id];
+    for (const inst of sourcesRef.current) {
+      const n = srcNodesRef.current[inst.id];
       if (!n) continue;
       mixes.forEach((mix) => {
         try { n.gain.disconnect(mix); } catch { /* was not connected */ }
       });
-      sourcesRef.current[id].to.forEach((on, ti) => {
+      inst.to.forEach((on, ti) => {
         if (on && mixes[ti]) n.gain.connect(mixes[ti]);
       });
     }
@@ -1029,7 +1076,7 @@ export default function LiveApp() {
 
   // --- patch cables ----------------------------------------------------
   const [anchors, setAnchors] = useState<{
-    src: Partial<Record<SourceId, { x: number; y: number }>>;
+    src: Record<string, { x: number; y: number }>;
     trk: { x: number; y: number }[];
   }>({ src: {}, trk: [] });
 
@@ -1042,10 +1089,10 @@ export default function LiveApp() {
       const r = el.getBoundingClientRect();
       return { x: r.left + r.width / 2 - base.left, y: r.top + r.height / 2 - base.top };
     };
-    const src: Partial<Record<SourceId, { x: number; y: number }>> = {};
-    for (const id of SOURCE_IDS) {
-      const pt = at(srcNodeEls.current[id]);
-      if (pt) src[id] = pt;
+    const src: Record<string, { x: number; y: number }> = {};
+    for (const inst of sourcesRef.current) {
+      const pt = at(srcNodeEls.current[inst.id]);
+      if (pt) src[inst.id] = pt;
     }
     setAnchors({ src, trk: trackNodeEls.current.map(el => at(el) ?? { x: 0, y: 0 }) });
   }, []);
@@ -1058,7 +1105,7 @@ export default function LiveApp() {
     return () => { window.clearTimeout(t); window.removeEventListener('resize', measure); };
   }, [measure, sources, tracks.length, shelfOpen, loopLen]);
 
-  const beginPatch = useCallback((id: SourceId, e: React.PointerEvent) => {
+  const beginPatch = useCallback((id: string, e: React.PointerEvent) => {
     e.preventDefault();
     measure();
     setPatchFrom(id);
@@ -1084,12 +1131,13 @@ export default function LiveApp() {
             && e.clientY >= r.top - pad && e.clientY <= r.bottom + pad;
       });
       if (hit >= 0) {
-        setSources(prev => {
-          const to = [...prev[patchFrom].to];
+        setSources(prev => prev.map(x => {
+          if (x.id !== patchFrom) return x;
+          const to = [...x.to];
           while (to.length < tracks.length) to.push(false);
           to[hit] = !to[hit];
-          return { ...prev, [patchFrom]: { ...prev[patchFrom], to } };
-        });
+          return { ...x, to };
+        }));
       }
       setPatchFrom(null);
       setPatchTo(null);
@@ -1102,16 +1150,50 @@ export default function LiveApp() {
     };
   }, [patchFrom, tracks.length]);
 
-  const addTrack = useCallback(() => {
-    setTracks(ts => (ts.length > 1 ? ts : [...ts, defaultTrack()]));
-    setActiveTab(1);
+  const addSource = useCallback((kind: SourceKind) => {
+    setAddMenu(false);
+    setSources(list => (list.length >= maxSlots ? list : [...list, newSource(kind, tracks.length)]));
+  }, [maxSlots, tracks.length]);
+
+  /** Removing a box must also silence it and drop its cables. */
+  const removeSource = useCallback((id: string) => {
+    const inst = sourcesRef.current.find(x => x.id === id);
+    // A running Live Code box keeps sounding otherwise: Strudel's scheduler is
+    // independent of our graph, so it has to be hushed explicitly.
+    if (inst?.kind === 'code') {
+      strudelRef.current?.hush();
+      setStrudelPlaying(false);
+    }
+    const n = srcNodesRef.current[id];
+    if (n) {
+      // Dropping the connections removes this box's cables with it.
+      try { n.gain.disconnect(); } catch { /* already detached */ }
+      try { n.analyser.disconnect(); } catch { /* already detached */ }
+      delete srcNodesRef.current[id];
+    }
+    delete filesRef.current[id];
+    delete srcCanvasRefs.current[id];
+    delete srcNodeEls.current[id];
+    if (recRef.current?.srcId === id) recRef.current = null;
+    setSources(list => list.filter(x => x.id !== id));
   }, []);
-  const removeTrack = useCallback(() => {
-    trackRefs.current[1]?.finish();
-    trackRefs.current = trackRefs.current.slice(0, 1);
-    setTracks(ts => ts.slice(0, 1));
+
+  const addTrack = useCallback(() => {
+    setTracks(ts => {
+      if (ts.length >= maxSlots) return ts;
+      // Every existing box patches to the new track by default.
+      setSources(list => list.map(x => ({ ...x, to: [...x.to, true] })));
+      setActiveTab(ts.length);
+      return [...ts, defaultTrack()];
+    });
+  }, [maxSlots]);
+  const removeTrack = useCallback((i: number) => {
+    trackRefs.current[i]?.finish();
+    trackRefs.current = trackRefs.current.filter((_, j) => j !== i);
+    setTracks(ts => ts.filter((_, j) => j !== i));
+    setSources(list => list.map(x => ({ ...x, to: x.to.filter((_, j) => j !== i) })));
     setActiveTab(0);
-    // Otherwise a solo on the departed track would silence the survivor.
+    // Otherwise a solo on the departed track would silence the survivors.
     setSolo(null);
   }, []);
 
@@ -1133,7 +1215,7 @@ export default function LiveApp() {
       <header className="live-bar">
         <button className={`transport ${running ? 'stop' : 'start'}`}
                 onClick={running ? stop : start}
-                disabled={!connected || isStarting || (sources.code.enabled && !strudelReady)}>
+                disabled={!connected || isStarting || (sources.some(x => x.kind === 'code') && !strudelReady)}>
           {running ? <Square size={16} /> : <Play size={16} />}
           {running ? 'STOP' : 'START'}
         </button>
@@ -1167,12 +1249,11 @@ export default function LiveApp() {
           <PanelRight size={15} /> LATENT
         </button>
 
-        <select className="live-select" value={chanSel}
-                onChange={e => setChanSel(e.target.value)}
-                title="Which physical input(s) feed the model">
-          {channelOptions(detectedChannels).map(o => (
-            <option key={o.value} value={o.value}>{o.label}</option>
-          ))}
+
+        <select className="live-select" value={maxSlots}
+                onChange={e => setMaxSlots(Number(e.target.value))}
+                title="Ceiling on input boxes and output tracks">
+          {[1, 2, 3, 4].map(n => <option key={n} value={n}>max {n}</option>)}
         </select>
 
         <select className="live-select" value={model}
@@ -1198,10 +1279,10 @@ export default function LiveApp() {
         {/* Patch cables. Pointer-transparent so the panes stay usable; the
             layer only draws. */}
         <svg className="patch-layer" aria-hidden="true">
-          {SOURCE_IDS.flatMap(id => {
-            const a = anchors.src[id];
-            if (!a || !sources[id].enabled) return [];
-            return sources[id].to.slice(0, anchors.trk.length).map((on, ti) => {
+          {sources.flatMap(inst => {
+            const a = anchors.src[inst.id];
+            if (!a) return [];
+            return inst.to.slice(0, anchors.trk.length).map((on, ti) => {
               const b = anchors.trk[ti];
               if (!on || !b) return null;
               // Leaves the source horizontally, arrives at the track from
@@ -1211,9 +1292,9 @@ export default function LiveApp() {
               const sag = Math.min(26, Math.abs(b.x - a.x) * 0.08);
               const d = `M ${a.x} ${a.y} C ${a.x + dx} ${a.y + sag}, `
                       + `${b.x} ${b.y - dy + sag}, ${b.x} ${b.y}`;
-              const col = SOURCE_META[id].accent;
+              const col = SOURCE_META[inst.kind].accent;
               return (
-                <g key={`${id}-${ti}`}>
+                <g key={`${inst.id}-${ti}`}>
                   <path className="cable-shadow" d={d} />
                   <path className="cable" stroke={col} d={d} />
                   <circle className="cable-plug" cx={a.x} cy={a.y} r={4} fill={col} />
@@ -1226,11 +1307,11 @@ export default function LiveApp() {
             <g>
               <path
                 className="cable dragging"
-                stroke={SOURCE_META[patchFrom].accent}
+                stroke={SOURCE_META[sources.find(x => x.id === patchFrom)?.kind ?? 'mic'].accent}
                 d={`M ${anchors.src[patchFrom]!.x} ${anchors.src[patchFrom]!.y} L ${patchTo.x} ${patchTo.y}`}
               />
               <circle className="cable-plug" cx={patchTo.x} cy={patchTo.y} r={5}
-                      fill={SOURCE_META[patchFrom].accent} />
+                      fill={SOURCE_META[sources.find(x => x.id === patchFrom)?.kind ?? 'mic'].accent} />
             </g>
           )}
         </svg>
@@ -1242,23 +1323,25 @@ export default function LiveApp() {
           {/* One horizontal band per enabled source, each with its own display,
               send fader and patch node. */}
           <div className="in-stack">
-            {SOURCE_IDS.filter(id => sources[id].enabled).map(id => (
+            {sources.map(inst => (
               <InputSection
-                key={id}
-                id={id}
-                state={sources[id]}
-                connected={sources[id].to.slice(0, tracks.length).filter(Boolean).length}
+                key={inst.id}
+                src={inst}
+                connected={inst.to.slice(0, tracks.length).filter(Boolean).length}
                 patching={patchFrom !== null}
+                running={running}
+                channelOptions={channelOptions(detectedChannels)}
+                onChanSel={(v) => patchSource(inst.id, { chanSel: v })}
                 onLevel={(v) => {
-                  patchSource(id, { level: v });
-                  srcNodesRef.current[id]?.gain.gain.setTargetAtTime(
+                  patchSource(inst.id, { level: v });
+                  srcNodesRef.current[inst.id]?.gain.gain.setTargetAtTime(
                     v, inCtxRef.current?.currentTime ?? 0, 0.02);
                 }}
-                onDisable={() => patchSource(id, { enabled: false })}
-                onCanvas={(el) => { srcCanvasRefs.current[id] = el; }}
-                onNode={(el) => { srcNodeEls.current[id] = el; }}
-                onNodeDown={(e) => beginPatch(id, e)}
-                canvasProps={id === 'mic' ? {
+                onRemove={() => removeSource(inst.id)}
+                onCanvas={(el) => { srcCanvasRefs.current[inst.id] = el; }}
+                onNode={(el) => { srcNodeEls.current[inst.id] = el; }}
+                onNodeDown={(e) => beginPatch(inst.id, e)}
+                canvasProps={inst.kind === 'mic' ? {
                   style: { cursor: showLoopView ? 'ew-resize' : 'default' },
                   onPointerDown: (e) => {
                     if (!showLoopView || !loopLen) return;
@@ -1273,7 +1356,7 @@ export default function LiveApp() {
                     try { (e.target as Element).releasePointerCapture(e.pointerId); } catch { /* done */ }
                   },
                 } : undefined}
-                overlay={id === 'code' ? (
+                overlay={inst.kind === 'code' ? (
                   <StrudelPanel
                     onEvaluate={runStrudel}
                     onHush={hushStrudel}
@@ -1284,10 +1367,10 @@ export default function LiveApp() {
                   />
                 ) : undefined}
                 tools={
-                  id === 'mic' ? (
+                  inst.kind === 'mic' ? (
                     <div className="in-tools">
                       {loopState !== 'recording' ? (
-                        <button className="tool rec" onClick={startRec} disabled={!running}
+                        <button className="tool rec" onClick={() => startRec(inst.id)} disabled={!running}
                                 title={running ? 'Record a loop' : 'Start the transport first'}>
                           <Circle size={10} /> REC
                         </button>
@@ -1308,15 +1391,18 @@ export default function LiveApp() {
                         </span>
                       )}
                     </div>
-                  ) : id === 'file' ? (
+                  ) : inst.kind === 'file' ? (
                     <div className="in-tools">
                       <button className="tool" disabled={running}
-                              onClick={() => filePickerRef.current?.click()}>
-                        <FolderOpen size={10} /> {fileInfo ? 'Change…' : 'Import…'}
+                              onClick={() => {
+                                filePickTargetRef.current = inst.id;
+                                filePickerRef.current?.click();
+                              }}>
+                        <FolderOpen size={10} /> {inst.fileName ? 'Change…' : 'Import…'}
                       </button>
-                      {fileInfo && (
-                        <span className="tools-meta" title={fileInfo.name}>
-                          {fileInfo.name} · {fileInfo.duration.toFixed(1)}s
+                      {inst.fileName && (
+                        <span className="tools-meta" title={inst.fileName}>
+                          {inst.fileName} · {inst.fileDuration?.toFixed(1)}s
                         </span>
                       )}
                     </div>
@@ -1326,25 +1412,29 @@ export default function LiveApp() {
             ))}
           </div>
 
-          {/* Turn sources on; they run simultaneously rather than exclusively. */}
-          <div className="source-row">
-            <div className="source-toggle">
-              {SOURCE_IDS.map(id => (
-                <button
-                  key={id}
-                  className={sources[id].enabled ? 'on' : ''}
-                  disabled={running}
-                  onClick={() => {
-                    if (id === 'file' && !fileRef.current) { filePickerRef.current?.click(); return; }
-                    patchSource(id, { enabled: !sources[id].enabled });
-                  }}
-                >
-                  {id === 'mic' ? <Mic size={13} /> : id === 'file' ? <Repeat size={13} /> : <Code2 size={13} />}
-                  {SOURCE_META[id].name}
-                </button>
-              ))}
-            </div>
-
+          {/* Add another input box. Live Code is capped at one because Strudel
+              is a singleton — one repl, one context, one output tap. */}
+          <div className="add-row">
+            <button className="add-btn" disabled={running || sources.length >= maxSlots}
+                    onClick={() => setAddMenu(v => !v)}
+                    title={sources.length >= maxSlots ? `Limit is ${maxSlots} input boxes` : 'Add an input'}>
+              <Plus size={14} /> ADD INPUT
+            </button>
+            {addMenu && (
+              <div className="add-menu">
+                {SOURCE_KINDS.map(kind => {
+                  const taken = kind === 'code' && sources.some(x => x.kind === 'code');
+                  return (
+                    <button key={kind} disabled={taken}
+                            title={taken ? 'Only one Live Code box is possible' : undefined}
+                            onClick={() => addSource(kind)}>
+                      {kind === 'mic' ? <Mic size={12} /> : kind === 'file' ? <Repeat size={12} /> : <Code2 size={12} />}
+                      {SOURCE_META[kind].name}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             <input ref={filePickerRef} type="file" accept="audio/*" hidden
                    onChange={e => {
                      const f = e.target.files?.[0];
@@ -1357,7 +1447,7 @@ export default function LiveApp() {
                       value={inputMonitor} onChange={setInputMonitor} />
         </section>
 
-        <div className="middle" title={`${cur.steps} steps · variant ${cur.variant} at noise ${(cur.noise + cur.variant * VARIANT_DELTA).toFixed(2)}`}>
+        <div className="middle" title={`${cur.steps} steps · variant ${cur.variant} at noise ${(cur.noise + cur.variant * cur.spread).toFixed(2)}`}>
           <div className="middle-bar" style={{ width: `${barWidth}px` }}>
             <div className="variant-marker" style={{ top: `${2 + variantPct * 0.96}%` }}>
               <span className="variant-marker-tag">{cur.variant}</span>
@@ -1365,7 +1455,9 @@ export default function LiveApp() {
           </div>
         </div>
 
-        <div className="out-stack">
+        <div className="out-side">
+          <div className="pane-title right">Live-Output Feed</div>
+          <div className="out-stack">
           {tracks.map((t, i) => (
             <TrackOutput
               key={i}
@@ -1378,11 +1470,13 @@ export default function LiveApp() {
               // The MIDI bridge broadcasts to every session; only track 1 acts
               // on it, or one CC would be applied twice.
               onMidi={i === 0 ? applyMidi : undefined}
-              onAdd={i === 0 && tracks.length === 1 ? addTrack : undefined}
-              onRemove={i === 1 ? removeTrack : undefined}
+              onAdd={i === tracks.length - 1 && tracks.length < maxSlots ? addTrack : undefined}
+              onRemove={tracks.length > 1 ? () => removeTrack(i) : undefined}
               onError={setError}
               onConnected={i === 0 ? setConnected : undefined}
-              active={activeTab === i}
+              // Master drives every track, so light them all: the ring is
+              // what tells you which tracks the knobs are touching.
+              active={masterMode || activeTab === i}
               onActivate={() => setActiveTab(i)}
               soloed={solo === i}
               muted={solo !== null && solo !== i}
@@ -1395,6 +1489,7 @@ export default function LiveApp() {
               running={running}
             />
           ))}
+          </div>
         </div>
 
         <LatentShelf
@@ -1499,14 +1594,34 @@ export default function LiveApp() {
                   disabled={!cur.multiVariant}
                   value={cur.variant} onChange={v => patchActive({ variant: v })}
                   format={v => cur.multiVariant
-                    ? `${Math.round(v)} · ${(cur.noise + v * VARIANT_DELTA).toFixed(2)}`
+                    ? `${Math.round(v)} · ${(cur.noise + v * cur.spread).toFixed(2)}`
                     : 'off'} />
             <label className="variant-toggle" title={`Generate ${VARIANTS} progressively noisier variants each cycle (${VARIANTS}x slower)`}>
               <input type="checkbox" checked={cur.multiVariant}
-                     onChange={e => patchActive({ multiVariant: e.target.checked, variant: 0 })} />
+                     onChange={e => patchActive({
+                       multiVariant: e.target.checked,
+                       variant: 0,
+                       // ALL is meaningless without a ladder to spread.
+                       allVariants: e.target.checked ? cur.allVariants : false,
+                     })} />
               {VARIANTS} variants
             </label>
           </div>
+
+          {cur.multiVariant && (
+            <div className="variant-cell">
+              <Knob {...knobProps('spread')} label="Spread"
+                    min={SPREAD_MIN} max={SPREAD_MAX} step={0.0025}
+                    value={cur.spread} onChange={v => patchActive({ spread: v })}
+                    format={v => v.toFixed(3)} />
+              <label className="variant-toggle"
+                     title="Play every variant at once, panned left to right">
+                <input type="checkbox" checked={cur.allVariants}
+                       onChange={e => patchActive({ allVariants: e.target.checked })} />
+                all
+              </label>
+            </div>
+          )}
         </div>
 
         <div className="knob-group">
