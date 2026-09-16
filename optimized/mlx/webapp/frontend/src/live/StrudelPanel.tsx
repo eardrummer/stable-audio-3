@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { Play, Square, Info } from 'lucide-react';
 import type { EditorHandle } from './strudel/codeEditor';
 
@@ -12,21 +12,31 @@ stack(
 )`;
 
 interface Props {
-  onEvaluate: (code: string) => void;
+  onEvaluate: (code: string) => void | Promise<void>;
   onHush: () => void;
   running: boolean;
   ready: boolean;
   banks: string[];
   error?: string | null;
+  /** The transport drives RUN and HUSH; say so, since the buttons will move
+   *  on their own. */
+  linked?: boolean;
+}
+
+/** Lets the transport press RUN and HUSH, so a pattern and the generation
+ *  clock start on the same instant instead of whenever each was clicked. */
+export interface StrudelPanelHandle {
+  run(): Promise<void>;
+  hush(): void;
 }
 
 /**
  * Code editor overlaying the input waveform. CodeMirror is loaded through a
  * dynamic import so its bundle only arrives when Live Code mode is opened.
  */
-export default function StrudelPanel({
-  onEvaluate, onHush, running, ready, banks, error,
-}: Props) {
+const StrudelPanel = forwardRef<StrudelPanelHandle, Props>(function StrudelPanel({
+  onEvaluate, onHush, running, ready, banks, error, linked,
+}, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const edRef = useRef<EditorHandle | null>(null);
   const codeRef = useRef<string>(
@@ -43,12 +53,19 @@ export default function StrudelPanel({
   useEffect(() => { runRef.current = onEvaluate; }, [onEvaluate]);
   useEffect(() => { hushRef.current = onHush; }, [onHush]);
 
-  const fire = () => {
+  /** The one path RUN takes, whoever presses it. Falls back to the stored
+   *  buffer so the transport can evaluate before CodeMirror has loaded. */
+  const fire = async () => {
     const code = edRef.current?.getCode() ?? codeRef.current;
-    runRef.current(code);
     setFlash(true);
     window.setTimeout(() => setFlash(false), 220);
+    await runRef.current(code);
   };
+
+  useImperativeHandle(ref, () => ({
+    run: fire,
+    hush: () => hushRef.current(),
+  }), []);
 
   useEffect(() => {
     let disposed = false;
@@ -82,7 +99,10 @@ export default function StrudelPanel({
         <button className="strudel-hush" onClick={onHush} disabled={!ready}>
           <Square size={12} /> HUSH
         </button>
-        <span className="strudel-hint">⌘↵ run · ⌘. hush</span>
+        <span className="strudel-hint">
+          ⌘↵ run · ⌘. hush
+          {linked && <em className="strudel-link" title="START evaluates this pattern and STOP hushes it, so its cycle 0 lands on the generation clock"> · tied to transport</em>}
+        </span>
         <span className={`strudel-state ${running ? 'on' : ''}`}>
           {!ready ? 'loading…' : running ? 'playing' : 'idle'}
         </span>
@@ -100,4 +120,6 @@ export default function StrudelPanel({
       </div>
     </div>
   );
-}
+});
+
+export default StrudelPanel;

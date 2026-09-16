@@ -30,17 +30,24 @@ interface Props {
   patching?: boolean;
   connected: number;
   running: boolean;
+  /** This box is the one the Input FX controls are editing. */
+  active?: boolean;
+  onActivate?: () => void;
 }
 
 export default function InputSection({
   src, onLevel, onChanSel, onRemove, onCanvas, onNode, onNodeDown,
   channelOptions, overlay, tools, canvasProps, patching, connected, running,
+  active, onActivate,
 }: Props) {
   const meta = SOURCE_META[src.kind];
   return (
     <section
-      className={`in-section ${patching ? 'patching' : ''}`}
+      className={`in-section ${patching ? 'patching' : ''} ${active ? 'active' : ''}`}
       style={{ ['--src' as string]: meta.accent }}
+      // Clicking anywhere in a box is how you choose which one the Input FX
+      // controls edit — the same gesture that picks a track below.
+      onPointerDown={onActivate}
     >
       <div className="in-head">
         <span className="in-name">{meta.name}</span>
@@ -70,12 +77,13 @@ export default function InputSection({
       <div className="in-body">
         <canvas ref={onCanvas} width={900} height={200} className="in-canvas" {...canvasProps} />
         {overlay}
-        {/* Cables to the output tracks start here. */}
-        <div ref={onNode} className="patch-node out" onPointerDown={onNodeDown}
-             title="Drag to a track to patch" />
       </div>
 
       {tools}
+
+      {/* Cables to the output tracks leave from the bottom edge. */}
+      <div ref={onNode} className="patch-node out" onPointerDown={onNodeDown}
+           title="Drag to a track to patch" />
 
       <div className="in-fader">
         <input

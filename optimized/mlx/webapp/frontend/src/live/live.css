@@ -230,7 +230,17 @@ html, body, #live-root {
   justify-content: center;
   padding: 14px 6px;
   min-width: 40px;
+  /* The divider is the resize handle. Its padding is most of the grab area,
+     so a thin bar (few diffusion steps) is still easy to catch. */
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
 }
+.vertical .middle { cursor: row-resize; }
+.middle:hover .middle-bar,
+.middle.dragging .middle-bar { box-shadow: 0 0 0 2px rgba(255, 255, 255, .25); }
+/* While dragging, the bar should track the pointer rather than easing after it. */
+.middle.dragging .middle-bar { transition: none; }
 .middle-bar {
   position: relative;
   background: linear-gradient(180deg, #cfe8cf 0%, #9ccf9c 55%, #7fc08a 100%);
@@ -363,18 +373,22 @@ html, body, #live-root {
   flex: 0 0 auto;
   display: flex;
   justify-content: center;
-  gap: 12px;
+  /* Six groups are a tight fit even at these sizes; wrapping keeps every knob
+     reachable on a narrow window instead of pushing the last group off. */
+  flex-wrap: wrap;
+  row-gap: 6px;
+  gap: 8px;
   padding: 12px 16px 16px 190px;   /* left room for the tempo box */
   border-top: 1px solid var(--line);
 }
 
 .knob {
-  width: 84px;
+  width: 64px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 1px;
-  padding: 5px;
+  gap: 0;
+  padding: 3px;
   border: 2px dashed transparent;
   border-radius: 8px;
 }
@@ -384,7 +398,9 @@ html, body, #live-root {
   background: rgba(59, 130, 246, .12);
 }
 
-.knob-dial { cursor: ns-resize; touch-action: none; }
+/* The SVG carries a 64px viewBox; CSS shrinks the rendering without
+   touching the geometry inside it. */
+.knob-dial { width: 50px; height: 50px; cursor: ns-resize; touch-action: none; }
 .knob.learning .knob-dial { cursor: pointer; }
 
 .knob-track { fill: none; stroke: #2b2b2b; stroke-width: 4; stroke-linecap: round; }
@@ -392,9 +408,9 @@ html, body, #live-root {
 .knob-body { fill: #ededed; stroke: #444; stroke-width: 1; }
 .knob-pointer { stroke: #111; stroke-width: 2.5; stroke-linecap: round; }
 
-.knob-value { font-size: 12px; font-variant-numeric: tabular-nums; color: #eee; }
-.knob-label { font-size: 10px; color: var(--dim); text-align: center; letter-spacing: .04em; }
-.knob-binding { font-size: 9px; color: #6f9bdd; }
+.knob-value { font-size: 10px; font-variant-numeric: tabular-nums; color: #eee; }
+.knob-label { font-size: 9px; color: var(--dim); text-align: center; letter-spacing: .03em; }
+.knob-binding { font-size: 8px; color: #6f9bdd; }
 
 /* ── tempo (bottom-left of the knob row) ───────────────────────── */
 /* Pinned to the bottom-left corner; the knobs stay centred in the footer. */
@@ -479,15 +495,46 @@ html, body, #live-root {
 .click-level input[type=range] { width: 96px; accent-color: var(--accent); }
 
 /* ── knob grouping ─────────────────────────────────────────────── */
+/* Each group is a captioned block. The tint is not decoration: it says where
+   in the signal path the group acts, and it is what lets you find the right
+   knob mid-performance without reading six labels. */
 .knob-group {
   display: flex;
-  align-items: flex-start;
-  gap: 20px;
-  padding: 8px 16px 6px;
-  border: 1px solid #1d1d1d;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px 5px;
+  border: 1px solid var(--g-line, #1d1d1d);
   border-radius: 9px;
-  background: #0a0a0a;
+  background: var(--g-bg, #0a0a0a);
 }
+.knob-row { display: flex; align-items: flex-start; gap: 8px; }
+.group-cap {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding-left: 2px;
+  font-size: 8px;
+  letter-spacing: .16em;
+  color: var(--g-cap, #6f6f6f);
+}
+.group-sub {
+  letter-spacing: .03em;
+  text-transform: none;
+  color: #8a8a8a;
+}
+
+/* Input side — the only group that runs before the model sees anything. */
+.g-infx  { --g-bg: #100d17; --g-line: #2b2240; --g-cap: #b98ad1; }
+/* How often the model is fed and how much it is given. */
+.g-rate  { --g-bg: #0b1014; --g-line: #1c2833; --g-cap: #7fa8c0; }
+/* The generation itself: green, the same green the model wears elsewhere. */
+.g-gen   { --g-bg: #0b1209; --g-line: #1f3019; --g-cap: #8ad18a; }
+/* The variant ladder. */
+.g-var   { --g-bg: #121005; --g-line: #322810; --g-cap: #d8c05f; }
+/* Output folded back into the input, and output timing. */
+.g-fb    { --g-bg: #140f08; --g-line: #382713; --g-cap: #d89a5f; }
+/* Filters on what you hear, after the model. */
+.g-outfx { --g-bg: #0a1114; --g-line: #163039; --g-cap: #5fc6d8; }
 
 /* ── live code (Strudel) ───────────────────────────────────────── */
 .wave-wrap { position: relative; flex: 1 1 auto; min-height: 0; display: flex; }
@@ -517,6 +564,9 @@ html, body, #live-root {
 .strudel-hush:hover:not(:disabled) { border-color: #7a2b2b; color: #ffbcbc; }
 .strudel-run:disabled, .strudel-hush:disabled { opacity: .4; cursor: not-allowed; }
 .strudel-hint { font-size: 9px; color: #666; }
+/* The transport drives RUN and HUSH whenever a Live Code box is open, so the
+   buttons move on their own; this says why. */
+.strudel-link { font-style: normal; color: #b98ad1; }
 .strudel-state { margin-left: auto; font-size: 10px; color: var(--dim); }
 .strudel-state.on { color: var(--accent); }
 
@@ -661,6 +711,65 @@ html, body, #live-root {
 }
 .out-pane .pane-canvas { flex: 1 1 auto; min-height: 0; }
 
+/* ── variant lanes in the output spectrogram ───────────────────── */
+.spec-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+.spec-wrap .pane-canvas { width: 100%; }
+/* One readout per lane, laid out on the same even division the canvas uses. */
+.lane-marks {
+  position: absolute;
+  inset: 2px 0 auto 0;
+  display: flex;
+  pointer-events: none;
+}
+.lane-mark {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding-bottom: 3px;
+  font-size: 9px;
+  letter-spacing: .08em;
+  color: rgba(255, 255, 255, .32);
+  border-left: 1px solid rgba(255, 255, 255, .12);
+}
+.lane-mark:first-child { border-left: none; }
+/* The variant the Variant knob is pointing at. */
+.lane-mark.on { color: var(--track); }
+
+/* The spread ladder: five bars rising left to right. Flat means identical. */
+.lane-gauge {
+  width: 60%;
+  max-width: 46px;
+  height: 22px;
+  display: flex;
+  align-items: flex-end;
+  border-bottom: 1px solid rgba(255, 255, 255, .25);
+}
+.lane-fill {
+  width: 100%;
+  min-height: 0;
+  background: currentColor;
+  opacity: .75;
+  transition: height .18s ease;
+}
+.lane-nz { font-variant-numeric: tabular-nums; opacity: .85; }
+
+/* Spread 0: every rung is zero, so the baselines read as one dashed line all
+   the way across — the difference from even the smallest spread is a row of
+   bars standing up out of it. */
+.lane-marks.flat .lane-gauge {
+  border-bottom-style: dashed;
+  border-bottom-color: var(--track);
+}
+.lane-marks.flat .lane-nz { opacity: .5; }
+
 /* The knob row picks up the active track's colour so it is obvious which
    stream the controls are touching. */
 .live-knobs .knob-fill { stroke: var(--track, var(--accent)); }
@@ -729,8 +838,8 @@ html, body, #live-root {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  flex-direction: row;
+  gap: 8px;
 }
 
 .in-section {
@@ -746,6 +855,34 @@ html, body, #live-root {
   background: rgba(255, 255, 255, .015);
 }
 .in-section.patching { border-color: var(--src); }
+/* The box the Input FX controls are pointed at. Same language as an active
+   output track, so "selected" reads the same on both halves. */
+.in-section.active { box-shadow: inset 0 0 0 1px var(--src); }
+
+/* ── input pre-FX: the method picker sits beside its amount knob ─── */
+.fx-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  align-self: center;
+}
+.fx-method {
+  width: 86px;
+  padding: 3px 4px;
+  background: #0d0d0d;
+  color: #cfcfcf;
+  border: 1px solid var(--g-line);
+  border-radius: 4px;
+  font-size: 10px;
+}
+.fx-lat {
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: #d8c05f;
+  white-space: nowrap;
+}
 
 .in-head { display: flex; align-items: center; gap: 8px; }
 .in-name { font-size: 12px; font-weight: 700; letter-spacing: .06em; color: var(--src); }
@@ -799,8 +936,15 @@ html, body, #live-root {
   left: 50%;
   top: -8px;
   transform: translateX(-50%);
+  cursor: crosshair;
 }
+.patch-node.in:hover { background: var(--src); }
 .out-pane.patch-target .patch-node.in {
+  box-shadow: 0 0 0 6px rgba(255, 255, 255, .12);
+}
+/* Mirror of the above: while a cable is being pulled from a track, the input
+   jacks are the ones that will accept it. */
+.in-section.patching .patch-node.out {
   box-shadow: 0 0 0 6px rgba(255, 255, 255, .12);
 }
 
@@ -891,3 +1035,134 @@ html, body, #live-root {
 }
 .add-menu button:hover:not(:disabled) { background: #17301c; color: #cfe8cf; }
 .add-menu button:disabled { opacity: .35; cursor: not-allowed; }
+
+/* ═══ layout ═══════════════════════════════════════════════════════
+   The base rules above describe the SIDE-BY-SIDE view. `.vertical`
+   overrides them into the stacked view; `.horizontal` keeps the base.
+   The view toggle in the header swaps the class on .live-root.        */
+
+/* The stage wraps the two halves in both views; the latent shelf stays a
+   column beside it, so .live-main remains a row either way. */
+.stage {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.stage > .input-pane,
+.stage > .out-side {
+  /* flex-grow is set inline from the draggable split; these are the floors. */
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.in-section { position: relative; }   /* containing block for its patch node */
+
+/* ── side-by-side: inputs left, outputs right ─────────────────── */
+.horizontal .stage { flex-direction: row; }
+.horizontal .stage > .out-side { padding: 14px 14px 0; }
+
+/* ── stacked: inputs above, outputs below ─────────────────────── */
+.vertical .stage { flex-direction: column; }
+.vertical .stage > .out-side { padding: 8px 14px 0; }
+
+.vertical .in-section {
+  border-left: 1px solid #1d1d1d;
+  border-top: 3px solid var(--src);
+}
+
+/* The bar between the halves lies flat: full width, thickness = steps. */
+.vertical .middle {
+  flex: 0 0 auto;
+  align-items: center;
+  padding: 8px 16px;
+  min-width: 0;
+}
+.vertical .middle-bar {
+  width: 100%;
+  background: linear-gradient(90deg, #cfe8cf 0%, #9ccf9c 55%, #7fc08a 100%);
+  transition: height .18s ease;
+}
+.vertical .variant-marker {
+  left: auto;
+  right: auto;
+  top: -5px;
+  bottom: -5px;
+  height: auto;
+  width: 3px;
+  transform: translateX(-50%);
+  transition: left .22s cubic-bezier(.4, 0, .2, 1);
+}
+/* Cables leave the bottom edge rather than the right. */
+.vertical .patch-node.out {
+  right: auto;
+  top: auto;
+  left: 50%;
+  bottom: -7px;
+  transform: translateX(-50%);
+}
+
+/* ── view toggle ──────────────────────────────────────────────── */
+.view-toggle {
+  margin-left: auto;
+  display: inline-flex;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.view-toggle button {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 9px;
+  background: #0d0d0d;
+  color: #7d7d7d;
+  border: none;
+  cursor: pointer;
+}
+.view-toggle button + button { border-left: 1px solid #2a2a2a; }
+.view-toggle button:hover { color: #ddd; }
+.view-toggle button.on { background: #1d1d1d; color: #fff; }
+/* The status line no longer needs to claim the free space. */
+.live-status { margin-left: 12px; }
+
+/* ── Live Code takes half the input area ───────────────────────── */
+.in-col {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  gap: 6px;
+}
+/* The code column always runs full height so its editor has room. */
+.in-col.code { flex-direction: column; }
+/* The remaining boxes stack along whichever axis the view calls for. */
+.horizontal .in-col.main { flex-direction: column; }
+.vertical   .in-col.main { flex-direction: row; }
+
+/* ── the bar between the halves carries the noise texture ──────── */
+.middle-bar {
+  overflow: hidden;
+  /* Dimmer ground than before: the grain on top is what reads now. */
+  background: linear-gradient(180deg, #3d5a41 0%, #2f4a34 100%);
+}
+.vertical .middle-bar {
+  background: linear-gradient(90deg, #3d5a41 0%, #2f4a34 100%);
+}
+.middle-noise {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+/* Keep the variant marker readable over the grain. */
+.variant-marker { z-index: 2; }
+
+/* ── cables sit behind the panes' text ─────────────────────────── */
+.cable { opacity: .55; }
+.cable-shadow { opacity: .3; }
+/* Stacked view runs cords straight over the track headings, so lighten
+   them further there. */
+.vertical .cable { opacity: .42; }
+.vertical .cable-shadow { opacity: .22; }
+.cable.dragging { opacity: .95; }

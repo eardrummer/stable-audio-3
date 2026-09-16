@@ -2,19 +2,32 @@
 // Scrolls the existing image down 2px and paints the new slice at the top, so
 // time falls downward while frequency runs left-to-right.
 // Shared by the studio (App.tsx) and the live app (live/LiveApp.tsx).
+//
+// `x`/`w` confine the whole thing to a vertical column of the canvas, which is
+// how the live app shows one lane per variant side by side: each lane scrolls
+// its own strip, and the pixels between lanes are never touched.
+//
+// `shift` is how far the image moves per call. The studio leaves it at the
+// historical 2px per frame; the live app drives it from the audio clock
+// instead, so a given number of pixels always means the same number of
+// seconds and a fixed playback line can be trusted.
 export const drawSpectrogram = (
   canvas: HTMLCanvasElement,
   analyser: AnalyserNode,
-  colorTheme: 'cyan' | 'green'
+  colorTheme: 'cyan' | 'green',
+  opts?: { x?: number; w?: number; shift?: number }
 ) => {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
-  const width = canvas.width;
+  const x0 = opts?.x ?? 0;
+  const width = opts?.w ?? canvas.width;
   const height = canvas.height;
+  const shift = Math.max(1, Math.round(opts?.shift ?? 2));
+  if (width < 1) return;
 
-  // 1. Scroll canvas down by 2px
-  ctx.drawImage(canvas, 0, 0, width, height, 0, 2, width, height);
+  // 1. Scroll this column down
+  ctx.drawImage(canvas, x0, 0, width, height, x0, shift, width, height);
 
   // 2. Capture and draw the new top slice
   const bufferLength = analyser.frequencyBinCount;
@@ -43,10 +56,12 @@ export const drawSpectrogram = (
         color = `rgba(${r}, ${g}, ${b}, ${percent * 0.45})`; // Semi-transparent glow
       }
       ctx.fillStyle = color;
-      ctx.fillRect(i * sliceWidth, 0, sliceWidth + 1, 2);
     } else {
       ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
-      ctx.fillRect(i * sliceWidth, 0, sliceWidth + 1, 2);
     }
+    // The +1 covers rounding gaps between bins, but must not bleed into the
+    // neighbouring lane, so the last bin is clipped to the column.
+    const bx = x0 + i * sliceWidth;
+    ctx.fillRect(bx, 0, Math.min(sliceWidth + 1, x0 + width - bx), shift);
   }
 };

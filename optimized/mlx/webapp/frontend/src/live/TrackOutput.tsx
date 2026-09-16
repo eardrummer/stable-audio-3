@@ -7,6 +7,7 @@ import { drawSpectrogram } from '../shared/spectrogram';
 import {
   WS_URL, VARIANTS, MAX_NUDGE, XF_MAX_CYCLE, XF_SWITCH, XF_MIN,
   FADE_IN_CURVE, FADE_OUT_CURVE, TRACK_THEME,
+  lpfHz, hpfHz, combGains, softClipCurve, COMB_LO, COMB_FB_HPF, SPREAD_MAX,
   type TrackParams, type SharedParams, type LearnProps,
 } from './trackTypes';
 
@@ -53,6 +54,8 @@ interface Props {
   onNode: (el: HTMLDivElement | null) => void;
   /** A cable is being dragged and could land here. */
   patchTarget: boolean;
+  /** Start a cable at this track, to pull one out from the output end. */
+  onNodeDown: (e: React.PointerEvent) => void;
 }
 
 interface CycleAudio { cycle: number; buffers: (AudioBuffer | null)[]; }
@@ -71,7 +74,48 @@ interface Voice {
   src: AudioBufferSourceNode;
   gain: GainNode;
   startedAt: number;
+  dur: number;
+  /** A silent second copy of the clip, running LOOKAHEAD_FRAC of its length
+   *  ahead of the audible one, and the tap that reads it. This is what lets
+   *  the display draw audio that has been generated but not yet heard. */
+  pre?: AudioBufferSourceNode;
+  an?: AnalyserNode;
 }
+
+/** Gap between variant lanes, in canvas pixels. It lies outside every lane's
+ *  scroll region, so the divider stays put while the lanes fall past it. */
+const LANE_GUTTER = 3;
+
+/**
+ * Where the playback line sits, as a fraction of the pane height measured from
+ * the top, and therefore also how far ahead the display runs. One clip spans
+ * the pane, so a third of the height is a third of the clip.
+ *
+ * Above the line is audio the model has already produced and you have not
+ * reached yet; below it is what you have heard. At Generate Rate below Input
+ * Rate the tail above the line is material the next cycle will cut off, which
+ * is the whole reason to show it.
+ */
+const LOOKAHEAD_FRAC = 1 / 3;
+/** Dimming over the not-yet-heard region. */
+const AHEAD_SCRIM = 'rgba(0, 0, 0, .55)';
+
+/**
+ * How tall to draw variant i's spread marker, as a fraction of its gauge.
+ *
+ * The rungs of the ladder are `i * spread` above the base noise, measured
+ * against the widest ladder the Spread knob can build. Straight proportion
+ * would make the useful settings invisible — a single knob detent of 0.0025
+ * is 3% of full scale — so the bar is that raised to 0.4, which lifts a
+ * one-detent ladder to a legible quarter of the gauge, with a floor so no
+ * rung above zero disappears entirely. Zero stays exactly zero: a flat row
+ * means the variants really are identical, which at spread 0 they are, since
+ * one clip is generated and fanned across the pans.
+ */
+const spreadBar = (i: number, spread: number) => {
+  const raw = (i * spread) / (SPREAD_MAX * (VARIANTS - 1));
+  return raw <= 0 ? 0 : Math.max(0.09, Math.pow(Math.min(1, raw), 0.4));
+};
 
 /** Variants spread evenly left to right; a lone variant sits centre. */
 const panFor = (i: number, n: number) => (n <= 1 ? 0 : -1 + (2 * i) / (n - 1));
@@ -123,7 +167,7 @@ function sumGain(entries: { buf: AudioBuffer; pan: number }[]): number {
 const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   index, connectionId, params, shared, onParam, onMidi, onAdd, onRemove,
   onError, onShelfDone, onConnected, learnProps, running,
-  active, onActivate, soloed, muted, onSolo, soloVisible, onNode, patchTarget,
+  active, onActivate, soloed, muted, onSolo, soloVisible, onNode, patchTarget, onNodeDown,
 }, ref) {
   const theme = TRACK_THEME[index] ?? TRACK_THEME[0];
 
@@ -131,12 +175,28 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   const [status, setStatus] = useState('Idle');
   const [cycleInfo, setCycleInfo] = useState<{ n: number; ms: number } | null>(null);
   const [dropped, setDropped] = useState(0);
+  /** How many variant lanes the spectrogram is currently split into. */
+  const [lanes, setLanes] = useState(1);
 
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const gainRef = useRef<GainNode | null>(null);
   const delayRef = useRef<DelayNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  // Output filter block: every voice lands on fxIn, whatever the panning.
+  const fxInRef = useRef<GainNode | null>(null);
+  const lpfNodeRef = useRef<BiquadFilterNode | null>(null);
+  const hpfNodeRef = useRef<BiquadFilterNode | null>(null);
+  const combDelayRef = useRef<DelayNode | null>(null);
+  const combFbRef = useRef<GainNode | null>(null);
+  const combWetRef = useRef<GainNode | null>(null);
+  const combDryRef = useRef<GainNode | null>(null);
+  const combPreRef = useRef<GainNode | null>(null);
+  const combPostRef = useRef<GainNode | null>(null);
+  /** Silent path to the destination for the look-ahead taps. A subgraph with
+   *  no route to the destination is not guaranteed to be rendered at all, so
+   *  the previews would read as silence without it. */
+  const previewSinkRef = useRef<GainNode | null>(null);
   const specRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const cycleRef = useRef<CycleAudio | null>(null);
@@ -171,8 +231,81 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       analyser.connect(gain);
       gain.connect(ctx.destination);
       gain.gain.value = mutedRef.current ? 0 : paramsRef.current.outputMonitor;
+
+      // ── filters ──────────────────────────────────────────────────────
+      // fxIn -> LPF -> HPF -> [dry + comb] -> nudge -> analyser -> monitor.
+      // They sit ahead of the analyser so the spectrogram draws what is
+      // actually heard. None of this reaches the backend: filtering here keeps
+      // the model's input untouched and costs no generation time.
+      const p0 = paramsRef.current;
+      const fxIn = ctx.createGain();
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.Q.value = 0.9;                 // a hint of resonance, short of a whistle
+      lp.frequency.value = lpfHz(p0.lpf);
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.Q.value = 0.9;
+      hp.frequency.value = hpfHz(p0.hpf);
+
+      // The comb is a feedback delay tapped in parallel: its resonance sits at
+      // 1 / delayTime, so the knob reads as a pitch. Web Audio allows the
+      // feedback cycle because a DelayNode breaks it.
+      const combDelay = ctx.createDelay(1 / COMB_LO + 0.01);   // headroom over the lowest note
+      const combFb = ctx.createGain();
+      const combWet = ctx.createGain();
+      const combDry = ctx.createGain();
+      // Inside the loop: at 0.95 feedback any DC or subsonic content would be
+      // multiplied twentyfold and swallow the resonance.
+      const combFbHp = ctx.createBiquadFilter();
+      combFbHp.type = 'highpass';
+      combFbHp.frequency.value = COMB_FB_HPF;
+      // After the sum: linear until the knee, then saturating. This is what
+      // absorbs a deep resonator's overshoot, and most of what gives the effect
+      // its bite — without it the destination would hard-clip instead.
+      const shaper = ctx.createWaveShaper();
+      shaper.curve = softClipCurve();
+      shaper.oversample = '4x';
+      // Trim into the clipper and make it back up on the way out. At comb 0
+      // this keeps the signal in the curve's straight section, so the whole
+      // block is transparent until you actually turn the knob.
+      const combPre = ctx.createGain();
+      const combPost = ctx.createGain();
+
+      const g0 = combGains(p0.comb);
+      combDelay.delayTime.value = g0.delaySec;
+      combFb.gain.value = g0.fb;
+      combWet.gain.value = g0.wet;
+      combDry.gain.value = g0.dry;
+      combPre.gain.value = g0.pre;
+      combPost.gain.value = g0.post;
+
+      fxIn.connect(lp);
+      lp.connect(hp);
+      hp.connect(combDry);
+      hp.connect(combDelay);
+      combDelay.connect(combFbHp);
+      combFbHp.connect(combFb);
+      combFb.connect(combDelay);
+      combDelay.connect(combWet);
+      combDry.connect(combPre);
+      combWet.connect(combPre);
+      combPre.connect(shaper);
+      shaper.connect(combPost);
+      combPost.connect(delay);
+
+      const previewSink = ctx.createGain();
+      previewSink.gain.value = 0;
+      previewSink.connect(ctx.destination);
+      previewSinkRef.current = previewSink;
+
       ctxRef.current = ctx; gainRef.current = gain;
       analyserRef.current = analyser; delayRef.current = delay;
+      fxInRef.current = fxIn;
+      lpfNodeRef.current = lp; hpfNodeRef.current = hp;
+      combDelayRef.current = combDelay; combFbRef.current = combFb;
+      combWetRef.current = combWet; combDryRef.current = combDry;
+      combPreRef.current = combPre; combPostRef.current = combPost;
     }
     return ctxRef.current!;
   }, []);
@@ -201,15 +334,33 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       const src = ctx.createBufferSource();
       src.buffer = buf;
       src.connect(gain);
+      // The display runs ahead of the ears: a second, silent copy of the same
+      // clip plays LOOKAHEAD_FRAC of its length early, and the spectrogram is
+      // drawn from that. By the time a painted row has scrolled down to the
+      // playback line, the audible voice has reached the same moment.
+      //
+      // This tap is pre-filter — LPF/HPF/comb run on the sum, downstream of
+      // here — but it is the only place a variant is still separable, and the
+      // only place the future exists at all.
+      const an = ctx.createAnalyser();
+      an.fftSize = 1024;
+      an.smoothingTimeConstant = 0.6;
+      const pre = ctx.createBufferSource();
+      pre.buffer = buf;
+      pre.connect(an);
+      // An analyser passes its input through untouched, so this carries the
+      // preview to a muted sink: nothing is heard, and the graph has a reason
+      // to render it.
+      if (previewSinkRef.current) an.connect(previewSinkRef.current);
       // A panner per voice; at pan 0 this is transparent, so the single-variant
       // path behaves exactly as it did before.
       if (pan !== 0) {
         const panner = ctx.createStereoPanner();
         panner.pan.value = Math.max(-1, Math.min(1, pan));
         gain.connect(panner);
-        panner.connect(delayRef.current ?? analyserRef.current!);
+        panner.connect(fxInRef.current ?? analyserRef.current!);
       } else {
-        gain.connect(delayRef.current ?? analyserRef.current!);
+        gain.connect(fxInRef.current ?? analyserRef.current!);
       }
 
       try {
@@ -218,8 +369,10 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
         gain.gain.setValueAtTime(0, now);
         gain.gain.linearRampToValueAtTime(k, now + fade);
       }
-      src.start(now, Math.min(offset, Math.max(0, buf.duration - 0.05)));
-      return { src, gain, startedAt: now - offset };
+      const at = Math.min(offset, Math.max(0, buf.duration - 0.05));
+      src.start(now, at);
+      pre.start(now, Math.min(at + buf.duration * LOOKAHEAD_FRAC, buf.duration - 0.01));
+      return { src, gain, startedAt: now - offset, dur: buf.duration, pre, an };
     });
 
     for (const v of prev) {
@@ -234,6 +387,8 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
         g.linearRampToValueAtTime(0, now + fade);
       }
       v.src.stop(now + fade + 0.03);
+      // The preview is silent, so it can go as soon as its replacement exists.
+      try { v.pre?.stop(now); } catch { /* already finished */ }
     }
     voicesRef.current = next;
   }, [ensureCtx]);
@@ -269,6 +424,42 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
     d.delayTime.linearRampToValueAtTime(params.nudge, c.currentTime + 0.08);
   }, [params.nudge]);
 
+  // Filter knobs. Every move is a short ramp: stepping an AudioParam under a
+  // running signal clicks, and these are meant to be swept during a set.
+  useEffect(() => {
+    const c = ctxRef.current;
+    const lp = lpfNodeRef.current, hp = hpfNodeRef.current;
+    if (!c || !lp || !hp) return;
+    const t = c.currentTime, glide = 0.05;
+    lp.frequency.cancelScheduledValues(t);
+    lp.frequency.setValueAtTime(lp.frequency.value, t);
+    lp.frequency.exponentialRampToValueAtTime(lpfHz(params.lpf), t + glide);
+    hp.frequency.cancelScheduledValues(t);
+    hp.frequency.setValueAtTime(hp.frequency.value, t);
+    hp.frequency.exponentialRampToValueAtTime(hpfHz(params.hpf), t + glide);
+  }, [params.lpf, params.hpf]);
+
+  useEffect(() => {
+    const c = ctxRef.current, d = combDelayRef.current;
+    const fb = combFbRef.current, wet = combWetRef.current, dry = combDryRef.current;
+    const pre = combPreRef.current, post = combPostRef.current;
+    if (!c || !d || !fb || !wet || !dry || !pre || !post) return;
+    const t = c.currentTime, glide = 0.05;
+    const g = combGains(params.comb);
+    const ramp = (p: AudioParam, to: number) => {
+      p.cancelScheduledValues(t);
+      p.setValueAtTime(p.value, t);
+      p.linearRampToValueAtTime(to, t + glide);
+    };
+    // Sweeping the delay time is what makes the comb sing, so it glides too.
+    ramp(d.delayTime, g.delaySec);
+    ramp(fb.gain, g.fb);
+    ramp(wet.gain, g.wet);
+    ramp(dry.gain, g.dry);
+    ramp(pre.gain, g.pre);
+    ramp(post.gain, g.post);
+  }, [params.comb]);
+
   // Switching the variant knob mid-clip swaps lanes at the same position.
   // In ALL mode every variant is already sounding, so there is nothing to swap.
   useEffect(() => {
@@ -290,15 +481,81 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   }, [params.allVariants]);
 
   // ── spectrogram ─────────────────────────────────────────────────────
+  // One clip spans the pane, so the scroll is driven by the audio clock rather
+  // than by frame count: a pixel is always the same number of seconds, which is
+  // what makes a fixed playback line mean anything. The rows accumulate on an
+  // offscreen canvas; the visible one is that image plus the dimming and the
+  // line, neither of which must ever be baked into the scroll.
+  const offRef = useRef<HTMLCanvasElement | null>(null);
+  const lanesRef = useRef(0);
+  const lastTRef = useRef(0);
+  const carryRef = useRef(0);
   useEffect(() => {
     const tick = () => {
       rafRef.current = requestAnimationFrame(tick);
-      const sc = specRef.current, an = analyserRef.current;
-      if (sc && an) drawSpectrogram(sc, an, theme.spec);
+      const sc = specRef.current, ctx = ctxRef.current;
+      if (!sc || !ctx) return;
+      if (!offRef.current) {
+        offRef.current = document.createElement('canvas');
+        offRef.current.width = sc.width;
+        offRef.current.height = sc.height;
+      }
+      const off = offRef.current;
+      const g = sc.getContext('2d');
+      if (!g) return;
+
+      const taps = voicesRef.current.filter(v => v.an);
+      const n = taps.length || 1;
+      if (n !== lanesRef.current) {
+        lanesRef.current = n;
+        setLanes(n);
+        // The old image is at the wrong scale now; wipe rather than let it
+        // scroll away over a whole clip.
+        off.getContext('2d')?.clearRect(0, 0, off.width, off.height);
+      }
+
+      // Pixels per second, from the clip currently playing.
+      const dur = taps[0]?.dur || sharedRef.current.inputRate || 10;
+      const pps = sc.height / dur;
+
+      const t = ctx.currentTime;
+      const dt = lastTRef.current ? t - lastTRef.current : 0;
+      lastTRef.current = t;
+      // A backgrounded tab returns with a huge dt; a whole pane is the most
+      // that can be meaningfully redrawn from a single analyser reading.
+      if (!taps.length) carryRef.current = 0;
+      else carryRef.current += Math.min(dt, dur) * pps;
+      const step = Math.floor(carryRef.current);
+      if (step >= 1 && taps.length) {
+        carryRef.current -= step;
+        if (n === 1) {
+          drawSpectrogram(off, taps[0].an!, theme.spec, { shift: step });
+        } else {
+          const lane = (off.width - LANE_GUTTER * (n - 1)) / n;
+          taps.forEach((v, i) => drawSpectrogram(off, v.an!, theme.spec, {
+            x: Math.round(i * (lane + LANE_GUTTER)),
+            w: Math.round(lane),
+            shift: step,
+          }));
+        }
+      }
+
+      // Nudge delays the ears but not the display, so the moment being heard
+      // sits that much further down the falling image.
+      const lineY = Math.min(
+        sc.height - 1,
+        Math.round(sc.height * LOOKAHEAD_FRAC + paramsRef.current.nudge * pps),
+      );
+      g.clearRect(0, 0, sc.width, sc.height);
+      g.drawImage(off, 0, 0);
+      g.fillStyle = AHEAD_SCRIM;
+      g.fillRect(0, 0, sc.width, lineY);
+      g.fillStyle = theme.accent;
+      g.fillRect(0, lineY - 1, sc.width, 2);
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
-  }, [theme.spec]);
+  }, [theme.spec, theme.accent]);
 
   // ── socket ──────────────────────────────────────────────────────────
   const sendParams = useCallback(() => {
@@ -431,6 +688,7 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
           v.gain.gain.setValueAtTime(Math.max(v.gain.gain.value, 0.0001), now);
           v.gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
           v.src.stop(now + 0.25);
+          try { v.pre?.stop(now); } catch { /* already finished */ }
         }
         voicesRef.current = [];
       }
@@ -454,7 +712,9 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       onPointerDown={onActivate}
     >
       {/* Cables from the input sources land here. */}
-      <div ref={onNode} className="patch-node in" data-track={index} />
+      <div ref={onNode} className="patch-node in" data-track={index}
+           onPointerDown={onNodeDown}
+           title="Drag to an input to connect or disconnect" />
 
       <div className="out-head">
         <span className="out-title">{theme.name}</span>
@@ -470,9 +730,17 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
             title={soloed ? 'Un-solo' : 'Solo this track (silences the other)'}
           ><Headphones size={12} /></button>
         )}
-        {index === 0
-          ? onAdd && <button className="track-btn" onClick={onAdd} title="Add a second output track"><Plus size={13} /></button>
-          : <button className="track-btn del" onClick={onRemove} title="Remove this track"><Minus size={13} /></button>}
+        {/* Independent, not either/or: the last track both adds and removes. */}
+        {onAdd && (
+          <button className="track-btn" onClick={onAdd} title="Add another output track">
+            <Plus size={13} />
+          </button>
+        )}
+        {onRemove && (
+          <button className="track-btn del" onClick={onRemove} title="Remove this track">
+            <Minus size={13} />
+          </button>
+        )}
       </div>
 
       <input
@@ -483,7 +751,26 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
         onFocus={onActivate}
       />
 
-      <canvas ref={specRef} width={900} height={420} className="pane-canvas" />
+      {/* In ALL mode the pane is divided one column per variant; the numbers
+          sit outside the canvas so they do not scroll away with the image. */}
+      <div className="spec-wrap">
+        <canvas ref={specRef} width={900} height={420} className="pane-canvas" />
+        {lanes > 1 && (
+          <div className={`lane-marks ${params.spread > 0 ? '' : 'flat'}`}>
+            {Array.from({ length: lanes }, (_, i) => (
+              <div key={i} className={`lane-mark ${i === params.variant ? 'on' : ''}`}>
+                <div className="lane-n">{i}</div>
+                {/* Height is this variant's rung on the noise ladder. */}
+                <div className="lane-gauge">
+                  <div className="lane-fill"
+                       style={{ height: `${spreadBar(i, params.spread) * 100}%` }} />
+                </div>
+                <div className="lane-nz">{(params.noise + i * params.spread).toFixed(3)}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       <MidiSlider
         {...learnProps(`outputMonitor${index}`)}

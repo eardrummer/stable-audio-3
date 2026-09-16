@@ -1,25 +1,71 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2, Plus } from 'lucide-react';
+import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2, Plus, Rows2, Columns2 } from 'lucide-react';
 import Knob from './Knob';
 import LatentShelf from './LatentShelf';
-import StrudelPanel from './StrudelPanel';
+import StrudelPanel, { type StrudelPanelHandle } from './StrudelPanel';
 import InputSection from './InputSection';
 import MidiSlider from './MidiSlider';
 import TrackOutput, { type TrackHandle } from './TrackOutput';
+import { FX_METHODS, FxChain, fxMethod } from './inputfx';
 import {
   API_URL, VARIANTS, SPREAD_MIN, SPREAD_MAX, MAX_NUDGE, TRACK_THEME,
   SOURCE_KINDS, SOURCE_META, MAX_SLOTS, defaultSources, defaultTrack, newSource,
+  lpfHz, hpfHz, combHz,
   type TrackParams, type SourceKind, type SourceInstance,
 } from './trackTypes';
+
+/** Cutoffs read better as "1.2k" than as four digits under a knob. */
+const hz = (f: number) =>
+  (f >= 1000 ? `${(f / 1000).toFixed(f >= 10000 ? 0 : 1)}k` : String(Math.round(f))) + 'Hz';
 
 interface RingBuf { l: Float32Array; r: Float32Array; w: number; filled: number; sr: number }
 interface SourceNodes {
   head: AudioNode;
   gain: GainNode;
+  /** What the track mixes and the monitor listen to: the pre-FX chain's
+   *  output, which is the fader when no effect is engaged. Everything
+   *  downstream patches here so switching method never rewires the box. */
+  out: AudioNode;
+  fx: FxChain;
   analyser: AnalyserNode;
   /** Mic boxes only: kept so the channel pick can be rewired live. */
   merger?: ChannelMergerNode;
+  /** Mic: the hardware feed and this box's own loop share the box's fader. */
+  liveGain?: GainNode;
+  loopGain?: GainNode;
+  recProc?: ScriptProcessorNode;
+  /** File: a fixed head the transport plugs playback nodes into. A buffer
+   *  source can only be started once, so PLAY makes a new one each time. */
+  fileGain?: GainNode;
+  fileBuf?: AudioBuffer;
+  fileSrc?: AudioBufferSourceNode | null;
+  fileStartedAt?: number;
 }
+
+/** Per-box looper. Every input box owns one, so a take recorded in one Live
+ *  Input never appears in another. */
+interface LoopSlot {
+  state: 'idle' | 'recording' | 'stopped' | 'playing';
+  len: number;
+  trim: [number, number];
+  recSecs: number;
+}
+const IDLE_SLOT: LoopSlot = { state: 'idle', len: 0, trim: [0, 0], recSecs: 0 };
+
+/** Reduce a buffer to per-column peaks. Redrawing 60x a second from the raw
+ *  samples would be far too slow for a minute of audio. */
+const peaksOf = (buf: AudioBuffer, cols = 900) => {
+  const L = buf.getChannelData(0);
+  const peaks = new Float32Array(cols);
+  const per = Math.max(1, Math.floor(buf.length / cols));
+  for (let c = 0; c < cols; c++) {
+    let m = 0;
+    const s0 = c * per, s1 = Math.min(buf.length, s0 + per);
+    for (let i = s0; i < s1; i++) m = Math.max(m, Math.abs(L[i]));
+    peaks[c] = m;
+  }
+  return peaks;
+};
 import type { StrudelHandle } from './strudel/strudelEngine';
 import './live.css';
 
@@ -122,11 +168,10 @@ export default function LiveApp() {
   const [clickOn, setClickOn] = useState(false);
   const [clickLevel, setClickLevel] = useState(0.5);
 
-  // Looper (Live Input only) and the optional live-input blend for the other modes.
-  const [loopState, setLoopState] = useState<'idle' | 'recording' | 'stopped' | 'playing'>('idle');
-  const [loopLen, setLoopLen] = useState(0);
-  const [trim, setTrim] = useState<[number, number]>([0, 0]);
-  const [recSecs, setRecSecs] = useState(0);
+  // One looper per input box, keyed by source id.
+  const [loops, setLoops] = useState<Record<string, LoopSlot>>({});
+  /** Which file boxes are currently sounding. */
+  const [filePlaying, setFilePlaying] = useState<Record<string, boolean>>({});
   const [model, setModel] = useState<'sm-music' | 'sm-sfx' | 'medium'>('sm-music');
   // Off by default: one generation per cycle is 5x faster, and the ladder is
   // only worth paying for when you are actually auditioning across it.
@@ -139,7 +184,10 @@ export default function LiveApp() {
   const [shelfOpen, setShelfOpen] = useState(false);
   const [shelfBusy, setShelfBusy] = useState(false);
   // Cable being dragged from a source node, and where the pointer is now.
+  // A drag in progress, from either end. Releasing over the opposite kind
+  // of node toggles that connection, so a cable can be removed from either side.
   const [patchFrom, setPatchFrom] = useState<string | null>(null);
+  const [patchFromTrack, setPatchFromTrack] = useState<number | null>(null);
   const [patchTo, setPatchTo] = useState<{ x: number; y: number } | null>(null);
   const [renormalize, setRenormalize] = useState(false);
 
@@ -149,17 +197,45 @@ export default function LiveApp() {
   const [sources, setSources] = useState<SourceInstance[]>(() => defaultSources(1));
   const sourcesRef = useRef(sources);
   useEffect(() => { sourcesRef.current = sources; }, [sources]);
+  const tracksRef = useRef(tracks);
+  useEffect(() => { tracksRef.current = tracks; }, [tracks]);
   const patchSource = useCallback((id: string, patch: Partial<SourceInstance>) => {
     setSources(list => list.map(x => (x.id === id ? { ...x, ...patch } : x)));
   }, []);
   const [addMenu, setAddMenu] = useState(false);
   /** Ceiling on both input boxes and output tracks. */
   const [maxSlots, setMaxSlots] = useState(MAX_SLOTS);
+  /** The input box the Input FX controls edit, the way the output knobs
+   *  follow whichever track is active. */
+  const [activeSrc, setActiveSrc] = useState<string | null>(null);
+  /** Share of the stage the input side takes. The two views hold it
+   *  separately: a comfortable split stacked is not a comfortable one
+   *  side by side. */
+  const [split, setSplit] = useState<Record<'vertical' | 'horizontal', number>>(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem('sa3_live_split') || 'null');
+      if (v && typeof v.vertical === 'number' && typeof v.horizontal === 'number') return v;
+    } catch { /* first run */ }
+    return { vertical: 0.5, horizontal: 0.5 };
+  });
+  /** 'vertical' = inputs above outputs; 'horizontal' = inputs left of outputs. */
+  const [layout, setLayout] = useState<'vertical' | 'horizontal'>(() => {
+    try { return (localStorage.getItem('sa3_live_layout') as 'vertical' | 'horizontal') || 'vertical'; }
+    catch { return 'vertical'; }
+  });
+  const measureRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    try { localStorage.setItem('sa3_live_layout', layout); } catch { /* private mode */ }
+    // Anchors move with the layout, so re-measure once it has settled.
+    const t = window.setTimeout(() => measureRef.current?.(), 80);
+    return () => window.clearTimeout(t);
+  }, [layout]);
   const [strudelReady, setStrudelReady] = useState(false);
   const [strudelPlaying, setStrudelPlaying] = useState(false);
   const [strudelBanks, setStrudelBanks] = useState<string[]>([]);
   const [strudelError, setStrudelError] = useState<string | null>(null);
   const strudelRef = useRef<StrudelHandle | null>(null);
+  const strudelPanelRef = useRef<StrudelPanelHandle | null>(null);
 
   // --- devices / status ----------------------------------------------
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -184,7 +260,6 @@ export default function LiveApp() {
   const streamRef = useRef<MediaStream | null>(null);
   const inGainRef = useRef<GainNode | null>(null);
   const inAnalyserRef = useRef<AnalyserNode | null>(null);
-  const fileSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const clickGainRef = useRef<GainNode | null>(null);
   const clickTimerRef = useRef<number | null>(null);
   const nextClickRef = useRef(0);
@@ -199,25 +274,28 @@ export default function LiveApp() {
   const trackMixRef = useRef<GainNode[]>([]);
   const ringsRef = useRef<RingBuf[]>([]);
   const procsRef = useRef<ScriptProcessorNode[]>([]);
-  const recProcRef = useRef<ScriptProcessorNode | null>(null);
   const tapSinkRef = useRef<GainNode | null>(null);
-  const fileBufRef = useRef<AudioBuffer | null>(null);
   const srcCanvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
   const srcNodeEls = useRef<Record<string, HTMLDivElement | null>>({});
-  const trackNodeEls = useRef<(HTMLDivElement | null)[]>([]);
+  const trackNodeEls = useRef<Record<string, HTMLDivElement | null>>({});
   const patchLayerRef = useRef<HTMLDivElement | null>(null);
-  const micGainRef = useRef<GainNode | null>(null);
-  const loopGainRef = useRef<GainNode | null>(null);
-  const loopSrcRef = useRef<AudioBufferSourceNode | null>(null);
-  const loopBufRef = useRef<AudioBuffer | null>(null);
-  const loopPeaksRef = useRef<Float32Array | null>(null);
-  const recRef = useRef<{ chunks: Float32Array[][]; frames: number; srcId: string } | null>(null);
-  const loopStartedAtRef = useRef(0);
-  const dragHandleRef = useRef<0 | 1 | null>(null);
+  /** Recorded takes, one per box: the audio, its display peaks, and the node
+   *  playing it back. Parallel to `loops`, which holds the same boxes' UI state. */
+  const loopAudioRef = useRef<Record<string, {
+    buf: AudioBuffer | null;
+    peaks: Float32Array | null;
+    src: AudioBufferSourceNode | null;
+    startedAt: number;
+  }>>({});
+  const recRef = useRef<Record<string, { chunks: Float32Array[][]; frames: number }>>({});
+  /** Imported files get the same waveform display as a recorded take. */
+  const filePeaksRef = useRef<Record<string, Float32Array>>({});
+  const dragHandleRef = useRef<{ id: string; h: 0 | 1 } | null>(null);
   const splitterRef = useRef<ChannelSplitterNode | null>(null);
   const mergerRef = useRef<ChannelMergerNode | null>(null);
   const filePickerRef = useRef<HTMLInputElement | null>(null);
   const noiseCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const midNoiseRef = useRef<HTMLCanvasElement | null>(null);
   const grainRef = useRef<{ tiles: HTMLCanvasElement[]; pats: (CanvasPattern | null)[] } | null>(null);
   const frameRef = useRef(0);
   const rafRef = useRef<number | null>(null);
@@ -278,12 +356,16 @@ export default function LiveApp() {
   // without restarting the animation frame on every knob move.
   const tempoRef = useRef(false);
   useEffect(() => { tempoRef.current = tempoOn && bpm !== null; }, [tempoOn, bpm]);
-  const loopStateRef = useRef(loopState);
-  useEffect(() => { loopStateRef.current = loopState; }, [loopState]);
-  const trimRef = useRef(trim);
-  useEffect(() => { trimRef.current = trim; }, [trim]);
-  const loopLenRef = useRef(loopLen);
-  useEffect(() => { loopLenRef.current = loopLen; }, [loopLen]);
+  // Only a take's *length* moves the layout; its playhead and rec counter do not.
+  const loopLensKey = Object.values(loops).map(l => l.len).join(',');
+  const activeSrcRef = useRef<string | null>(activeSrc);
+  useEffect(() => { activeSrcRef.current = activeSrc; }, [activeSrc]);
+  const loopsRef = useRef(loops);
+  useEffect(() => { loopsRef.current = loops; }, [loops]);
+  const slotOf = (id: string) => loops[id] ?? IDLE_SLOT;
+  const patchSlot = useCallback((id: string, patch: Partial<LoopSlot>) => {
+    setLoops(m => ({ ...m, [id]: { ...(m[id] ?? IDLE_SLOT), ...patch } }));
+  }, []);
   const noiseRef = useRef(cur.noise);
   useEffect(() => { noiseRef.current = cur.noise; }, [cur.noise]);
   const runningRef = useRef(running);
@@ -413,6 +495,13 @@ export default function LiveApp() {
     else if (id === 'spread') {
       patchActive({ spread: Number((SPREAD_MIN + norm * (SPREAD_MAX - SPREAD_MIN)).toFixed(3)) });
     }
+    else if (id === 'fxAmount') {
+      const sid = activeSrcRef.current ?? sourcesRef.current[0]?.id;
+      if (sid) patchSource(sid, { fxAmount: Number(norm.toFixed(3)) });
+    }
+    else if (id === 'lpf') patchActive({ lpf: Number(norm.toFixed(3)) });
+    else if (id === 'hpf') patchActive({ hpf: Number(norm.toFixed(3)) });
+    else if (id === 'comb') patchActive({ comb: Number(norm.toFixed(3)) });
     else if (id === 'inputMonitor') setInputMonitor(Number(norm.toFixed(2)));
     else if (id.startsWith('outputMonitor')) {
       const t = Number(id.slice('outputMonitor'.length)) || 0;
@@ -452,6 +541,25 @@ export default function LiveApp() {
 
   useEffect(() => { if (inGainRef.current) inGainRef.current.gain.value = inputMonitor; }, [inputMonitor]);
 
+  // Tempo-aware pre-FX (Scramble slices in sixteenths) follow the app's BPM,
+  // including the one a Live Code pattern sets on evaluate — which happens
+  // after the chains are built, so this has to be live rather than set once.
+  useEffect(() => {
+    for (const n of Object.values(srcNodesRef.current)) n?.fx.setTempo(bpm);
+  }, [bpm]);
+
+  // Pre-FX follows its box live. Method changes swap the chain's guts behind
+  // stable endpoints, so a box never drops out of its patch mid-set.
+  const fxKey = sources.map(x => `${x.id}:${x.fxMethod}:${x.fxAmount}`).join('|');
+  useEffect(() => {
+    for (const inst of sourcesRef.current) {
+      const fx = srcNodesRef.current[inst.id]?.fx;
+      if (!fx) continue;
+      fx.setMethod(inst.fxMethod);
+      fx.setAmount(inst.fxAmount);
+    }
+  }, [fxKey]);
+
   // ─────────────────────────────────────────────────────────────────────
   // Canvas render loop: input waveform (left) + output spectrogram (right)
   // ─────────────────────────────────────────────────────────────────────
@@ -459,8 +567,9 @@ export default function LiveApp() {
     const tick = () => {
       rafRef.current = requestAnimationFrame(tick);
 
-      // One scope per enabled source. The mic's canvas switches to the
-      // recorded loop (with its trim handles) once a take exists.
+      // One scope per enabled source. A Live Input's canvas switches to its own
+      // recorded take (with trim handles) once one exists; a File Loop shows
+      // the imported file the same way, minus the handles.
       for (const inst of sourcesRef.current) {
         const id = inst.id;
         const wc = srcCanvasRefs.current[id];
@@ -469,15 +578,45 @@ export default function LiveApp() {
         if (!ctx2) continue;
         const w = wc.width, h = wc.height, mid = h / 2;
 
-        const peaks = loopPeaksRef.current;
-        const loopView = inst.kind === 'mic' && peaks &&
-          (loopStateRef.current === 'stopped' || loopStateRef.current === 'playing');
+        // Both a recorded take and an imported file draw as a waveform with a
+        // playhead; only the mic's version has trim handles.
+        const accent = SOURCE_META[inst.kind].accent;
+        const c2 = inCtxRef.current;
+        let view: {
+          peaks: Float32Array; len: number; t0: number; t1: number; pos: number | null;
+        } | null = null;
 
-        if (loopView && peaks) {
+        if (inst.kind === 'mic') {
+          const slot = loopsRef.current[id] ?? IDLE_SLOT;
+          const a = loopAudioRef.current[id];
+          if (a?.peaks && (slot.state === 'stopped' || slot.state === 'playing')) {
+            const [t0, t1] = slot.trim;
+            const span = Math.max(0.05, t1 - t0);
+            view = {
+              peaks: a.peaks, len: slot.len || 1, t0, t1,
+              pos: slot.state === 'playing' && c2
+                ? t0 + ((c2.currentTime - a.startedAt) % span) : null,
+            };
+          }
+        } else if (inst.kind === 'file') {
+          const fp = filePeaksRef.current[id];
+          const len = inst.fileDuration ?? 0;
+          if (fp && len > 0) {
+            const n = srcNodesRef.current[id];
+            view = {
+              peaks: fp, len, t0: 0, t1: len,
+              pos: n?.fileSrc && c2
+                ? (c2.currentTime - (n.fileStartedAt ?? 0)) % len : null,
+            };
+          }
+        }
+
+        if (view) {
+          const { peaks, len, t0, t1, pos } = view;
           ctx2.clearRect(0, 0, w, h);
-          const [t0, t1] = trimRef.current;
-          const len = loopLenRef.current || 1;
           const x0 = (t0 / len) * w, x1 = (t1 / len) * w;
+          // Outside the trim is dimmed rather than hidden, so you can see what
+          // you cropped off and drag it back.
           ctx2.fillStyle = 'rgba(0,0,0,.45)';
           ctx2.fillRect(0, 0, x0, h);
           ctx2.fillRect(x1, 0, w - x1, h);
@@ -488,14 +627,13 @@ export default function LiveApp() {
             const amp = Math.max(1, peaks[c] * mid);
             ctx2.fillRect(x, mid - amp, Math.max(1, w / peaks.length), amp * 2);
           }
-          ctx2.fillStyle = '#8ad18a';
-          ctx2.fillRect(x0 - 1, 0, 3, h);
-          ctx2.fillRect(x1 - 1, 0, 3, h);
-          const c2 = inCtxRef.current;
-          if (loopStateRef.current === 'playing' && c2) {
-            const span = Math.max(0.05, t1 - t0);
-            const pos = t0 + ((c2.currentTime - loopStartedAtRef.current) % span);
-            ctx2.fillStyle = 'rgba(138,209,138,.9)';
+          if (inst.kind === 'mic') {
+            ctx2.fillStyle = accent;
+            ctx2.fillRect(x0 - 1, 0, 3, h);
+            ctx2.fillRect(x1 - 1, 0, 3, h);
+          }
+          if (pos !== null) {
+            ctx2.fillStyle = accent;
             ctx2.fillRect((pos / len) * w, 0, 2, h);
           }
           continue;
@@ -506,7 +644,7 @@ export default function LiveApp() {
         if (!an) continue;
         const data = new Uint8Array(an.fftSize);
         an.getByteTimeDomainData(data);
-        ctx2.strokeStyle = SOURCE_META[inst.kind].accent;
+        ctx2.strokeStyle = accent;
         ctx2.lineWidth = 1.5;
         ctx2.beginPath();
         for (let i = 0; i < data.length; i++) {
@@ -552,14 +690,70 @@ export default function LiveApp() {
         }
       }
       const inCtx = inCtxRef.current;
-      if (recRef.current && inCtx) {
-        setRecSecs(recRef.current.frames / inCtx.sampleRate);
+      for (const [id, rec] of Object.entries(recRef.current)) {
+        if (!inCtx) continue;
+        // The readout shows tenths; updating it every frame would re-render
+        // the whole app 60 times a second for no visible gain.
+        const secs = rec.frames / inCtx.sampleRate;
+        if (secs - ((loopsRef.current[id] ?? IDLE_SLOT).recSecs) >= 0.1) {
+          patchSlot(id, { recSecs: secs });
+        }
       }
+      // The middle bar carries the same grain as the input background.
+      const mn = midNoiseRef.current;
+      if (mn && grainRef.current) {
+        const g2 = mn.getContext('2d');
+        const r2 = mn.getBoundingClientRect();
+        if (g2 && r2.width > 1 && r2.height > 1) {
+          if (mn.width !== Math.round(r2.width) || mn.height !== Math.round(r2.height)) {
+            mn.width = Math.round(r2.width);
+            mn.height = Math.round(r2.height);
+          }
+          g2.clearRect(0, 0, mn.width, mn.height);
+          const alpha = 0.9 * Math.pow(noiseRef.current, 0.6);
+          if (alpha > 0.012) {
+            const i2 = Math.floor(frameRef.current / 3) % grainRef.current.tiles.length;
+            const pat2 = g2.createPattern(grainRef.current.tiles[i2], 'repeat');
+            if (pat2) {
+              g2.globalAlpha = alpha;
+              g2.fillStyle = pat2;
+              g2.fillRect(0, 0, mn.width, mn.height);
+              g2.globalAlpha = 1;
+            }
+          }
+        }
+      }
+
       frameRef.current++;
 
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, []);
+
+  /** One mixer, capture tap and ring for a single track. Summing happens in the
+      audio graph rather than in JS, so sources routed to a track stay
+      sample-aligned — independent processors would smear them by a block. */
+  const makeTrackChain = useCallback((ctx: AudioContext, tapSink: GainNode, cap: number) => {
+    const mix = ctx.createGain();
+    const proc = ctx.createScriptProcessor(4096, 2, 2);
+    const ring: RingBuf = {
+      l: new Float32Array(cap), r: new Float32Array(cap),
+      w: 0, filled: 0, sr: ctx.sampleRate,
+    };
+    proc.onaudioprocess = (e) => {
+      const Lc = e.inputBuffer.getChannelData(0);
+      const Rc = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : Lc;
+      for (let k = 0; k < Lc.length; k++) {
+        ring.l[ring.w] = Lc[k];
+        ring.r[ring.w] = Rc[k];
+        ring.w = (ring.w + 1) % ring.l.length;
+      }
+      ring.filled = Math.min(ring.filled + Lc.length, ring.l.length);
+    };
+    mix.connect(proc);
+    proc.connect(tapSink);
+    return { mix, ring, proc };
   }, []);
 
   // ─────────────────────────────────────────────────────────────────────
@@ -645,90 +839,114 @@ export default function LiveApp() {
     if (cur == null || Math.abs(cur - bpm) > 0.05) h.setBpm(bpm);
   }, [bpm, sources]);
 
-  // ── looper (Live Input) ──────────────────────────────────────────────
-  const startRec = useCallback((srcId: string) => {
-    recRef.current = { chunks: [], frames: 0, srcId };
-    setRecSecs(0);
-    setLoopState('recording');
-  }, []);
+  // ── looper: one per Live Input box ───────────────────────────────────
+  const audioOf = (id: string) => {
+    let a = loopAudioRef.current[id];
+    if (!a) a = loopAudioRef.current[id] = { buf: null, peaks: null, src: null, startedAt: 0 };
+    return a;
+  };
 
-  const stopRec = useCallback(() => {
-    const rec = recRef.current;
-    recRef.current = null;
+  const startRec = useCallback((srcId: string) => {
+    recRef.current[srcId] = { chunks: [], frames: 0 };
+    patchSlot(srcId, { state: 'recording', recSecs: 0 });
+  }, [patchSlot]);
+
+  const stopRec = useCallback((srcId: string) => {
+    const rec = recRef.current[srcId];
+    delete recRef.current[srcId];
     const ctx = inCtxRef.current;
-    if (!rec || !ctx || rec.frames === 0) { setLoopState('idle'); return; }
+    if (!rec || !ctx || rec.frames === 0) { patchSlot(srcId, { state: 'idle' }); return; }
 
     const buf = ctx.createBuffer(2, rec.frames, ctx.sampleRate);
     const L = buf.getChannelData(0), R = buf.getChannelData(1);
     let off = 0;
     for (const [l, r] of rec.chunks) { L.set(l, off); R.set(r, off); off += l.length; }
-    loopBufRef.current = buf;
 
-    // Pre-reduce to per-column peaks; redrawing 60x a second from the raw
-    // buffer would be far too slow for a minute of audio.
-    const COLS = 900;
-    const peaks = new Float32Array(COLS);
-    const per = Math.max(1, Math.floor(buf.length / COLS));
-    for (let c = 0; c < COLS; c++) {
-      let m = 0;
-      const s0 = c * per, s1 = Math.min(buf.length, s0 + per);
-      for (let i = s0; i < s1; i++) m = Math.max(m, Math.abs(L[i]));
-      peaks[c] = m;
-    }
-    loopPeaksRef.current = peaks;
-    setLoopLen(buf.duration);
-    setTrim([0, buf.duration]);
-    setLoopState('stopped');
-  }, []);
+    const a = audioOf(srcId);
+    a.buf = buf;
+    a.peaks = peaksOf(buf);
+    patchSlot(srcId, { state: 'stopped', len: buf.duration, trim: [0, buf.duration] });
+  }, [patchSlot]);
 
-  const playLoop = useCallback(() => {
-    const ctx = inCtxRef.current, buf = loopBufRef.current, g = loopGainRef.current;
-    if (!ctx || !buf || !g) return;
-    try { loopSrcRef.current?.stop(); } catch { /* not started */ }
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.loop = true;
-    src.loopStart = trim[0];
-    src.loopEnd = Math.max(trim[0] + 0.05, trim[1]);
-    src.connect(g);
-    src.start(0, trim[0]);
-    loopSrcRef.current = src;
-    loopStartedAtRef.current = ctx.currentTime;
-    g.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
-    // The loop replaces the hardware input as the model's source.
-    micGainRef.current?.gain.setTargetAtTime(0, ctx.currentTime, 0.01);
-    setLoopState('playing');
-  }, [trim]);
-
-  const stopLoop = useCallback(() => {
+  const playLoop = useCallback((srcId: string) => {
     const ctx = inCtxRef.current;
-    try { loopSrcRef.current?.stop(); } catch { /* not started */ }
-    loopSrcRef.current = null;
-    if (ctx) {
-      loopGainRef.current?.gain.setTargetAtTime(0, ctx.currentTime, 0.01);
-      micGainRef.current?.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
-    }
-    setLoopState(loopBufRef.current ? 'stopped' : 'idle');
-  }, []);
+    const a = loopAudioRef.current[srcId];
+    const g = srcNodesRef.current[srcId]?.loopGain;
+    const slot = loopsRef.current[srcId] ?? IDLE_SLOT;
+    if (!ctx || !a?.buf || !g) return;
+    try { a.src?.stop(); } catch { /* not started */ }
+    const [t0, t1] = slot.trim;
+    const src = ctx.createBufferSource();
+    src.buffer = a.buf;
+    src.loop = true;
+    src.loopStart = t0;
+    src.loopEnd = Math.max(t0 + 0.05, t1);
+    src.connect(g);
+    src.start(0, t0);
+    a.src = src;
+    a.startedAt = ctx.currentTime;
+    g.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
+    // The loop replaces the hardware input as this box's source.
+    srcNodesRef.current[srcId]?.liveGain?.gain.setTargetAtTime(0, ctx.currentTime, 0.01);
+    patchSlot(srcId, { state: 'playing' });
+  }, [patchSlot]);
 
-  const deleteLoop = useCallback(() => {
-    stopLoop();
-    loopBufRef.current = null;
-    loopPeaksRef.current = null;
-    recRef.current = null;
-    setLoopLen(0);
-    setTrim([0, 0]);
-    setLoopState('idle');
+  const stopLoop = useCallback((srcId: string) => {
+    const ctx = inCtxRef.current;
+    const a = loopAudioRef.current[srcId];
+    try { a?.src?.stop(); } catch { /* not started */ }
+    if (a) a.src = null;
+    if (ctx) {
+      const n = srcNodesRef.current[srcId];
+      n?.loopGain?.gain.setTargetAtTime(0, ctx.currentTime, 0.01);
+      n?.liveGain?.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
+    }
+    patchSlot(srcId, { state: a?.buf ? 'stopped' : 'idle' });
+  }, [patchSlot]);
+
+  const deleteLoop = useCallback((srcId: string) => {
+    stopLoop(srcId);
+    delete loopAudioRef.current[srcId];
+    delete recRef.current[srcId];
+    setLoops(m => ({ ...m, [srcId]: IDLE_SLOT }));
   }, [stopLoop]);
 
   // Re-arm the loop points live while the trim handles are dragged.
   useEffect(() => {
-    const src = loopSrcRef.current;
-    if (src && loopState === 'playing') {
-      src.loopStart = trim[0];
-      src.loopEnd = Math.max(trim[0] + 0.05, trim[1]);
+    for (const [id, slot] of Object.entries(loops)) {
+      const src = loopAudioRef.current[id]?.src;
+      if (src && slot.state === 'playing') {
+        src.loopStart = slot.trim[0];
+        src.loopEnd = Math.max(slot.trim[0] + 0.05, slot.trim[1]);
+      }
     }
-  }, [trim, loopState]);
+  }, [loops]);
+
+  // ── file loop transport ──────────────────────────────────────────────
+  /** A file box is a loop, not a one-shot: playback always wraps. A buffer
+   *  source cannot be restarted, so each PLAY builds a fresh one. */
+  const playFile = useCallback((srcId: string, offset = 0) => {
+    const ctx = inCtxRef.current;
+    const n = srcNodesRef.current[srcId];
+    if (!ctx || !n?.fileBuf || !n.fileGain) return;
+    try { n.fileSrc?.stop(); } catch { /* not started */ }
+    const src = ctx.createBufferSource();
+    src.buffer = n.fileBuf;
+    src.loop = true;
+    src.connect(n.fileGain);
+    const at = offset % n.fileBuf.duration;
+    src.start(0, at);
+    n.fileSrc = src;
+    n.fileStartedAt = ctx.currentTime - at;
+    setFilePlaying(m => ({ ...m, [srcId]: true }));
+  }, []);
+
+  const stopFile = useCallback((srcId: string) => {
+    const n = srcNodesRef.current[srcId];
+    try { n?.fileSrc?.stop(); } catch { /* not started */ }
+    if (n) n.fileSrc = null;
+    setFilePlaying(m => ({ ...m, [srcId]: false }));
+  }, []);
 
 
   /** Load an audio file to stand in for the live feed while testing. */
@@ -745,6 +963,11 @@ export default function LiveApp() {
       const target = filePickTargetRef.current;
       if (target) {
         filesRef.current[target] = file;
+        // Peaks now, from the probe: the box shows its waveform as soon as the
+        // file is chosen, without waiting for the transport.
+        filePeaksRef.current[target] = peaksOf(buf);
+        const n = srcNodesRef.current[target];
+        if (n) { n.fileBuf = undefined; n.fileSrc = null; }
         patchSource(target, { fileName: file.name, fileDuration: buf.duration });
       }
       // A file can't feed back into the mic, so make it audible by default —
@@ -777,8 +1000,9 @@ export default function LiveApp() {
   };
 
   /** Build one input box: its head node, fader and display analyser. */
-  const buildSource = async (inst: SourceInstance, ctx: AudioContext) => {
+  const buildSource = async (inst: SourceInstance, ctx: AudioContext): Promise<SourceNodes | null> => {
     let head: AudioNode | null = null;
+    let extra: Partial<SourceNodes> = {};
 
     let micMerger: ChannelMergerNode | undefined;
     if (inst.kind === 'mic') {
@@ -792,26 +1016,26 @@ export default function LiveApp() {
       splitter.connect(merger, selB, 1);
 
       // The live signal and this box's recorded loop share its fader.
+      const playing = (loopsRef.current[inst.id] ?? IDLE_SLOT).state === 'playing';
       const liveGain = ctx.createGain();
-      liveGain.gain.value = loopStateRef.current === 'playing' ? 0 : 1;
+      liveGain.gain.value = playing ? 0 : 1;
       merger.connect(liveGain);
-      micGainRef.current = liveGain;
 
       const loopGain = ctx.createGain();
-      loopGain.gain.value = loopStateRef.current === 'playing' ? 1 : 0;
-      loopGainRef.current = loopGain;
+      loopGain.gain.value = playing ? 1 : 0;
 
       const bus = ctx.createGain();
       liveGain.connect(bus);
       loopGain.connect(bus);
       head = bus;
+      extra = { liveGain, loopGain };
 
       // The looper records this box alone, not a track mix that may also carry
       // a file or a pattern, so it needs its own tap.
       const recProc = ctx.createScriptProcessor(4096, 2, 2);
       recProc.onaudioprocess = (e) => {
-        const rec = recRef.current;
-        if (!rec || rec.srcId !== inst.id) return;
+        const rec = recRef.current[inst.id];
+        if (!rec) return;
         const Lc = e.inputBuffer.getChannelData(0);
         const Rc = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : Lc;
         if (rec.frames < MAX_LOOP_SECS * ctx.sampleRate) {
@@ -822,19 +1046,19 @@ export default function LiveApp() {
       merger.connect(recProc);
       // A ScriptProcessor only fires while it has a path to the destination.
       if (tapSinkRef.current) recProc.connect(tapSinkRef.current);
-      recProcRef.current = recProc;
+      extra.recProc = recProc;
     }
 
     if (inst.kind === 'file') {
       const f = filesRef.current[inst.id];
       if (!f) return null;
       const buf = await ctx.decodeAudioData(await f.arrayBuffer());
-      const node = ctx.createBufferSource();
-      node.buffer = buf;
-      node.loop = true;            // sample-accurate loop, no gap at the seam
-      fileSourceRef.current = node;
-      fileBufRef.current = buf;
-      head = node;                 // started below, once the seed is known
+      // A fixed head, so PLAY and STOP can swap buffer sources underneath it
+      // without rewiring the box into the tracks again.
+      const fileGain = ctx.createGain();
+      head = fileGain;
+      extra = { fileGain, fileBuf: buf, fileSrc: null, fileStartedAt: 0 };
+      if (!filePeaksRef.current[inst.id]) filePeaksRef.current[inst.id] = peaksOf(buf);
     }
 
     if (inst.kind === 'code') head = strudelRef.current!.tap;
@@ -844,12 +1068,19 @@ export default function LiveApp() {
     gain.gain.value = inst.level;
     head.connect(gain);
 
+    // Pre-FX sits after the fader and before everything downstream, so it is
+    // in the model's path as well as the monitor's — the point of an input
+    // effect is that the model conditions on the processed audio.
+    const fx = new FxChain(ctx, inst.fxMethod, inst.fxAmount);
+    fx.setTempo(bpmRef.current);
+    gain.connect(fx.input);
+
     // Display tap is PRE-fader, so a box stays visible at level 0.
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 2048;
     head.connect(analyser);
 
-    return { head, gain, analyser, merger: micMerger };
+    return { head, gain, out: fx.output, fx, analyser, merger: micMerger, ...extra };
   };
 
 
@@ -884,32 +1115,12 @@ export default function LiveApp() {
       tapSink.connect(ctx.destination);
       tapSinkRef.current = tapSink;
 
-      // One mixer, capture tap and ring per TRACK. Summing happens in the audio
-      // graph rather than in JS, so sources routed to a track stay
-      // sample-aligned — independent processors would smear them by a block.
       const mixes: GainNode[] = [];
       const rings: RingBuf[] = [];
       const procs: ScriptProcessorNode[] = [];
       for (let i = 0; i < tracks.length; i++) {
-        const mix = ctx.createGain();
-        const proc = ctx.createScriptProcessor(4096, 2, 2);
-        const ring: RingBuf = {
-          l: new Float32Array(cap), r: new Float32Array(cap),
-          w: 0, filled: 0, sr: ctx.sampleRate,
-        };
-        proc.onaudioprocess = (e) => {
-          const Lc = e.inputBuffer.getChannelData(0);
-          const Rc = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : Lc;
-          for (let k = 0; k < Lc.length; k++) {
-            ring.l[ring.w] = Lc[k];
-            ring.r[ring.w] = Rc[k];
-            ring.w = (ring.w + 1) % ring.l.length;
-          }
-          ring.filled = Math.min(ring.filled + Lc.length, ring.l.length);
-        };
-        mix.connect(proc);
-        proc.connect(tapSink);
-        mixes.push(mix); rings.push(ring); procs.push(proc);
+        const c = makeTrackChain(ctx, tapSink, cap);
+        mixes.push(c.mix); rings.push(c.ring); procs.push(c.proc);
       }
       trackMixRef.current = mixes;
       ringsRef.current = rings;
@@ -935,10 +1146,10 @@ export default function LiveApp() {
         const n = await buildSource(inst, ctx);
         if (!n) continue;
         built[inst.id] = n;
-        n.gain.connect(monitorGain);
+        n.out.connect(monitorGain);
         // Patch into whichever tracks this box is routed to.
         inst.to.forEach((on, ti) => {
-          if (on && mixes[ti]) n.gain.connect(mixes[ti]);
+          if (on && mixes[ti]) n.out.connect(mixes[ti]);
         });
       }
       srcNodesRef.current = built;
@@ -948,8 +1159,12 @@ export default function LiveApp() {
       // playback where that window ends. With other sources mixed in the seed
       // would be wrong, so it is skipped.
       let seeded = false;
-      const fbuf = fileBufRef.current;
-      if (active.some(x => x.kind === 'file') && fbuf) {
+      let seedOffset = 0;
+      const fileBoxes = active.filter(x => x.kind === 'file' && built[x.id]);
+      // Only with a single file box is it clear what the window should hold;
+      // two files mixed into one track would seed it with the wrong audio.
+      const fbuf = fileBoxes.length === 1 ? built[fileBoxes[0].id].fileBuf : undefined;
+      if (fbuf) {
         const seedLen = Math.min(Math.floor(effInputRate * ctx.sampleRate), fbuf.length);
         const Lc = fbuf.getChannelData(0);
         const Rc = fbuf.numberOfChannels > 1 ? fbuf.getChannelData(1) : Lc;
@@ -963,8 +1178,12 @@ export default function LiveApp() {
           ring.filled = seedLen;
           seeded = true;
         });
-        fileSourceRef.current!.start(0, (seedLen / ctx.sampleRate) % fbuf.duration);
+        if (seeded) seedOffset = seedLen / ctx.sampleRate;
       }
+      // Every file box starts looping; the seeded one resumes where its
+      // pre-filled window ended so the audio joins on rather than repeating.
+      fileBoxes.forEach((x, i) => playFile(x.id, i === 0 ? seedOffset : 0));
+
 
       // Autoplay policy can leave a context suspended when it is created either
       // side of an await; without this nothing fires and nothing is heard.
@@ -975,9 +1194,30 @@ export default function LiveApp() {
       setRunning(true);
       setIsStarting(false);
 
+      // Live Code shares the transport. Evaluating here rather than whenever
+      // RUN happened to be clicked is the whole point: the pattern's cycle 0
+      // and the generation clock start on the same instant, so an Input Rate
+      // of 32 beats really is 8 bars of what you are hearing.
+      //
+      // It has to come after the graph is wired — the pattern's output lands on
+      // Strudel's tap, which only reaches a track once buildSource has run.
+      let firstRate = effInputRate;
+      if (active.some(x => x.kind === 'code')) {
+        // An error in the buffer is the panel's to report; it must not take
+        // the transport down with it.
+        await strudelPanelRef.current?.run().catch(() => {});
+        // A `setcpm` in the pattern may have just redefined the beat. React
+        // state has not caught up yet, so ask the engine directly rather than
+        // sizing the first window at the previous tempo.
+        const b = strudelRef.current?.getBpm();
+        if (b && isFinite(b) && b > 0) {
+          firstRate = Math.min(MAX_BUFFER_SECS, inputBeats * (60 / b));
+        }
+      }
+
       setStatus(seeded ? 'Generating first cycle…'
-                       : `Filling ${effInputRate.toFixed(1)}s buffer…`);
-      const firstDelay = seeded ? 120 : effInputRate * 1000;
+                       : `Filling ${firstRate.toFixed(1)}s buffer…`);
+      const firstDelay = seeded ? 120 : firstRate * 1000;
       timerRef.current = window.setTimeout(function fire() {
         if (!runningRef.current) return;
         pushSnapshot();
@@ -991,31 +1231,39 @@ export default function LiveApp() {
 
   const stop = () => {
     setRunning(false);
-    if (sourcesRef.current.some(x => x.kind === 'code')) { strudelRef.current?.hush(); setStrudelPlaying(false); }
+    // ...and STOP presses HUSH, the other half of the same deal.
+    if (sourcesRef.current.some(x => x.kind === 'code')) hushStrudel();
     setStatus('Idle');
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
     for (const t of trackRefs.current) t?.finish();
     for (const pr of procsRef.current) pr.disconnect();
     procsRef.current = [];
-    recProcRef.current?.disconnect();
-    recProcRef.current = null;
     for (const m of trackMixRef.current) m.disconnect();
     trackMixRef.current = [];
     tapSinkRef.current?.disconnect();
     tapSinkRef.current = null;
     for (const n of Object.values(srcNodesRef.current)) {
       n?.gain.disconnect();
+      n?.fx.dispose();
       n?.analyser.disconnect();
+      n?.recProc?.disconnect();
+      if (n?.fileSrc) {
+        try { n.fileSrc.stop(); } catch { /* never started */ }
+        n.fileSrc.disconnect();
+        n.fileSrc = null;
+      }
     }
+    setFilePlaying({});
+    for (const a of Object.values(loopAudioRef.current)) {
+      try { a.src?.stop(); } catch { /* not started */ }
+      a.src = null;
+    }
+    // Takes survive a stop; only playback does. A box whose loop was sounding
+    // drops back to 'stopped', and a take still being recorded is discarded.
+    setLoops(m => Object.fromEntries(Object.entries(m).map(([id, sl]) =>
+      [id, { ...sl, state: loopAudioRef.current[id]?.buf ? 'stopped' as const : 'idle' as const }])));
+    recRef.current = {};
     srcNodesRef.current = {};
-    if (fileSourceRef.current) {
-      try { fileSourceRef.current.stop(); } catch { /* never started */ }
-      fileSourceRef.current.disconnect();
-      fileSourceRef.current = null;
-    }
-    try { loopSrcRef.current?.stop(); } catch { /* not started */ }
-    loopSrcRef.current = null;
-    recRef.current = null;
     if (clickTimerRef.current) { clearInterval(clickTimerRef.current); clickTimerRef.current = null; }
     clickGainRef.current?.disconnect();
     clickGainRef.current = null;
@@ -1035,18 +1283,76 @@ export default function LiveApp() {
 
   useEffect(() => () => { stop(); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
 
-  const showLoopView = loopState === 'stopped' || loopState === 'playing';
-  const posToTime = (e: React.PointerEvent) => {
+  const loopVisible = (id: string) => {
+    const st = slotOf(id).state;
+    return st === 'stopped' || st === 'playing';
+  };
+  const posToTime = (id: string, e: React.PointerEvent) => {
+    const len = slotOf(id).len;
     const r = (e.target as HTMLCanvasElement).getBoundingClientRect();
-    return Math.max(0, Math.min(loopLen, ((e.clientX - r.left) / r.width) * loopLen));
+    return Math.max(0, Math.min(len, ((e.clientX - r.left) / r.width) * len));
   };
-  const applyTrim = (at: number) => {
-    const h = dragHandleRef.current;
-    if (h === null) return;
-    setTrim(([a, b]) => h === 0
-      ? [Math.min(at, b - 0.05), b]
-      : [a, Math.max(at, a + 0.05)]);
+  const applyTrim = (id: string, at: number) => {
+    const d = dragHandleRef.current;
+    if (!d || d.id !== id) return;
+    setLoops(m => {
+      const sl = m[id] ?? IDLE_SLOT;
+      const [a, b] = sl.trim;
+      const trim: [number, number] = d.h === 0
+        ? [Math.min(at, b - 0.05), b]
+        : [a, Math.max(at, a + 0.05)];
+      return { ...m, [id]: { ...sl, trim } };
+    });
   };
+
+  // ── the draggable divider between the two halves ─────────────────────
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const splitDragRef = useRef(false);
+  const [splitting, setSplitting] = useState(false);
+  const layoutRef = useRef(layout);
+  useEffect(() => { layoutRef.current = layout; }, [layout]);
+
+  const onSplitDown = useCallback((e: React.PointerEvent) => {
+    // No preventDefault: it would swallow the double-click that resets the
+    // split. `user-select: none` on the handle deals with text dragging.
+    (e.target as Element).setPointerCapture(e.pointerId);
+    splitDragRef.current = true;
+    setSplitting(true);
+  }, []);
+
+  const onSplitMove = useCallback((e: React.PointerEvent) => {
+    if (!splitDragRef.current) return;
+    const r = stageRef.current?.getBoundingClientRect();
+    if (!r) return;
+    // Whichever axis the stage runs along is the one the divider slides on.
+    const f = layoutRef.current === 'vertical'
+      ? (e.clientY - r.top) / r.height
+      : (e.clientX - r.left) / r.width;
+    // Neither side may be squeezed to nothing: a pane below this still has
+    // room for its title and one box.
+    const clamped = Math.max(0.18, Math.min(0.82, f));
+    setSplit(sp => ({ ...sp, [layoutRef.current]: clamped }));
+  }, []);
+
+  const onSplitUp = useCallback((e: React.PointerEvent) => {
+    if (!splitDragRef.current) return;
+    splitDragRef.current = false;
+    setSplitting(false);
+    try { (e.target as Element).releasePointerCapture(e.pointerId); } catch { /* done */ }
+    setSplit(sp => {
+      localStorage.setItem('sa3_live_split', JSON.stringify(sp));
+      return sp;
+    });
+  }, []);
+
+  /** Double-click the divider to go back to even halves. */
+  const resetSplit = useCallback(() => {
+    setSplit(sp => {
+      const next = { ...sp, [layoutRef.current]: 0.5 };
+      localStorage.setItem('sa3_live_split', JSON.stringify(next));
+      return next;
+    });
+  }, []);
 
   /** The latent shelf edits whichever track's tab is showing. */
   const sendWeights = useCallback((weights: Float32Array, renorm: boolean) => {
@@ -1066,10 +1372,10 @@ export default function LiveApp() {
       const n = srcNodesRef.current[inst.id];
       if (!n) continue;
       mixes.forEach((mix) => {
-        try { n.gain.disconnect(mix); } catch { /* was not connected */ }
+        try { n.out.disconnect(mix); } catch { /* was not connected */ }
       });
       inst.to.forEach((on, ti) => {
-        if (on && mixes[ti]) n.gain.connect(mixes[ti]);
+        if (on && mixes[ti]) n.out.connect(mixes[ti]);
       });
     }
   }, [routingKey]);
@@ -1077,7 +1383,7 @@ export default function LiveApp() {
   // --- patch cables ----------------------------------------------------
   const [anchors, setAnchors] = useState<{
     src: Record<string, { x: number; y: number }>;
-    trk: { x: number; y: number }[];
+    trk: ({ x: number; y: number } | undefined)[];
   }>({ src: {}, trk: [] });
 
   const measure = useCallback(() => {
@@ -1094,7 +1400,12 @@ export default function LiveApp() {
       const pt = at(srcNodeEls.current[inst.id]);
       if (pt) src[inst.id] = pt;
     }
-    setAnchors({ src, trk: trackNodeEls.current.map(el => at(el) ?? { x: 0, y: 0 }) });
+    // Walk the current track list rather than the element map: a removed
+    // track leaves no anchor at all, so its cables cannot be redrawn.
+    setAnchors({
+      src,
+      trk: tracksRef.current.map(t => at(trackNodeEls.current[t.id])),
+    });
   }, []);
 
   // Anchors move whenever the layout does.
@@ -1103,7 +1414,17 @@ export default function LiveApp() {
     const t = window.setTimeout(measure, 60);   // after the panes settle
     window.addEventListener('resize', measure);
     return () => { window.clearTimeout(t); window.removeEventListener('resize', measure); };
-  }, [measure, sources, tracks.length, shelfOpen, loopLen]);
+  }, [measure, sources, tracks.length, shelfOpen, loopLensKey, layout, split]);
+  useEffect(() => { measureRef.current = measure; }, [measure]);
+
+  const beginPatchFromTrack = useCallback((ti: number, e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    measure();
+    setPatchFromTrack(ti);
+    const base = patchLayerRef.current?.getBoundingClientRect();
+    if (base) setPatchTo({ x: e.clientX - base.left, y: e.clientY - base.top });
+  }, [measure]);
 
   const beginPatch = useCallback((id: string, e: React.PointerEvent) => {
     e.preventDefault();
@@ -1114,32 +1435,47 @@ export default function LiveApp() {
     if (base) setPatchTo({ x: e.clientX - base.left, y: e.clientY - base.top });
   }, [measure]);
 
-  // While dragging, the loose end follows the pointer; releasing over a track
-  // toggles that connection, anywhere else cancels.
+  /** Flip one source->track connection on or off. Both drag directions land
+      here, so a cable can be pulled apart from whichever end you grab. */
+  const toggleLink = useCallback((srcId: string, ti: number) => {
+    setSources(prev => prev.map(x => {
+      if (x.id !== srcId) return x;
+      const to = [...x.to];
+      while (to.length <= ti) to.push(false);
+      to[ti] = !to[ti];
+      return { ...x, to };
+    }));
+  }, []);
+
+  // A drop does not have to be precise: the pad widens every jack.
+  const hits = (el: HTMLElement | null | undefined, e: PointerEvent) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const pad = 26;
+    return e.clientX >= r.left - pad && e.clientX <= r.right + pad
+        && e.clientY >= r.top - pad && e.clientY <= r.bottom + pad;
+  };
+
+  // While dragging, the loose end follows the pointer; releasing over the
+  // opposite kind of jack toggles that connection, anywhere else cancels.
   useEffect(() => {
-    if (patchFrom === null) return;
+    if (patchFrom === null && patchFromTrack === null) return;
     const move = (e: PointerEvent) => {
       const base = patchLayerRef.current?.getBoundingClientRect();
       if (base) setPatchTo({ x: e.clientX - base.left, y: e.clientY - base.top });
     };
     const up = (e: PointerEvent) => {
-      const hit = trackNodeEls.current.findIndex(el => {
-        if (!el) return false;
-        const r = el.getBoundingClientRect();
-        const pad = 26;   // generous, so the drop does not demand precision
-        return e.clientX >= r.left - pad && e.clientX <= r.right + pad
-            && e.clientY >= r.top - pad && e.clientY <= r.bottom + pad;
-      });
-      if (hit >= 0) {
-        setSources(prev => prev.map(x => {
-          if (x.id !== patchFrom) return x;
-          const to = [...x.to];
-          while (to.length < tracks.length) to.push(false);
-          to[hit] = !to[hit];
-          return { ...x, to };
-        }));
+      if (patchFrom !== null) {
+        // Started at a source: look for a track jack under the pointer.
+        const ti = tracksRef.current.findIndex(t => hits(trackNodeEls.current[t.id], e));
+        if (ti >= 0) toggleLink(patchFrom, ti);
+      } else if (patchFromTrack !== null) {
+        // Started at a track: look for a source jack instead.
+        const inst = sourcesRef.current.find(x => hits(srcNodeEls.current[x.id], e));
+        if (inst) toggleLink(inst.id, patchFromTrack);
       }
       setPatchFrom(null);
+      setPatchFromTrack(null);
       setPatchTo(null);
     };
     window.addEventListener('pointermove', move);
@@ -1148,7 +1484,7 @@ export default function LiveApp() {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
     };
-  }, [patchFrom, tracks.length]);
+  }, [patchFrom, patchFromTrack, toggleLink]);
 
   const addSource = useCallback((kind: SourceKind) => {
     setAddMenu(false);
@@ -1168,30 +1504,69 @@ export default function LiveApp() {
     if (n) {
       // Dropping the connections removes this box's cables with it.
       try { n.gain.disconnect(); } catch { /* already detached */ }
+      try { n.fx.dispose(); } catch { /* already detached */ }
       try { n.analyser.disconnect(); } catch { /* already detached */ }
       delete srcNodesRef.current[id];
     }
     delete filesRef.current[id];
+    delete filePeaksRef.current[id];
     delete srcCanvasRefs.current[id];
     delete srcNodeEls.current[id];
-    if (recRef.current?.srcId === id) recRef.current = null;
+    // The box's take goes with it — nothing else can reach it now.
+    const a = loopAudioRef.current[id];
+    try { a?.src?.stop(); } catch { /* not started */ }
+    delete loopAudioRef.current[id];
+    delete recRef.current[id];
+    setLoops(m => { const { [id]: _gone, ...rest } = m; return rest; });
+    setFilePlaying(m => { const { [id]: _g, ...rest } = m; return rest; });
     setSources(list => list.filter(x => x.id !== id));
   }, []);
 
   const addTrack = useCallback(() => {
     setTracks(ts => {
       if (ts.length >= maxSlots) return ts;
+      // The capture graph is index-parallel to the track list, so it has to
+      // grow with it — otherwise the new track would have no ring to read.
+      const ctx = inCtxRef.current, tapSink = tapSinkRef.current;
+      if (ctx && tapSink) {
+        const c = makeTrackChain(ctx, tapSink, Math.ceil(MAX_BUFFER_SECS * ctx.sampleRate));
+        trackMixRef.current = [...trackMixRef.current, c.mix];
+        ringsRef.current = [...ringsRef.current, c.ring];
+        procsRef.current = [...procsRef.current, c.proc];
+      }
       // Every existing box patches to the new track by default.
       setSources(list => list.map(x => ({ ...x, to: [...x.to, true] })));
       setActiveTab(ts.length);
       return [...ts, defaultTrack()];
     });
-  }, [maxSlots]);
+  }, [maxSlots, makeTrackChain]);
   const removeTrack = useCallback((i: number) => {
     trackRefs.current[i]?.finish();
     trackRefs.current = trackRefs.current.filter((_, j) => j !== i);
-    setTracks(ts => ts.filter((_, j) => j !== i));
-    setSources(list => list.map(x => ({ ...x, to: x.to.filter((_, j) => j !== i) })));
+    // Tear the departed track's capture chain out too: the arrays are indexed
+    // in parallel, so leaving a stale entry would hand its mix to a survivor.
+    const drop = <T,>(arr: T[]) => arr.filter((_, j) => j !== i);
+    const dead = trackMixRef.current[i];
+    if (dead) {
+      // Sources feed the mix; disconnect() only sheds its outputs, so the
+      // incoming edges have to be cut from the source side or the dead node
+      // stays reachable.
+      for (const inst of sourcesRef.current) {
+        try { srcNodesRef.current[inst.id]?.out.disconnect(dead); } catch { /* not routed */ }
+      }
+      try { dead.disconnect(); } catch { /* never connected */ }
+    }
+    const oldProc = procsRef.current[i];
+    if (oldProc) { oldProc.onaudioprocess = null; try { oldProc.disconnect(); } catch { /* idem */ } }
+    trackMixRef.current = drop(trackMixRef.current);
+    procsRef.current = drop(procsRef.current);
+    ringsRef.current = drop(ringsRef.current);
+    setTracks(ts => {
+      const gone = ts[i];
+      if (gone) delete trackNodeEls.current[gone.id];
+      return drop(ts);
+    });
+    setSources(list => list.map(x => ({ ...x, to: drop(x.to) })));
     setActiveTab(0);
     // Otherwise a solo on the departed track would silence the survivors.
     setSolo(null);
@@ -1205,12 +1580,141 @@ export default function LiveApp() {
 
   // The middle bar's thickness is the diffusion step count; noise instead
   // shows up as the wash bleeding into the input pane.
-  const barWidth = 18 + (Math.min(cur.steps, 16) / 16) * 104;
+  // Horizontal bar between the halves: its THICKNESS is the step count.
+  const barThickness = 12 + (Math.min(cur.steps, 16) / 16) * 60;
   // Variant 0 sits at the top of the bar and the ladder descends from there.
   const variantPct = activeVariants > 1 ? (cur.variant / (activeVariants - 1)) * 100 : 0;
 
+  /** One input box; rendered from either column. */
+  // The Input FX controls edit this box. Falls back to the first one so the
+  // rack is never pointing at nothing.
+  const fxSrc = sources.find(x => x.id === activeSrc) ?? sources[0];
+  const patchFx = useCallback((patch: Partial<SourceInstance>) => {
+    const id = activeSrcRef.current ?? sourcesRef.current[0]?.id;
+    if (id) patchSource(id, patch);
+  }, []);
+
+  const renderSource = (inst: SourceInstance) => (
+    <InputSection
+      key={inst.id}
+      src={inst}
+      active={fxSrc?.id === inst.id}
+      onActivate={() => setActiveSrc(inst.id)}
+      connected={inst.to.slice(0, tracks.length).filter(Boolean).length}
+      patching={patchFromTrack !== null}
+      running={running}
+      channelOptions={channelOptions(detectedChannels)}
+      onChanSel={(v) => patchSource(inst.id, { chanSel: v })}
+      onLevel={(v) => {
+        patchSource(inst.id, { level: v });
+        srcNodesRef.current[inst.id]?.gain.gain.setTargetAtTime(
+          v, inCtxRef.current?.currentTime ?? 0, 0.02);
+      }}
+      onRemove={() => removeSource(inst.id)}
+      onCanvas={(el) => { srcCanvasRefs.current[inst.id] = el; }}
+      onNode={(el) => { srcNodeEls.current[inst.id] = el; }}
+      onNodeDown={(e) => beginPatch(inst.id, e)}
+      canvasProps={inst.kind === 'mic' ? {
+        style: { cursor: loopVisible(inst.id) ? 'ew-resize' : 'default' },
+        onPointerDown: (e) => {
+          const sl = slotOf(inst.id);
+          if (!loopVisible(inst.id) || !sl.len) return;
+          (e.target as Element).setPointerCapture(e.pointerId);
+          const at = posToTime(inst.id, e);
+          const [t0, t1] = sl.trim;
+          dragHandleRef.current = {
+            id: inst.id,
+            h: Math.abs(at - t0) <= Math.abs(at - t1) ? 0 : 1,
+          };
+          applyTrim(inst.id, at);
+        },
+        onPointerMove: (e) => {
+          if (dragHandleRef.current) applyTrim(inst.id, posToTime(inst.id, e));
+        },
+        onPointerUp: (e) => {
+          dragHandleRef.current = null;
+          try { (e.target as Element).releasePointerCapture(e.pointerId); } catch { /* done */ }
+        },
+      } : undefined}
+      overlay={inst.kind === 'code' ? (
+        <StrudelPanel
+          ref={strudelPanelRef}
+          linked
+          onEvaluate={runStrudel}
+          onHush={hushStrudel}
+          running={strudelPlaying}
+          ready={strudelReady}
+          banks={strudelBanks}
+          error={strudelError}
+        />
+      ) : undefined}
+      tools={
+        inst.kind === 'mic' ? (() => {
+          // Every box reads its own slot, so a take made here never shows up
+          // in the Live Input next to it.
+          const sl = slotOf(inst.id);
+          return (
+            <div className="in-tools">
+              {sl.state !== 'recording' ? (
+                <button className="tool rec" onClick={() => startRec(inst.id)} disabled={!running}
+                        title={running ? 'Record a loop' : 'Start the transport first'}>
+                  <Circle size={10} /> REC
+                </button>
+              ) : (
+                <button className="tool recording" onClick={() => stopRec(inst.id)}>
+                  <Square size={10} /> STOP {sl.recSecs.toFixed(1)}s
+                </button>
+              )}
+              {sl.state === 'playing'
+                ? <button className="tool on" onClick={() => stopLoop(inst.id)}><Square size={10} /> STOP</button>
+                : <button className="tool" onClick={() => playLoop(inst.id)}
+                          disabled={!sl.len || !running}
+                          title={running ? 'Loop this take' : 'Start the transport first'}>
+                    <Play size={10} /> PLAY
+                  </button>}
+              <button className="tool del" onClick={() => deleteLoop(inst.id)} disabled={!sl.len}>
+                <Trash2 size={10} /> DEL
+              </button>
+              {sl.len > 0 && (
+                <span className="tools-meta">
+                  loop {(sl.trim[1] - sl.trim[0]).toFixed(2)}s of {sl.len.toFixed(2)}s · drag edges to trim
+                </span>
+              )}
+            </div>
+          );
+        })() : inst.kind === 'file' ? (
+          <div className="in-tools">
+            <button className="tool" disabled={running}
+                    onClick={() => {
+                      filePickTargetRef.current = inst.id;
+                      filePickerRef.current?.click();
+                    }}>
+              <FolderOpen size={10} /> {inst.fileName ? 'Change…' : 'Import…'}
+            </button>
+            {/* The transport starts every file box looping; these are for
+                dropping one out and back in without stopping the whole rig. */}
+            {filePlaying[inst.id]
+              ? <button className="tool on" onClick={() => stopFile(inst.id)}>
+                  <Square size={10} /> STOP
+                </button>
+              : <button className="tool" onClick={() => playFile(inst.id)}
+                        disabled={!running || !inst.fileName}
+                        title={running ? 'Loop this file' : 'Start the transport first'}>
+                  <Play size={10} /> PLAY
+                </button>}
+            {inst.fileName && (
+              <span className="tools-meta" title={inst.fileName}>
+                {inst.fileName} · {inst.fileDuration?.toFixed(1)}s
+              </span>
+            )}
+          </div>
+        ) : undefined
+      }
+    />
+  );
+
   return (
-    <div className="live-root">
+    <div className={`live-root ${layout}`}>
       {/* ── transport ─────────────────────────────────────────── */}
       <header className="live-bar">
         <button className={`transport ${running ? 'stop' : 'start'}`}
@@ -1263,6 +1767,17 @@ export default function LiveApp() {
           <option value="medium">medium</option>
         </select>
 
+        <div className="view-toggle" title="Switch between stacked and side-by-side layouts">
+          <button className={layout === 'vertical' ? 'on' : ''}
+                  onClick={() => setLayout('vertical')} aria-label="Stacked layout">
+            <Rows2 size={13} />
+          </button>
+          <button className={layout === 'horizontal' ? 'on' : ''}
+                  onClick={() => setLayout('horizontal')} aria-label="Side-by-side layout">
+            <Columns2 size={13} />
+          </button>
+        </div>
+
         <div className="live-status">
           <Circle size={8} className={connected ? 'dot ok' : 'dot bad'} />
           {status}
@@ -1285,13 +1800,14 @@ export default function LiveApp() {
             return inst.to.slice(0, anchors.trk.length).map((on, ti) => {
               const b = anchors.trk[ti];
               if (!on || !b) return null;
-              // Leaves the source horizontally, arrives at the track from
-              // directly above, with a little slack so it reads as a cord.
+              // Stacked: leave downwards, arrive from above. Side-by-side:
+              // leave to the right, still arriving from above.
+              const dy = Math.max(40, Math.abs(b.y - a.y) * 0.55);
               const dx = Math.max(48, Math.abs(b.x - a.x) * 0.5);
-              const dy = Math.max(48, Math.abs(b.y - a.y) * 0.5);
-              const sag = Math.min(26, Math.abs(b.x - a.x) * 0.08);
-              const d = `M ${a.x} ${a.y} C ${a.x + dx} ${a.y + sag}, `
-                      + `${b.x} ${b.y - dy + sag}, ${b.x} ${b.y}`;
+              const sag = Math.min(22, Math.abs(b.x - a.x) * 0.06);
+              const d = layout === 'vertical'
+                ? `M ${a.x} ${a.y} C ${a.x} ${a.y + dy + sag}, ${b.x} ${b.y - dy}, ${b.x} ${b.y}`
+                : `M ${a.x} ${a.y} C ${a.x + dx} ${a.y + sag}, ${b.x} ${b.y - dy + sag}, ${b.x} ${b.y}`;
               const col = SOURCE_META[inst.kind].accent;
               return (
                 <g key={`${inst.id}-${ti}`}>
@@ -1303,113 +1819,44 @@ export default function LiveApp() {
               );
             });
           })}
-          {patchFrom && patchTo && anchors.src[patchFrom] && (
-            <g>
-              <path
-                className="cable dragging"
-                stroke={SOURCE_META[sources.find(x => x.id === patchFrom)?.kind ?? 'mic'].accent}
-                d={`M ${anchors.src[patchFrom]!.x} ${anchors.src[patchFrom]!.y} L ${patchTo.x} ${patchTo.y}`}
-              />
-              <circle className="cable-plug" cx={patchTo.x} cy={patchTo.y} r={5}
-                      fill={SOURCE_META[sources.find(x => x.id === patchFrom)?.kind ?? 'mic'].accent} />
-            </g>
-          )}
+          {patchTo && (() => {
+            // The loose end can originate at either a source or a track.
+            const o = patchFrom ? anchors.src[patchFrom] : anchors.trk[patchFromTrack ?? -1];
+            if (!o) return null;
+            const col = patchFrom
+              ? SOURCE_META[sources.find(x => x.id === patchFrom)?.kind ?? 'mic'].accent
+              : (TRACK_THEME[patchFromTrack ?? 0]?.accent ?? '#ffffff');
+            return (
+              <g>
+                <path className="cable dragging" stroke={col}
+                      d={`M ${o.x} ${o.y} L ${patchTo.x} ${patchTo.y}`} />
+                <circle className="cable-plug" cx={patchTo.x} cy={patchTo.y} r={5} fill={col} />
+              </g>
+            );
+          })()}
         </svg>
 
-        <section className="pane input-pane">
+        <div className="stage" ref={stageRef}>
+        <section className="pane input-pane"
+                 style={{ flexGrow: split[layout], flexBasis: 0 }}>
           <canvas ref={noiseCanvasRef} className="pane-noise" />
           <div className="pane-title">Live-Input Feed</div>
 
           {/* One horizontal band per enabled source, each with its own display,
               send fader and patch node. */}
+          {/* A Live Code box needs room for its editor, so it takes half the
+              input area and the remaining boxes share the other half. */}
           <div className="in-stack">
-            {sources.map(inst => (
-              <InputSection
-                key={inst.id}
-                src={inst}
-                connected={inst.to.slice(0, tracks.length).filter(Boolean).length}
-                patching={patchFrom !== null}
-                running={running}
-                channelOptions={channelOptions(detectedChannels)}
-                onChanSel={(v) => patchSource(inst.id, { chanSel: v })}
-                onLevel={(v) => {
-                  patchSource(inst.id, { level: v });
-                  srcNodesRef.current[inst.id]?.gain.gain.setTargetAtTime(
-                    v, inCtxRef.current?.currentTime ?? 0, 0.02);
-                }}
-                onRemove={() => removeSource(inst.id)}
-                onCanvas={(el) => { srcCanvasRefs.current[inst.id] = el; }}
-                onNode={(el) => { srcNodeEls.current[inst.id] = el; }}
-                onNodeDown={(e) => beginPatch(inst.id, e)}
-                canvasProps={inst.kind === 'mic' ? {
-                  style: { cursor: showLoopView ? 'ew-resize' : 'default' },
-                  onPointerDown: (e) => {
-                    if (!showLoopView || !loopLen) return;
-                    (e.target as Element).setPointerCapture(e.pointerId);
-                    const at = posToTime(e);
-                    dragHandleRef.current = Math.abs(at - trim[0]) <= Math.abs(at - trim[1]) ? 0 : 1;
-                    applyTrim(at);
-                  },
-                  onPointerMove: (e) => { if (dragHandleRef.current !== null) applyTrim(posToTime(e)); },
-                  onPointerUp: (e) => {
-                    dragHandleRef.current = null;
-                    try { (e.target as Element).releasePointerCapture(e.pointerId); } catch { /* done */ }
-                  },
-                } : undefined}
-                overlay={inst.kind === 'code' ? (
-                  <StrudelPanel
-                    onEvaluate={runStrudel}
-                    onHush={hushStrudel}
-                    running={strudelPlaying}
-                    ready={strudelReady}
-                    banks={strudelBanks}
-                    error={strudelError}
-                  />
-                ) : undefined}
-                tools={
-                  inst.kind === 'mic' ? (
-                    <div className="in-tools">
-                      {loopState !== 'recording' ? (
-                        <button className="tool rec" onClick={() => startRec(inst.id)} disabled={!running}
-                                title={running ? 'Record a loop' : 'Start the transport first'}>
-                          <Circle size={10} /> REC
-                        </button>
-                      ) : (
-                        <button className="tool recording" onClick={stopRec}>
-                          <Square size={10} /> STOP {recSecs.toFixed(1)}s
-                        </button>
-                      )}
-                      {loopState === 'playing'
-                        ? <button className="tool on" onClick={stopLoop}><Square size={10} /> STOP</button>
-                        : <button className="tool" onClick={playLoop} disabled={!loopLen}><Play size={10} /> PLAY</button>}
-                      <button className="tool del" onClick={deleteLoop} disabled={!loopLen}>
-                        <Trash2 size={10} /> DEL
-                      </button>
-                      {loopLen > 0 && (
-                        <span className="tools-meta">
-                          loop {(trim[1] - trim[0]).toFixed(2)}s of {loopLen.toFixed(2)}s · drag edges to trim
-                        </span>
-                      )}
-                    </div>
-                  ) : inst.kind === 'file' ? (
-                    <div className="in-tools">
-                      <button className="tool" disabled={running}
-                              onClick={() => {
-                                filePickTargetRef.current = inst.id;
-                                filePickerRef.current?.click();
-                              }}>
-                        <FolderOpen size={10} /> {inst.fileName ? 'Change…' : 'Import…'}
-                      </button>
-                      {inst.fileName && (
-                        <span className="tools-meta" title={inst.fileName}>
-                          {inst.fileName} · {inst.fileDuration?.toFixed(1)}s
-                        </span>
-                      )}
-                    </div>
-                  ) : undefined
-                }
-              />
+            <div className="in-col main">
+            {sources.filter(x => x.kind !== 'code').map(inst => (
+              renderSource(inst)
             ))}
+            </div>
+            {sources.some(x => x.kind === 'code') && (
+              <div className="in-col code">
+                {sources.filter(x => x.kind === 'code').map(inst => (renderSource(inst)))}
+              </div>
+            )}
           </div>
 
           {/* Add another input box. Live Code is capped at one because Strudel
@@ -1447,20 +1894,40 @@ export default function LiveApp() {
                       value={inputMonitor} onChange={setInputMonitor} />
         </section>
 
-        <div className="middle" title={`${cur.steps} steps · variant ${cur.variant} at noise ${(cur.noise + cur.variant * cur.spread).toFixed(2)}`}>
-          <div className="middle-bar" style={{ width: `${barWidth}px` }}>
-            <div className="variant-marker" style={{ top: `${2 + variantPct * 0.96}%` }}>
+        <div
+          className={`middle ${splitting ? 'dragging' : ''}`}
+          onPointerDown={onSplitDown}
+          onPointerMove={onSplitMove}
+          onPointerUp={onSplitUp}
+          onPointerCancel={onSplitUp}
+          onDoubleClick={resetSplit}
+          role="separator"
+          aria-orientation={layout === 'vertical' ? 'horizontal' : 'vertical'}
+          title={`Drag to resize · double-click for even halves — ${cur.steps} steps · variant ${cur.variant} at noise ${(cur.noise + cur.variant * cur.spread).toFixed(2)}`}
+        >
+          {/* Thickness is the step count; which axis that is depends on the
+              view — height when the bar lies flat, width when it stands up. */}
+          <div
+            className="middle-bar"
+            style={layout === 'vertical'
+              ? { height: `${barThickness}px` }
+              : { width: `${barThickness}px` }}
+          >
+            {/* Noise grain, same texture and the same amount as the input
+                background, so the bar shows what is being added. */}
+            <canvas ref={midNoiseRef} className="middle-noise" />
+            <div className="variant-marker" style={{ left: `${2 + variantPct * 0.96}%` }}>
               <span className="variant-marker-tag">{cur.variant}</span>
             </div>
           </div>
         </div>
 
-        <div className="out-side">
+        <div className="out-side" style={{ flexGrow: 1 - split[layout], flexBasis: 0 }}>
           <div className="pane-title right">Live-Output Feed</div>
           <div className="out-stack">
           {tracks.map((t, i) => (
             <TrackOutput
-              key={i}
+              key={t.id}
               ref={(h) => { trackRefs.current[i] = h; }}
               index={i}
               connectionId={connectionId}
@@ -1482,14 +1949,16 @@ export default function LiveApp() {
               muted={solo !== null && solo !== i}
               onSolo={() => setSolo(cur => (cur === i ? null : i))}
               soloVisible={tracks.length > 1}
-              onNode={(el) => { trackNodeEls.current[i] = el; }}
+              onNode={(el) => { trackNodeEls.current[t.id] = el; }}
               patchTarget={patchFrom !== null}
+              onNodeDown={(e) => beginPatchFromTrack(i, e)}
               onShelfDone={() => setShelfBusy(false)}
               learnProps={knobProps}
               running={running}
             />
           ))}
           </div>
+        </div>
         </div>
 
         <LatentShelf
@@ -1558,7 +2027,48 @@ export default function LiveApp() {
           {tempoOn && !bpm && <div className="tempo-warn">no tempo yet — using seconds</div>}
         </div>
 
-        <div className="knob-group">
+        {/* Input pre-FX leads the rack because it is the only group that runs
+            BEFORE the ring buffer: it changes what the model conditions on,
+            not just what you hear. Left to right, the row now follows the
+            signal — input, rate, generation, variants, feedback, output. */}
+        {fxSrc && (() => {
+          const m = fxMethod(fxSrc.fxMethod);
+          const lat = m.latencyAt(fxSrc.fxAmount);
+          return (
+            <div className="knob-group g-infx">
+              <div className="group-cap">
+                INPUT FX
+                <span className="group-sub">{SOURCE_META[fxSrc.kind].name}</span>
+              </div>
+              <div className="knob-row">
+                <div className="fx-cell">
+                  <select
+                    className="fx-method"
+                    value={fxSrc.fxMethod}
+                    onChange={e => patchFx({ fxMethod: e.target.value })}
+                    title={m.blurb}
+                    aria-label="Input FX method"
+                  >
+                    {FX_METHODS.map(x => (
+                      <option key={x.id} value={x.id} title={x.blurb}>{x.label}</option>
+                    ))}
+                  </select>
+                  <span className="fx-lat"
+                        title="Added input latency — the model's window is this much older">
+                    {lat > 0.001 ? `+${(lat * 1000).toFixed(0)}ms` : 'no delay'}
+                  </span>
+                </div>
+                <Knob {...knobProps('fxAmount')} label="Saturate" min={0} max={1} step={0.005}
+                      value={fxSrc.fxAmount} onChange={v => patchFx({ fxAmount: v })}
+                      format={v => m.format(v)} />
+              </div>
+            </div>
+          );
+        })()}
+
+        <div className="knob-group g-rate">
+          <div className="group-cap">RATE</div>
+          <div className="knob-row">
           {beatSec ? (
             <>
               <Knob {...knobProps('inputRate')} label="Input Rate" values={BEATS}
@@ -1576,18 +2086,24 @@ export default function LiveApp() {
                     value={generateRate} onChange={setGenerateRate} format={v => `${v}s`} />
             </>
           )}
+          </div>
         </div>
 
-        <div className="knob-group">
+        <div className="knob-group g-gen">
+          <div className="group-cap">GENERATION</div>
+          <div className="knob-row">
           <Knob {...knobProps('noise')} label="Noise" min={0.05} max={1} step={0.01}
                 value={cur.noise} onChange={v => patchActive({ noise: v })} />
           <Knob {...knobProps('steps')} label="Steps" min={1} max={16} step={1}
                 value={cur.steps} onChange={v => patchActive({ steps: v })} format={v => String(Math.round(v))} />
           <Knob {...knobProps('cfg')} label="CFG" min={1} max={10} step={0.1}
                 value={cur.cfg} onChange={v => patchActive({ cfg: v })} format={v => v.toFixed(1)} />
+          </div>
         </div>
 
-        <div className="knob-group">
+        <div className="knob-group g-var">
+          <div className="group-cap">VARIANTS</div>
+          <div className="knob-row">
           <div className="variant-cell">
             <Knob {...knobProps('variant')} label="Variant"
                   min={0} max={Math.max(0, activeVariants - 1)} step={1}
@@ -1622,15 +2138,36 @@ export default function LiveApp() {
               </label>
             </div>
           )}
+          </div>
         </div>
 
-        <div className="knob-group">
+        <div className="knob-group g-fb">
+          <div className="group-cap">FEEDBACK</div>
+          <div className="knob-row">
           <Knob {...knobProps('loopback')} label="Loopback" min={0} max={1} step={0.01}
                 value={cur.loopback} onChange={v => patchActive({ loopback: v })}
                 format={v => `${Math.round(v * 100)}%`} />
           <Knob {...knobProps('nudge')} label="Nudge" min={0} max={MAX_NUDGE} step={0.01}
                 value={cur.nudge} onChange={v => patchActive({ nudge: v })}
                 format={v => `${v.toFixed(2)}s`} />
+          </div>
+        </div>
+
+        {/* Output filters. Browser-side only, so they respond instantly and
+            cost nothing in generation time — sweep them mid-cycle. */}
+        <div className="knob-group g-outfx">
+          <div className="group-cap">OUTPUT FX</div>
+          <div className="knob-row">
+          <Knob {...knobProps('lpf')} label="LPF" min={0} max={1} step={0.005}
+                value={cur.lpf} onChange={v => patchActive({ lpf: v })}
+                format={v => (v >= 1 ? 'open' : hz(lpfHz(v)))} />
+          <Knob {...knobProps('hpf')} label="HPF" min={0} max={1} step={0.005}
+                value={cur.hpf} onChange={v => patchActive({ hpf: v })}
+                format={v => (v <= 0 ? 'open' : hz(hpfHz(v)))} />
+          <Knob {...knobProps('comb')} label="Comb" min={0} max={1} step={0.005}
+                value={cur.comb} onChange={v => patchActive({ comb: v })}
+                format={v => (v <= 0 ? 'off' : hz(combHz(v)))} />
+          </div>
         </div>
 
         {tracks.length > 1 && (
