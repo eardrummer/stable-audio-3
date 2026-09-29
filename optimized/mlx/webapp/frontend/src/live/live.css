@@ -523,6 +523,8 @@ html, body, #live-root {
   color: #8a8a8a;
 }
 
+/* Master actions — the whole rig, not one track. */
+.g-master { --g-bg: #150e0e; --g-line: #3a2525; --g-cap: #d98a8a; }
 /* Input side — the only group that runs before the model sees anything. */
 .g-infx  { --g-bg: #100d17; --g-line: #2b2240; --g-cap: #b98ad1; }
 /* How often the model is fed and how much it is given. */
@@ -859,6 +861,45 @@ html, body, #live-root {
    output track, so "selected" reads the same on both halves. */
 .in-section.active { box-shadow: inset 0 0 0 1px var(--src); }
 
+/* ── master actions: big enough to hit without looking ──────────── */
+.act-row { gap: 10px; align-items: stretch; }
+.act-btn {
+  width: 94px;
+  min-height: 62px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 8px 6px;
+  border: 1px solid var(--g-line);
+  border-radius: 6px;
+  background: #121010;
+  color: var(--fg);
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
+}
+.act-btn:hover:not(:disabled) { background: #1b1515; }
+.act-btn:active:not(:disabled) { background: #241b1b; }
+.act-btn:disabled { opacity: .35; cursor: not-allowed; }
+.act-name { font-size: 13px; font-weight: 700; letter-spacing: .1em; }
+.act-sub {
+  font-size: 8px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  text-align: center;
+}
+.act-bind { font-size: 8px; color: #6f9bdd; }
+/* Flush is the destructive one and Inject the constructive one; the rest of
+   the button stays quiet so the pair reads at a glance. */
+.act-btn.flush .act-name { color: #e8837a; }
+.act-btn.flush:hover:not(:disabled) { border-color: #7a3a33; }
+.act-btn.inject .act-name { color: #8ad18a; }
+.act-btn.inject:hover:not(:disabled) { border-color: #2f6f3a; }
+.act-btn.learning { border-style: dashed; border-color: rgba(59, 130, 246, .55); }
+.act-btn.armed { border-color: var(--learn); background: rgba(59, 130, 246, .12); }
+
 /* ── input pre-FX: the method picker sits beside its amount knob ─── */
 .fx-cell {
   display: flex;
@@ -912,6 +953,27 @@ html, body, #live-root {
 
 .in-tools { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .in-fader { display: flex; align-items: center; gap: 8px; font-size: 9px; }
+
+/* Names the effect whose before/after traces fill the band at the foot of the
+   canvas. Sits over the band, out of the waveform's way. */
+.fx-tag {
+  position: absolute;
+  left: 6px;
+  bottom: 5px;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--src) 45%, transparent);
+  border-radius: 3px;
+  background: rgba(0, 0, 0, .55);
+  font: 500 9px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--src);
+  pointer-events: none;
+}
+.fx-tag b { font-weight: 500; color: #e8e8e8; letter-spacing: .02em; text-transform: none; }
 .in-fader input[type=range] { flex: 1 1 auto; accent-color: var(--src); }
 
 /* ── patch nodes and cables ────────────────────────────────────── */

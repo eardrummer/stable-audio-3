@@ -293,6 +293,13 @@ mic / file / Strudel
                                                         backend snapshot
 ```
 
+While a method is engaged, the foot of that box's display turns into a band
+carrying two traces: the signal going into the effect as a ghost, and the signal
+coming out of it over the top. The gap between them is the effect itself — a
+smear spreads one transient into a swell, a scramble puts it somewhere else, a
+disperse rings on after it — so the picture distinguishes the methods without
+having to explain them. A tag in the corner names the method and its setting.
+
 Per box, not global: each input box carries its own `fxMethod` / `fxAmount`, so
 a mic can be washed out while a Live Code pattern stays sharp. The rack's Input
 FX group edits whichever box is selected — click a box to select it, the same

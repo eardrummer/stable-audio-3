@@ -212,6 +212,12 @@ class LiveSession:
         self._redecode_thread.start()
         self._send_json({"type": "started", "params": self.params})
 
+    def flush(self) -> None:
+        """Forget the last output, so loopback cannot feed the model audio the
+        performer has just silenced. Generation itself carries on."""
+        with self._lock:
+            self._last_output = None
+
     def stop(self) -> None:
         self.running = False
         self._wake.set()
@@ -548,6 +554,8 @@ def build_router(engine):
                         session.start()
                     elif kind == "stop":
                         session.stop()
+                    elif kind == "flush":
+                        session.flush()
                     elif kind == "params":
                         session.update_params(data.get("params", {}))
                     elif kind == "weights":

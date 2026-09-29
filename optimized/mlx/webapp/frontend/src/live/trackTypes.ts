@@ -223,6 +223,9 @@ export interface SourceInstance {
   /** File only, for display; the File object itself lives in a ref. */
   fileName?: string;
   fileDuration?: number;
+  /** File only: the segment that loops, in seconds. Absent means the whole
+   *  file. The recorded-take equivalent lives on the box's LoopSlot. */
+  fileTrim?: [number, number];
   /** Input pre-FX: which algorithm, and how much of it. This runs BEFORE the
    *  ring buffer, so it changes what the model conditions on, not just what
    *  you hear. See `src/live/inputfx/` and `analysis/input-prefx.md`. */

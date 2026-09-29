@@ -24,6 +24,8 @@ import {
 export interface TrackHandle {
   push(header: object, pcm: ArrayBuffer): void;
   begin(): void;
+  /** Silence what is sounding without ending the session. */
+  flush(): void;
   finish(): void;
   sendWeights(w: Float32Array, renorm: boolean): void;
 }
@@ -97,6 +99,8 @@ const LANE_GUTTER = 3;
  * is the whole reason to show it.
  */
 const LOOKAHEAD_FRAC = 1 / 3;
+/** How long Flush takes to reach silence. */
+const FLUSH_FADE = 0.03;
 /** Dimming over the not-yet-heard region. */
 const AHEAD_SCRIM = 'rgba(0, 0, 0, .55)';
 
@@ -676,6 +680,29 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
           loopback: p.loopback, selected_variant: p.variant,
         },
       }));
+    },
+    flush() {
+      // The backend forgets its own last output too, or Loopback would feed
+      // the model the very material just cut.
+      wsRef.current?.send(JSON.stringify({ type: 'flush' }));
+      const ctx = ctxRef.current;
+      if (ctx) {
+        const now = ctx.currentTime;
+        for (const v of voicesRef.current) {
+          v.gain.gain.cancelScheduledValues(now);
+          v.gain.gain.setValueAtTime(Math.max(v.gain.gain.value, 0.0001), now);
+          // Not an instant cut: stopping mid-waveform clicks, and 30 ms still
+          // reads as immediate.
+          v.gain.gain.exponentialRampToValueAtTime(0.0001, now + FLUSH_FADE);
+          v.src.stop(now + FLUSH_FADE + 0.02);
+          try { v.pre?.stop(now); } catch { /* already finished */ }
+        }
+        voicesRef.current = [];
+      }
+      // The Variant knob and the ALL toggle both re-voice from the cached
+      // cycle, so it has to go as well or a knob touch brings the audio back.
+      cycleRef.current = null;
+      setCycleInfo(null);
     },
     finish() {
       wsRef.current?.send(JSON.stringify({ type: 'stop' }));

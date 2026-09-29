@@ -25,6 +25,8 @@ interface Props {
   channelOptions: { value: string; label: string }[];
   /** Live Code renders its editor here instead of a waveform. */
   overlay?: ReactNode;
+  /** Names the input effect drawn in the band at the foot of the canvas. */
+  fxBadge?: ReactNode;
   tools?: ReactNode;
   canvasProps?: React.CanvasHTMLAttributes<HTMLCanvasElement>;
   patching?: boolean;
@@ -37,7 +39,7 @@ interface Props {
 
 export default function InputSection({
   src, onLevel, onChanSel, onRemove, onCanvas, onNode, onNodeDown,
-  channelOptions, overlay, tools, canvasProps, patching, connected, running,
+  channelOptions, overlay, fxBadge, tools, canvasProps, patching, connected, running,
   active, onActivate,
 }: Props) {
   const meta = SOURCE_META[src.kind];
@@ -76,6 +78,7 @@ export default function InputSection({
 
       <div className="in-body">
         <canvas ref={onCanvas} width={900} height={200} className="in-canvas" {...canvasProps} />
+        {fxBadge && <span className="fx-tag">{fxBadge}</span>}
         {overlay}
       </div>
 

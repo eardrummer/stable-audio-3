@@ -30,6 +30,11 @@ interface SourceNodes {
   analyser: AnalyserNode;
   /** Mic boxes only: kept so the channel pick can be rewired live. */
   merger?: ChannelMergerNode;
+  /** Taps either side of the pre-FX chain, so a box can show what the model is
+   *  being fed against what went in. Both are post-fader, so the only
+   *  difference between them is the effect itself. */
+  fxIn?: AnalyserNode;
+  fxOut?: AnalyserNode;
   /** Mic: the hardware feed and this box's own loop share the box's fader. */
   liveGain?: GainNode;
   loopGain?: GainNode;
@@ -495,6 +500,15 @@ export default function LiveApp() {
     else if (id === 'spread') {
       patchActive({ spread: Number((SPREAD_MIN + norm * (SPREAD_MAX - SPREAD_MIN)).toFixed(3)) });
     }
+    // Momentary: fire once as the control crosses halfway, so a pad, a
+    // footswitch or a fader all work and holding one down does not repeat.
+    else if (id === 'flush' || id === 'inject') {
+      const down = norm >= 0.5;
+      if (down && !triggersRef.current[id]) {
+        (id === 'flush' ? actionsRef.current.flush : actionsRef.current.inject)();
+      }
+      triggersRef.current[id] = down;
+    }
     else if (id === 'fxAmount') {
       const sid = activeSrcRef.current ?? sourcesRef.current[0]?.id;
       if (sid) patchSource(sid, { fxAmount: Number(norm.toFixed(3)) });
@@ -508,6 +522,9 @@ export default function LiveApp() {
       patchTrack(t, { outputMonitor: Number(norm.toFixed(2)) });
     }
   }, [patchActive, patchTrack]);
+
+  /** Which momentary bindings are currently held, for edge detection. */
+  const triggersRef = useRef<Record<string, boolean>>({});
 
   const bindingLabel = (id: string) => {
     const b = bindings[id];
@@ -563,25 +580,66 @@ export default function LiveApp() {
   // ─────────────────────────────────────────────────────────────────────
   // Canvas render loop: input waveform (left) + output spectrogram (right)
   // ─────────────────────────────────────────────────────────────────────
+  /**
+   * The strip along the bottom of a box whose input effect is engaged: the
+   * signal going into the effect as a ghost, the signal coming out over it.
+   * The gap between the two IS the effect — a smear spreads one transient into
+   * a swell, a scramble puts it somewhere else entirely, a disperse rings on
+   * after it — so this reads without having to label what each one does.
+   */
+  const drawFxBand = useCallback((
+    inst: SourceInstance, g: CanvasRenderingContext2D,
+    w: number, h: number, bandH: number,
+  ) => {
+    const n = srcNodesRef.current[inst.id];
+    if (!n?.fxOut) return;
+    const top = h - bandH, midY = top + bandH / 2, amp = bandH / 2 - 4;
+    g.fillStyle = 'rgba(0,0,0,.5)';
+    g.fillRect(0, top, w, bandH);
+    g.fillStyle = 'rgba(255,255,255,.12)';
+    g.fillRect(0, top, w, 1);
+    const trace = (an: AnalyserNode, stroke: string, lw: number) => {
+      const d = new Uint8Array(an.fftSize);
+      an.getByteTimeDomainData(d);
+      g.strokeStyle = stroke;
+      g.lineWidth = lw;
+      g.beginPath();
+      for (let i = 0; i < d.length; i++) {
+        const x = (i / d.length) * w;
+        const y = midY + (d[i] / 128 - 1) * amp;
+        i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+      }
+      g.stroke();
+    };
+    if (n.fxIn) trace(n.fxIn, 'rgba(255,255,255,.22)', 1.5);
+    trace(n.fxOut, SOURCE_META[inst.kind].accent, 2.5);
+  }, []);
+
   useEffect(() => {
     const tick = () => {
       rafRef.current = requestAnimationFrame(tick);
 
       // One scope per enabled source. A Live Input's canvas switches to its own
-      // recorded take (with trim handles) once one exists; a File Loop shows
-      // the imported file the same way, minus the handles.
+      // recorded take once one exists, and a File Loop shows the file it
+      // imported; both carry a handle at each end of the loop.
       for (const inst of sourcesRef.current) {
         const id = inst.id;
         const wc = srcCanvasRefs.current[id];
         if (!wc) continue;
         const ctx2 = wc.getContext('2d');
         if (!ctx2) continue;
-        const w = wc.width, h = wc.height, mid = h / 2;
-
-        // Both a recorded take and an imported file draw as a waveform with a
-        // playhead; only the mic's version has trim handles.
+        const w = wc.width, h = wc.height;
         const accent = SOURCE_META[inst.kind].accent;
         const c2 = inCtxRef.current;
+        ctx2.clearRect(0, 0, w, h);
+
+        // An engaged input effect claims a band along the bottom; everything
+        // else draws in the height above it. Only once the graph exists,
+        // though — before the transport starts there is nothing to show, and a
+        // blank strip would just squash the waveform.
+        const bandH = inst.fxAmount > 0 && srcNodesRef.current[id]?.fxOut
+          ? Math.max(40, Math.round(h * 0.34)) : 0;
+        const vh = h - bandH, mid = vh / 2;
         let view: {
           peaks: Float32Array; len: number; t0: number; t1: number; pos: number | null;
         } | null = null;
@@ -603,23 +661,24 @@ export default function LiveApp() {
           const len = inst.fileDuration ?? 0;
           if (fp && len > 0) {
             const n = srcNodesRef.current[id];
+            const [t0, t1] = inst.fileTrim ?? [0, len];
+            const span = Math.max(0.05, t1 - t0);
             view = {
-              peaks: fp, len, t0: 0, t1: len,
+              peaks: fp, len, t0, t1,
               pos: n?.fileSrc && c2
-                ? (c2.currentTime - (n.fileStartedAt ?? 0)) % len : null,
+                ? t0 + ((c2.currentTime - (n.fileStartedAt ?? 0)) % span) : null,
             };
           }
         }
 
         if (view) {
           const { peaks, len, t0, t1, pos } = view;
-          ctx2.clearRect(0, 0, w, h);
           const x0 = (t0 / len) * w, x1 = (t1 / len) * w;
           // Outside the trim is dimmed rather than hidden, so you can see what
           // you cropped off and drag it back.
           ctx2.fillStyle = 'rgba(0,0,0,.45)';
-          ctx2.fillRect(0, 0, x0, h);
-          ctx2.fillRect(x1, 0, w - x1, h);
+          ctx2.fillRect(0, 0, x0, vh);
+          ctx2.fillRect(x1, 0, w - x1, vh);
           for (let c = 0; c < peaks.length; c++) {
             const x = (c / peaks.length) * w;
             const inTrim = x >= x0 && x <= x1;
@@ -627,32 +686,31 @@ export default function LiveApp() {
             const amp = Math.max(1, peaks[c] * mid);
             ctx2.fillRect(x, mid - amp, Math.max(1, w / peaks.length), amp * 2);
           }
-          if (inst.kind === 'mic') {
-            ctx2.fillStyle = accent;
-            ctx2.fillRect(x0 - 1, 0, 3, h);
-            ctx2.fillRect(x1 - 1, 0, 3, h);
-          }
+          ctx2.fillStyle = accent;
+          ctx2.fillRect(x0 - 1, 0, 3, vh);
+          ctx2.fillRect(x1 - 1, 0, 3, vh);
           if (pos !== null) {
             ctx2.fillStyle = accent;
-            ctx2.fillRect((pos / len) * w, 0, 2, h);
+            ctx2.fillRect((pos / len) * w, 0, 2, vh);
           }
-          continue;
+        } else {
+          const an = srcNodesRef.current[id]?.analyser;
+          if (an) {
+            const data = new Uint8Array(an.fftSize);
+            an.getByteTimeDomainData(data);
+            ctx2.strokeStyle = accent;
+            ctx2.lineWidth = 1.5;
+            ctx2.beginPath();
+            for (let i = 0; i < data.length; i++) {
+              const x = (i / data.length) * w;
+              const y = (data[i] / 128 - 1) * mid + mid;
+              i === 0 ? ctx2.moveTo(x, y) : ctx2.lineTo(x, y);
+            }
+            ctx2.stroke();
+          }
         }
 
-        const an = srcNodesRef.current[id]?.analyser;
-        ctx2.clearRect(0, 0, w, h);
-        if (!an) continue;
-        const data = new Uint8Array(an.fftSize);
-        an.getByteTimeDomainData(data);
-        ctx2.strokeStyle = accent;
-        ctx2.lineWidth = 1.5;
-        ctx2.beginPath();
-        for (let i = 0; i < data.length; i++) {
-          const x = (i / data.length) * w;
-          const y = (data[i] / 128 - 1) * mid + mid;
-          i === 0 ? ctx2.moveTo(x, y) : ctx2.lineTo(x, y);
-        }
-        ctx2.stroke();
+        if (bandH) drawFxBand(inst, ctx2, w, h, bandH);
       }
 
       // Noise texture across the whole input side. It sits behind the waveform
@@ -783,6 +841,46 @@ export default function LiveApp() {
       );
     });
   }, []);
+
+  /**
+   * Arm the generation clock. Every cycle from here counts off `delayMs`, so
+   * Inject re-phases the whole loop simply by calling this again.
+   */
+  const scheduleCycles = useCallback((delayMs: number) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(function fire() {
+      if (!runningRef.current) return;
+      pushSnapshot();
+      timerRef.current = window.setTimeout(fire, paramsRef.current.generateRate * 1000);
+    }, delayMs);
+  }, [pushSnapshot]);
+
+  // ── master actions ───────────────────────────────────────────────────
+  // Global by design: these always mean every track, whatever MASTER is set
+  // to, because that is what makes them usable as a panic and a cue.
+
+  /** Silence every track at once, and have each session forget its own last
+   *  output so Loopback cannot bring back what was just cut. */
+  const flushAll = useCallback(() => {
+    for (const t of trackRefs.current) t?.flush();
+  }, []);
+
+  /**
+   * Generate now from the last Input Rate of audio, the window ending at this
+   * instant, and re-phase the cycle clock to the press. The ring is already
+   * holding that audio, so nothing is waited for; what is playing keeps
+   * playing until the new clip crossfades in.
+   */
+  const injectNow = useCallback(() => {
+    if (!runningRef.current) return;
+    pushSnapshot();
+    scheduleCycles(paramsRef.current.generateRate * 1000);
+  }, [pushSnapshot, scheduleCycles]);
+
+  // MIDI reaches these through a ref: applyMidi is defined further up, and a
+  // dependency array is evaluated during render, before these exist.
+  const actionsRef = useRef({ flush: flushAll, inject: injectNow });
+  useEffect(() => { actionsRef.current = { flush: flushAll, inject: injectNow }; }, [flushAll, injectNow]);
 
   const [isStarting, setIsStarting] = useState(false);
 
@@ -925,19 +1023,33 @@ export default function LiveApp() {
   // ── file loop transport ──────────────────────────────────────────────
   /** A file box is a loop, not a one-shot: playback always wraps. A buffer
    *  source cannot be restarted, so each PLAY builds a fresh one. */
+  /** The segment of a file box that loops: its handles, clamped to the buffer. */
+  const fileSpan = (srcId: string, dur: number): [number, number] => {
+    const inst = sourcesRef.current.find(x => x.id === srcId);
+    const [a, b] = inst?.fileTrim ?? [0, dur];
+    const t0 = Math.max(0, Math.min(a, dur - 0.05));
+    return [t0, Math.min(dur, Math.max(t0 + 0.05, b))];
+  };
+
   const playFile = useCallback((srcId: string, offset = 0) => {
     const ctx = inCtxRef.current;
     const n = srcNodesRef.current[srcId];
     if (!ctx || !n?.fileBuf || !n.fileGain) return;
     try { n.fileSrc?.stop(); } catch { /* not started */ }
+    const dur = n.fileBuf.duration;
+    const [t0, t1] = fileSpan(srcId, dur);
     const src = ctx.createBufferSource();
     src.buffer = n.fileBuf;
+    // Loop between the handles rather than over the whole file.
     src.loop = true;
+    src.loopStart = t0;
+    src.loopEnd = t1;
     src.connect(n.fileGain);
-    const at = offset % n.fileBuf.duration;
-    src.start(0, at);
+    const into = offset % (t1 - t0);
+    src.start(0, t0 + into);
     n.fileSrc = src;
-    n.fileStartedAt = ctx.currentTime - at;
+    // Measured from the loop's start, so the playhead is t0 + elapsed % span.
+    n.fileStartedAt = ctx.currentTime - into;
     setFilePlaying(m => ({ ...m, [srcId]: true }));
   }, []);
 
@@ -947,6 +1059,20 @@ export default function LiveApp() {
     if (n) n.fileSrc = null;
     setFilePlaying(m => ({ ...m, [srcId]: false }));
   }, []);
+
+  // Dragging a File Loop's handles re-aims the loop without restarting it, the
+  // same way the recorded take's handles do.
+  const fileTrimKey = sources.map(x => `${x.id}:${x.fileTrim?.join() ?? ''}`).join('|');
+  useEffect(() => {
+    for (const inst of sourcesRef.current) {
+      const n = srcNodesRef.current[inst.id];
+      if (inst.kind !== 'file' || !n?.fileSrc || !n.fileBuf) continue;
+      const [t0, t1] = fileSpan(inst.id, n.fileBuf.duration);
+      n.fileSrc.loopStart = t0;
+      n.fileSrc.loopEnd = t1;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fileTrimKey]);
 
 
   /** Load an audio file to stand in for the live feed while testing. */
@@ -968,7 +1094,11 @@ export default function LiveApp() {
         filePeaksRef.current[target] = peaksOf(buf);
         const n = srcNodesRef.current[target];
         if (n) { n.fileBuf = undefined; n.fileSrc = null; }
-        patchSource(target, { fileName: file.name, fileDuration: buf.duration });
+        patchSource(target, {
+          fileName: file.name,
+          fileDuration: buf.duration,
+          fileTrim: [0, buf.duration],   // a new file starts untrimmed
+        });
       }
       // A file can't feed back into the mic, so make it audible by default —
       // unlike the hardware input, which stays muted until you ask for it.
@@ -1075,12 +1205,19 @@ export default function LiveApp() {
     fx.setTempo(bpmRef.current);
     gain.connect(fx.input);
 
+    const fxIn = ctx.createAnalyser();
+    fxIn.fftSize = 2048;
+    gain.connect(fxIn);
+    const fxOut = ctx.createAnalyser();
+    fxOut.fftSize = 2048;
+    fx.output.connect(fxOut);
+
     // Display tap is PRE-fader, so a box stays visible at level 0.
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 2048;
     head.connect(analyser);
 
-    return { head, gain, out: fx.output, fx, analyser, merger: micMerger, ...extra };
+    return { head, gain, out: fx.output, fx, fxIn, fxOut, analyser, merger: micMerger, ...extra };
   };
 
 
@@ -1163,17 +1300,23 @@ export default function LiveApp() {
       const fileBoxes = active.filter(x => x.kind === 'file' && built[x.id]);
       // Only with a single file box is it clear what the window should hold;
       // two files mixed into one track would seed it with the wrong audio.
-      const fbuf = fileBoxes.length === 1 ? built[fileBoxes[0].id].fileBuf : undefined;
-      if (fbuf) {
-        const seedLen = Math.min(Math.floor(effInputRate * ctx.sampleRate), fbuf.length);
+      const fbox = fileBoxes.length === 1 ? fileBoxes[0] : undefined;
+      const fbuf = fbox ? built[fbox.id].fileBuf : undefined;
+      if (fbox && fbuf) {
+        // Seed from the loop's start, not the file's: the trimmed segment is
+        // what is about to play.
+        const [ft0, ft1] = fileSpan(fbox.id, fbuf.duration);
+        const from = Math.floor(ft0 * ctx.sampleRate);
+        const span = Math.floor((ft1 - ft0) * ctx.sampleRate);
+        const seedLen = Math.min(Math.floor(effInputRate * ctx.sampleRate), span);
         const Lc = fbuf.getChannelData(0);
         const Rc = fbuf.numberOfChannels > 1 ? fbuf.getChannelData(1) : Lc;
         rings.forEach((ring, ti) => {
           const only = active.length === 1 ||
             active.every(x => x.kind === 'file' || !x.to[ti]);
           if (!only) return;
-          ring.l.set(Lc.subarray(0, seedLen), 0);
-          ring.r.set(Rc.subarray(0, seedLen), 0);
+          ring.l.set(Lc.subarray(from, from + seedLen), 0);
+          ring.r.set(Rc.subarray(from, from + seedLen), 0);
           ring.w = seedLen % cap;
           ring.filled = seedLen;
           seeded = true;
@@ -1217,12 +1360,7 @@ export default function LiveApp() {
 
       setStatus(seeded ? 'Generating first cycle…'
                        : `Filling ${firstRate.toFixed(1)}s buffer…`);
-      const firstDelay = seeded ? 120 : firstRate * 1000;
-      timerRef.current = window.setTimeout(function fire() {
-        if (!runningRef.current) return;
-        pushSnapshot();
-        timerRef.current = window.setTimeout(fire, paramsRef.current.generateRate * 1000);
-      }, firstDelay);
+      scheduleCycles(seeded ? 120 : firstRate * 1000);
     } catch (e: any) {
       setIsStarting(false);
       setError(e.message || 'Could not open the audio input');
@@ -1283,26 +1421,38 @@ export default function LiveApp() {
 
   useEffect(() => () => { stop(); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
 
-  const loopVisible = (id: string) => {
-    const st = slotOf(id).state;
-    return st === 'stopped' || st === 'playing';
+  /**
+   * What a box's trim handles act on, or null when it has nothing to trim yet.
+   * A Live Input trims the take it recorded; a File Loop trims the file it
+   * imported. Both loop between the handles, so the gesture is the same.
+   */
+  const trimTarget = (inst: SourceInstance): { len: number; trim: [number, number] } | null => {
+    if (inst.kind === 'mic') {
+      const sl = slotOf(inst.id);
+      const showing = sl.state === 'stopped' || sl.state === 'playing';
+      return showing && sl.len ? { len: sl.len, trim: sl.trim } : null;
+    }
+    if (inst.kind === 'file') {
+      const len = inst.fileDuration ?? 0;
+      return len > 0 ? { len, trim: inst.fileTrim ?? [0, len] } : null;
+    }
+    return null;
   };
-  const posToTime = (id: string, e: React.PointerEvent) => {
-    const len = slotOf(id).len;
+  const posToTime = (len: number, e: React.PointerEvent) => {
     const r = (e.target as HTMLCanvasElement).getBoundingClientRect();
     return Math.max(0, Math.min(len, ((e.clientX - r.left) / r.width) * len));
   };
-  const applyTrim = (id: string, at: number) => {
+  const applyTrim = (inst: SourceInstance, at: number) => {
     const d = dragHandleRef.current;
-    if (!d || d.id !== id) return;
-    setLoops(m => {
-      const sl = m[id] ?? IDLE_SLOT;
-      const [a, b] = sl.trim;
-      const trim: [number, number] = d.h === 0
-        ? [Math.min(at, b - 0.05), b]
-        : [a, Math.max(at, a + 0.05)];
-      return { ...m, [id]: { ...sl, trim } };
-    });
+    const t = trimTarget(inst);
+    if (!d || d.id !== inst.id || !t) return;
+    const [a, b] = t.trim;
+    // Never let the handles cross; a loop shorter than 50 ms is a click.
+    const trim: [number, number] = d.h === 0
+      ? [Math.min(at, b - 0.05), b]
+      : [a, Math.max(at, a + 0.05)];
+    if (inst.kind === 'file') patchSource(inst.id, { fileTrim: trim });
+    else setLoops(m => ({ ...m, [inst.id]: { ...(m[inst.id] ?? IDLE_SLOT), trim } }));
   };
 
   // ── the draggable divider between the two halves ─────────────────────
@@ -1614,28 +1764,32 @@ export default function LiveApp() {
       onCanvas={(el) => { srcCanvasRefs.current[inst.id] = el; }}
       onNode={(el) => { srcNodeEls.current[inst.id] = el; }}
       onNodeDown={(e) => beginPatch(inst.id, e)}
-      canvasProps={inst.kind === 'mic' ? {
-        style: { cursor: loopVisible(inst.id) ? 'ew-resize' : 'default' },
+      canvasProps={inst.kind === 'code' ? undefined : {
+        style: { cursor: trimTarget(inst) ? 'ew-resize' : 'default' },
         onPointerDown: (e) => {
-          const sl = slotOf(inst.id);
-          if (!loopVisible(inst.id) || !sl.len) return;
+          const t = trimTarget(inst);
+          if (!t) return;
           (e.target as Element).setPointerCapture(e.pointerId);
-          const at = posToTime(inst.id, e);
-          const [t0, t1] = sl.trim;
+          const at = posToTime(t.len, e);
+          // Grab whichever handle is nearer the click.
           dragHandleRef.current = {
             id: inst.id,
-            h: Math.abs(at - t0) <= Math.abs(at - t1) ? 0 : 1,
+            h: Math.abs(at - t.trim[0]) <= Math.abs(at - t.trim[1]) ? 0 : 1,
           };
-          applyTrim(inst.id, at);
+          applyTrim(inst, at);
         },
         onPointerMove: (e) => {
-          if (dragHandleRef.current) applyTrim(inst.id, posToTime(inst.id, e));
+          const t = trimTarget(inst);
+          if (t && dragHandleRef.current) applyTrim(inst, posToTime(t.len, e));
         },
         onPointerUp: (e) => {
           dragHandleRef.current = null;
           try { (e.target as Element).releasePointerCapture(e.pointerId); } catch { /* done */ }
         },
-      } : undefined}
+      }}
+      fxBadge={inst.fxAmount > 0
+        ? <>{fxMethod(inst.fxMethod).label}<b>{fxMethod(inst.fxMethod).format(inst.fxAmount)}</b></>
+        : undefined}
       overlay={inst.kind === 'code' ? (
         <StrudelPanel
           ref={strudelPanelRef}
@@ -1702,11 +1856,18 @@ export default function LiveApp() {
                         title={running ? 'Loop this file' : 'Start the transport first'}>
                   <Play size={10} /> PLAY
                 </button>}
-            {inst.fileName && (
-              <span className="tools-meta" title={inst.fileName}>
-                {inst.fileName} · {inst.fileDuration?.toFixed(1)}s
-              </span>
-            )}
+            {inst.fileName && (() => {
+              const len = inst.fileDuration ?? 0;
+              const [t0, t1] = inst.fileTrim ?? [0, len];
+              const cropped = len - (t1 - t0) > 0.01;
+              return (
+                <span className="tools-meta" title={inst.fileName}>
+                  {inst.fileName} · {cropped
+                    ? `loop ${(t1 - t0).toFixed(2)}s of ${len.toFixed(2)}s`
+                    : `${len.toFixed(2)}s`} · drag edges to trim
+                </span>
+              );
+            })()}
           </div>
         ) : undefined
       }
@@ -2027,7 +2188,35 @@ export default function LiveApp() {
           {tempoOn && !bpm && <div className="tempo-warn">no tempo yet — using seconds</div>}
         </div>
 
-        {/* Input pre-FX leads the rack because it is the only group that runs
+        {/* Master actions, left of everything, because they act on the whole
+            rig rather than on one track or one box. */}
+        <div className="knob-group g-master">
+          <div className="group-cap">MASTER</div>
+          <div className="knob-row act-row">
+            <button
+              className={`act-btn flush ${midiLearn ? 'learning' : ''} ${armed === 'flush' ? 'armed' : ''}`}
+              onClick={() => (midiLearn ? arm('flush') : flushAll())}
+              disabled={!running && !midiLearn}
+              title="Silence every track now, and have each one forget its own last output so Loopback cannot bring it back"
+            >
+              <span className="act-name">FLUSH</span>
+              <span className="act-sub">silence all</span>
+              {bindingLabel('flush') && <span className="act-bind">{bindingLabel('flush')}</span>}
+            </button>
+            <button
+              className={`act-btn inject ${midiLearn ? 'learning' : ''} ${armed === 'inject' ? 'armed' : ''}`}
+              onClick={() => (midiLearn ? arm('inject') : injectNow())}
+              disabled={!running && !midiLearn}
+              title="Generate now from the last Input Rate of audio, the window ending at this instant, and re-phase the cycle clock to the press"
+            >
+              <span className="act-name">INJECT</span>
+              <span className="act-sub">generate now</span>
+              {bindingLabel('inject') && <span className="act-bind">{bindingLabel('inject')}</span>}
+            </button>
+          </div>
+        </div>
+
+        {/* Input pre-FX leads the knobs because it is the only group that runs
             BEFORE the ring buffer: it changes what the model conditions on,
             not just what you hear. Left to right, the row now follows the
             signal — input, rate, generation, variants, feedback, output. */}
@@ -2176,8 +2365,10 @@ export default function LiveApp() {
             onClick={() => setMasterMode(v => !v)}
             title="Apply knob and MIDI changes to every track at once"
           >
-            <span>MASTER</span>
-            <span className="master-sub">{masterMode ? 'all tracks' : `track ${activeTab + 1}`}</span>
+            <span>ALL TRACKS</span>
+            <span className="master-sub">
+              {masterMode ? 'knobs → every track' : `knobs → track ${activeTab + 1}`}
+            </span>
           </button>
         )}
       </footer>
