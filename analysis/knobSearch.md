@@ -139,7 +139,7 @@ most important control from a scalar into a gesture.
 | Surface | Current state | Opportunity |
 | :--- | :--- | :--- |
 | `apg` (Adaptive Projected Guidance) | real engine parameter, **hardcoded to 1.0** in [`live.py:258`](../optimized/mlx/webapp/backend/live.py) | expose it — zero implementation cost |
-| `anchor_logsnr = -6.2`, `logsnr_end = 2.0` | hardcoded in [`sa3_pipeline.py:75`](../optimized/mlx/models/defs/sa3_pipeline.py) | decides *where steps land* in noise space; reallocates effort between structure and detail at **fixed compute** |
+| `anchor_logsnr = -6.2`, `logsnr_end = 2.0` | hardcoded in [`sa3_pipeline.py:75`](../optimized/mlx/models/defs/sa3_pipeline.py) | decides *where steps land* in noise space; reallocates effort between structure and detail at **fixed compute**. Built and measured since — see **Part III**, which also reports that this warp leaves the schedule non-monotonic at every σmax below 1.0 |
 | Ping-pong churn | fixed by the schedule: `x = (1-t_next)·denoised + t_next·noise` ([`sa3_pipeline.py:132`](../optimized/mlx/models/defs/sa3_pipeline.py)) | scale the injected noise independently — a texture/variation control nothing else provides |
 | CFG trajectory | constant across steps | ramp it (high early, low late) for a markedly different character |
 | Unconditional branch | `mx.zeros_like(cross_attn)` when no negative prompt ([`engine.py:316`](../optimized/mlx/webapp/backend/engine.py)) | the padding embedding, not zeros, is what makes an empty prompt behave; worth an A/B since the studio defaults to `cfg = 4.0` |
@@ -374,3 +374,131 @@ only a cheap blend remains, well inside the live loop's budget.
    the manifold projector, for free.
 3. **In parallel, run (D)** as the baseline, so we know what any fancier method must beat.
 4. Only then consider (B) or (C), which are genuine projects rather than knobs.
+
+---
+
+# Part III — Sampling-Schedule Notes (tried, measured, parked)
+
+Written after building the schedule-tilt knob of §5, measuring it, and taking it
+back out again. The knob is gone from the rack; the findings are the point.
+
+## III.1 σmax is not a separate control — it is the Noise knob
+
+Worth stating plainly, because the documentation invites the opposite
+conclusion. In this pipeline one value feeds both places σmax is used:
+
+```python
+# engine.py:385  — the schedule's starting point
+sigmas = build_pingpong_schedule(steps, sigma_max=init_noise_level, use_logsnr_shift=True)
+# engine.py:402  — the init/noise mix
+noise = init_latents * (1.0 - init_noise_level) + pure_noise * init_noise_level
+```
+
+The reference implementation agrees at
+[`sampling.py:455`](../stable_audio_3/inference/sampling.py):
+`sigma_max = init_noise_level if init_data is not None else 1.0`. The MLX CLI
+says it outright at [`sa3_mlx.py:491`](../optimized/mlx/scripts/sa3_mlx.py):
+*"σmax is always taken from `--init-noise-level`, regardless of mode. The mode
+only changes how σmax is used."* The live app already exposes it as **Noise**
+([`live.py:390`](../optimized/mlx/webapp/backend/live.py)).
+
+**Range: 0.01 – 1.0.** The ceiling is 1.0 because SA3 is a rectified-flow
+denoiser; Gradio hard-codes `sigma_max_max = 1.0` for both `is_rf` and
+`is_rf_denoiser` ([`diffusion_cond.py:353`](../stable_audio_3/interface/diffusion_cond.py)).
+The floor is `MIN_SIGMA = 0.01`, and the CLI's own error says why: *"the
+rf_denoiser model is undefined at t≈0; below 0.01 the schedule collapses and the
+model emits NaN."* The live app currently clamps to 0.05 – 1.0.
+
+If you have seen **0 – 1000, default 100** described as the sigma-max range:
+that is the v-diffusion / k-diffusion branch (`dpmpp-*`, `k-heun`, `v-ddim`).
+SA3 has no such sampler — only pingpong — and `sampling.py` explicitly *pops*
+`sigma_max` out of the sampler kwargs for RF objectives. That slider does
+nothing on this model.
+
+## III.2 The schedule is non-monotonic whenever σmax < 1
+
+**This is the finding that matters, and it is live right now.**
+
+`logsnr_shift` documents itself as mapping `t ∈ [0,1]`, and clamps its endpoints
+at 0 and 1. But `build_pingpong_schedule` hands it the raw schedule, which runs
+from σmax down to 0. When σmax < 1 the sigmoid maps those values *upward*, and
+re-anchoring index 0 back to σmax leaves a schedule that climbs before it falls.
+At the live app's default Noise of 0.35, 8 steps:
+
+```
+0.350  0.625  0.538  0.449  0.362  0.284  0.217  0.162  0.000
+       ^^^^^ nearly double the noise that was asked for
+```
+
+So the Noise knob is partly overridden after step 0, and **every live generation
+to date has run a schedule shaped like this**, since Noise defaults to 0.35 and
+the variant ladder sits at 0.35 – 0.43.
+
+Monotonic at σmax = 1.0; broken at every σmax below it (measured at 0.60 and
+0.35, and the algebra says all of them).
+
+**This is upstream behaviour, not a porting bug.** The reference
+[`LogSNRShift.shift`](../stable_audio_3/inference/distribution_shift.py) says
+*"Transform t∈[0,1]"*, clamps at 0 and 1, and `build_schedule` feeds it the same
+unnormalised `linspace(sigma_max, 0, n)` before forcing `t[0] = sigma_max`. The
+MLX port is faithful.
+
+The candidate fix is one line — normalise `t` by σmax before the warp, then
+scale back — but it changes the sound of every generation and diverges from the
+reference model. **Do not apply it silently.** It wants an A/B behind a switch,
+and an ear.
+
+## III.3 Schedule tilt: measured, and how to put it back
+
+`anchor_logsnr` is the warp's high-t bound and the one number deciding how the
+steps are *distributed* between σmax and 0 — as opposed to σmax, which says
+where they start. Measured at 8 steps, σmax = 1.0 (the only regime where the
+warp is well defined, per III.2):
+
+| anchor | steps in the high-noise half | steps that don't move (Δσ < 0.005) |
+| :--- | :--- | :--- |
+| −2.0 | 4/8 — effectively the unwarped linear schedule | 0 |
+| −3.0 | 5/8 | 0 |
+| −5.0 | 6/8 | 0 |
+| **−6.2** (model default) | 6/8 | 0 |
+| −7.0 | 6/8 | 1 |
+| −8.0 | 6/8 | 2 |
+| −10.0 | 7/8 | 3 |
+| −16.0 | 7/8 | 4 |
+
+So the usable span is roughly **−2 to −8**: past −7 the top of the schedule
+saturates and consecutive steps land on the same σ, spending compute on nothing.
+The model's default sits right at that edge. Note the dead-step count depends on
+`steps`; at 16 steps the saturation arrives later.
+
+Re-adding it took one parameter threaded through four layers, each defaulting to
+current behaviour so nothing changes until the knob moves:
+
+```
+Knob (0..1) → tiltAnchor() → schedule_anchor (params) → engine.generate()
+            → build_pingpong_schedule(anchor_logsnr=) → logsnr_shift()
+```
+
+with `tiltAnchor(v) = -2 - 6v`, putting the model default at knob 0.70, and a
+backend clamp of `(-8.0, -2.0)`. Reading the knob out as the raw anchor rather
+than an invented unit is what made it checkable against the schedule.
+
+**Why it was parked:** its effect is entangled with III.2 at any normal Noise
+setting. Testing it honestly means either running at Noise = 1.0, or settling
+the normalisation question first. Settle III.2, then this knob becomes
+measurable — and probably worth having, because at 8 steps the structure/detail
+split is a large lever at fixed compute.
+
+## III.4 What to explore next, in order
+
+1. **Settle III.2.** Put the normalisation behind a flag, generate the same seed
+   and input both ways at Noise 0.35, and listen. Everything else in this part
+   is downstream of the answer, and it is currently affecting all output.
+2. **`apg` — still hardcoded to 1.0** (§5). The cheapest real knob left: a live
+   parameter the engine already accepts, no plumbing beyond the rack.
+3. **Ping-pong churn scale** (§5). Scale the re-injected noise independently of
+   the schedule. Nothing else in the rack offers that texture control, and it is
+   a small change to `sample_flow_pingpong`.
+4. **Schedule tilt**, once (1) is decided, with the range and wiring above.
+5. **CFG trajectory** (§5). Ramping CFG across steps is a bigger change than the
+   others and should wait until the cheap surfaces are exhausted.
