@@ -508,7 +508,63 @@ class MidiBridge:
             s._send_json(payload)
 
 
+# The remembered control surface: which port to reopen, and what the learned
+# CCs are bound to. Kept here rather than in the browser because localStorage
+# is per-origin — opening the app at 127.0.0.1 instead of localhost, or in
+# another browser, is a different store and looks exactly like a lost mapping.
+MIDI_MAP_FILE = Path(__file__).resolve().parent / "midi_map.json"
+
+
+def load_midi_map() -> dict:
+    """{"port": name or None, "bindings": {id: {channel, control}}}."""
+    try:
+        with open(MIDI_MAP_FILE) as f:
+            d = json.load(f)
+        return {
+            "port": d.get("port") or None,
+            "bindings": d.get("bindings") or {},
+        }
+    except FileNotFoundError:
+        return {"port": None, "bindings": {}}
+    except Exception as e:
+        # A corrupt file must not take the app down with it.
+        print(f"[Live] MIDI map unreadable, starting empty: {e}")
+        return {"port": None, "bindings": {}}
+
+
+def save_midi_map(**changes) -> dict:
+    """Merge `changes` into the stored map and write it back."""
+    cur = load_midi_map()
+    cur.update({k: v for k, v in changes.items() if v is not None})
+    tmp = MIDI_MAP_FILE.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(cur, f, indent=2)
+        tmp.replace(MIDI_MAP_FILE)      # atomic, so a crash cannot truncate it
+    except Exception as e:
+        print(f"[Live] could not write the MIDI map: {e}")
+    return cur
+
+
 midi_bridge = MidiBridge()
+
+
+def restore_midi_port() -> str | None:
+    """Reopen the remembered port at startup. Only if it is actually present:
+    a name that is gone means the surface is unplugged, and guessing another
+    port would silently bind the knobs to the wrong device."""
+    name = load_midi_map()["port"]
+    if not name:
+        return None
+    ports = MidiBridge.list_ports()
+    if name not in ports:
+        print(f"[Live] remembered MIDI port not connected: {name!r} (have {ports})")
+        return None
+    try:
+        return midi_bridge.open(name)
+    except Exception as e:
+        print(f"[Live] could not reopen {name!r}: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -516,6 +572,23 @@ midi_bridge = MidiBridge()
 # ─────────────────────────────────────────────────────────────────────────
 
 def build_router(engine):
+    # build_router is called once, as the app starts.
+    restore_midi_port()
+
+    @router.get("/api/live/midi_map")
+    def get_midi_map():
+        return load_midi_map()
+
+    @router.post("/api/live/midi_map")
+    def post_midi_map(body: dict):
+        """Save the learned bindings. The browser is the editor; this is only
+        the filing cabinet, so the whole set is replaced rather than merged —
+        otherwise an unlearned control could never be removed."""
+        b = body.get("bindings")
+        if not isinstance(b, dict):
+            return {"status": "error", "error": "bindings must be an object"}
+        return {"status": "ok", **save_midi_map(bindings=b)}
+
     @router.get("/api/live/midi_ports")
     def midi_ports():
         return {
@@ -527,6 +600,9 @@ def build_router(engine):
     def midi_port(body: dict):
         try:
             opened = midi_bridge.open(body.get("name"))
+            # Remember it, so the next start comes up on the same surface.
+            if opened:
+                save_midi_map(port=opened)
             return {"status": "ok", "open": opened}
         except Exception as e:
             return {"status": "error", "error": str(e)}

@@ -95,31 +95,40 @@ import './live.css';
 const MAX_BUFFER_SECS = 32;  // largest InputRate the ring buffer must hold
 const MAX_LOOP_SECS = 60;    // ceiling on a recorded loop
 /**
- * How many hardware channels a Live Input box can choose from. Raise it for a
- * wider interface — the channel list, the splitter and the clamp all follow it.
+ * How many hardware channels a Live Input box can choose from — the channel
+ * list, the splitter and the clamp all follow it.
  *
- * The list is NOT built from what the device reports, because Chrome routinely
- * leaves `channelCount` out of a track's settings even on a multi-channel
- * interface, and it has to be pickable before the transport starts, when no
- * device is open to report anything. The splitter is this wide to match, so a
- * selection can never ask for an output that does not exist; a channel the
- * device is not supplying is silent, which the box's own waveform makes
- * obvious. The real count is still detected and shown in the status line.
+ * TWO, AND NOT BECAUSE OF THE INTERFACE. Chrome hardcodes getUserMedia's
+ * maximum channel count to 2 (Chromium issue 40403559, open since the API
+ * shipped): channels 1 and 2 arrive, and 3 upward produce nothing at all. This
+ * was 4 for an 18-in Focusrite, and the result was a picker offering Ch 3 and
+ * Ch 4 that could never carry audio — a promise the browser will not keep, and
+ * worse than not offering them, because you reach for one mid-set. Raising it
+ * again only helps once that limit moves, or once capture leaves the browser
+ * for the backend, where all 18 are reachable.
+ *
+ * The list is still NOT built from what the device reports: Chrome routinely
+ * leaves `channelCount` out of a track's settings, and the choice has to be
+ * pickable before the transport starts, when no device is open to report
+ * anything. The real count is detected and shown in the status line.
  */
-const MAX_INPUT_CHANNELS = 4;
+const MAX_INPUT_CHANNELS = 2;
 
 // Every whole second, when Tempo is off. The sparse 1/3/5/10 set could not
 // express a 3 s window regenerated every 2 s, which is exactly the kind of
 // overlap the loop is for.
 //
-// Input Rate reaches further than Generate Rate: the window handed to the model
-// is what a long phrase needs room for, while regenerating less often than
-// every 10 s is a different thing to want. Both stay inside the backend's
-// limits (input_rate 0.25-32 s, generate_rate 0.2-40 s) and inside the ring,
-// which holds MAX_BUFFER_SECS.
+// Generate Rate stops one second short of Input Rate's ceiling, which is the
+// longest cycle that still leaves an overlap at the widest window. The list is
+// fixed rather than following the Input Rate knob: a short window regenerated
+// sparsely -- 3 s every 12 s -- is a legitimate setting, and a moving ceiling
+// would take it away and shift the knob's range under your hand mid-set.
+// Both stay inside the backend's limits (input_rate 0.25-32 s, generate_rate
+// 0.2-40 s) and inside the ring, which holds MAX_BUFFER_SECS.
 const wholeSecs = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
 const INPUT_RATES = wholeSecs(15);
-const GEN_RATES = wholeSecs(10);
+const GEN_RATES = wholeSecs(14);
+const GEN_MIN = GEN_RATES[0], GEN_MAX = GEN_RATES[GEN_RATES.length - 1];
 const BEATS = [4, 8, 16, 32];              // beats, when Tempo is on
                                            // (1 beat is too short to diffuse well)
 const TAP_RESET_MS = 2500;                 // gap after which a tap starts a new count
@@ -475,6 +484,36 @@ export default function LiveApp() {
   // without restarting the animation frame on every knob move.
   const tempoRef = useRef(false);
   useEffect(() => { tempoRef.current = tempoOn && bpm !== null; }, [tempoOn, bpm]);
+
+  /** The Generate Rate to put back when the valve opens again, or null when
+   *  freeze did not touch it. */
+  const thawRateRef = useRef<number | null>(null);
+
+  /**
+   * Open and close the valve. Holding the input only pays off if a cycle lasts
+   * long enough to play the held window through: a cycle gets Generate Rate
+   * seconds of airtime before the next one restarts it from zero, so at 2 s a
+   * 14 s clip is restarted six times before it ever reaches its end and all you
+   * hear is the first two seconds, over and over, from six generations. One
+   * second under the window is the longest cycle that still leaves an overlap
+   * for the crossfade and for the generation latency to land in.
+   *
+   * Tempo mode is left alone: its rates are in beats (4/8/16/32), where "one
+   * second less" has no equivalent and the nearest move is halving, which is a
+   * different musical decision and not one to make on someone's behalf.
+   */
+  const setFreeze = useCallback((on: boolean) => {
+    setFrozen(on);
+    if (on) {
+      if (tempoRef.current) { thawRateRef.current = null; return; }
+      thawRateRef.current = paramsRef.current.generateRate;
+      const held = paramsRef.current.inputRate;
+      setGenerateRate(Math.max(GEN_MIN, Math.min(GEN_MAX, Math.round(held) - 1)));
+    } else if (thawRateRef.current !== null) {
+      setGenerateRate(thawRateRef.current);
+      thawRateRef.current = null;
+    }
+  }, []);
   // Only a take's *length* moves the layout; its playhead and rec counter do not.
   const loopLensKey = Object.values(loops).map(l => l.len).join(',');
   const activeSrcRef = useRef<string | null>(activeSrc);
@@ -556,6 +595,51 @@ export default function LiveApp() {
       .catch(() => {});
   }, []);
 
+  /**
+   * The learned mapping lives in a file beside the backend, so it survives a
+   * different browser, profile, hostname or port — localStorage is per-origin,
+   * and opening the app at 127.0.0.1 rather than localhost is a different store
+   * that looks exactly like a lost mapping.
+   *
+   * On the first run after this change the file is empty and the browser may
+   * hold a mapping learned before it, so that one is pushed up rather than
+   * discarded. After that the file wins, and localStorage is kept in step only
+   * as a fallback for when the backend is not up yet.
+   */
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const r = await fetch(`${API_URL}/api/live/midi_map`);
+        const d = await r.json();
+        if (!alive) return;
+        const stored: Bindings = d.bindings || {};
+        if (Object.keys(stored).length) {
+          setBindings(stored);
+          bindingsRef.current = stored;
+          return;
+        }
+        // Nothing on the server yet: adopt whatever this browser remembers.
+        const local = bindingsRef.current;
+        if (Object.keys(local).length) void saveBindings(local);
+      } catch { /* backend not up; localStorage carries us until it is */ }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  /** Write the mapping through to the file, and to localStorage as a fallback. */
+  const saveBindings = async (next: Bindings) => {
+    try { localStorage.setItem('sa3_live_midi', JSON.stringify(next)); }
+    catch { /* private mode */ }
+    try {
+      await fetch(`${API_URL}/api/live/midi_map`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bindings: next }),
+      });
+    } catch { /* backend not up; the local copy is pushed on the next load */ }
+  };
+
   const openMidiPort = async (name: string) => {
     try {
       const r = await fetch(`${API_URL}/api/live/midi_port`, {
@@ -586,6 +670,7 @@ export default function LiveApp() {
       const next = { ...bindingsRef.current, [armedId]: { channel, control } };
       bindingsRef.current = next;
       setBindings(next);
+      void saveBindings(next);
       localStorage.setItem('sa3_live_midi', JSON.stringify(next));
       setArmed(null);
       return;
@@ -626,7 +711,7 @@ export default function LiveApp() {
     }
     else if (id === 'freeze') {
       const down = norm >= 0.5;
-      if (down && !triggersRef.current[id]) setFrozen(v => !v);
+      if (down && !triggersRef.current[id]) setFreeze(!frozenRef.current);
       triggersRef.current[id] = down;
     }
     else if (id === 'inject') {
@@ -644,8 +729,9 @@ export default function LiveApp() {
     else if (id === 'inputMonitor') setInputMonitor(Number(norm.toFixed(2)));
     else if (id === 'masterVolume') setMasterVolume(Number(norm.toFixed(2)));
     // One binding per box, keyed to the box rather than to a slot number.
-    else if (id.startsWith('inputMonitor:')) {
-      patchSource(id.slice('inputMonitor:'.length), { monitor: Number(norm.toFixed(2)) });
+    else if (/^inputMonitor@\d+$/.test(id)) {
+      const inst = sourcesRef.current[Number(id.slice('inputMonitor@'.length))];
+      if (inst) patchSource(inst.id, { monitor: Number(norm.toFixed(2)) });
     }
     else if (/^send\d+$/.test(id)) {
       const inst = sourcesRef.current[Number(id.slice(4))];
@@ -1640,8 +1726,9 @@ export default function LiveApp() {
   const stop = () => {
     setRunning(false);
     // START builds fresh rings with nothing in them, so a freeze carried across
-    // a stop would leave the model with no input and no way to tell why.
-    setFrozen(false);
+    // a stop would leave the model with no input and no way to tell why. Going
+    // through setFreeze also hands back the Generate Rate it borrowed.
+    setFreeze(false);
     // ...and STOP presses HUSH, the other half of the same deal.
     if (sourcesRef.current.some(x => x.kind === 'code')) hushStrudel();
     setStatus('Idle');
@@ -2120,7 +2207,7 @@ export default function LiveApp() {
         },
       }}
       monitorSlider={monitorMode === 'box' ? (
-        <MidiSlider {...knobProps(`inputMonitor:${inst.id}`)} label="Mon"
+        <MidiSlider {...knobProps(`inputMonitor@${slot}`)} label="Mon"
                     value={inst.monitor}
                     onChange={(v) => {
                       patchSource(inst.id, { monitor: v });
@@ -2551,7 +2638,7 @@ export default function LiveApp() {
           <div className="knob-row act-row">
             <button
               className={`act-btn freeze ${frozen ? 'on' : ''} ${midiLearn ? 'learning' : ''} ${armed === 'freeze' ? 'armed' : ''}`}
-              onClick={() => (midiLearn ? arm('freeze') : setFrozen(v => !v))}
+              onClick={() => (midiLearn ? arm('freeze') : setFreeze(!frozen))}
               disabled={!running && !midiLearn}
               title="Hold the input the model is working from. Capture stops advancing, so every cycle from here re-reads the same window — you keep playing and hearing yourself, but the model keeps turning over the moment you froze. Press again to let it move."
             >
