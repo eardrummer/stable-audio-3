@@ -862,16 +862,16 @@ html, body, #live-root {
 .in-section.active { box-shadow: inset 0 0 0 1px var(--src); }
 
 /* ── master actions: big enough to hit without looking ──────────── */
-.act-row { gap: 10px; align-items: stretch; }
+.act-row { gap: 7px; align-items: stretch; }
 .act-btn {
-  width: 94px;
-  min-height: 62px;
+  width: 78px;
+  min-height: 50px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 3px;
-  padding: 8px 6px;
+  gap: 2px;
+  padding: 6px 4px;
   border: 1px solid var(--g-line);
   border-radius: 6px;
   background: #121010;
@@ -882,19 +882,26 @@ html, body, #live-root {
 .act-btn:hover:not(:disabled) { background: #1b1515; }
 .act-btn:active:not(:disabled) { background: #241b1b; }
 .act-btn:disabled { opacity: .35; cursor: not-allowed; }
-.act-name { font-size: 13px; font-weight: 700; letter-spacing: .1em; }
+.act-name { font-size: 11px; font-weight: 700; letter-spacing: .06em; }
 .act-sub {
-  font-size: 8px;
+  font-size: 7px;
   letter-spacing: .06em;
   text-transform: uppercase;
   color: var(--dim);
   text-align: center;
 }
-.act-bind { font-size: 8px; color: #6f9bdd; }
-/* Flush is the destructive one and Inject the constructive one; the rest of
-   the button stays quiet so the pair reads at a glance. */
-.act-btn.flush .act-name { color: #e8837a; }
-.act-btn.flush:hover:not(:disabled) { border-color: #7a3a33; }
+.act-bind { font-size: 7px; color: #6f9bdd; }
+/* Freeze holds, Inject advances; the rest of the button stays quiet so the pair
+   reads at a glance. Freeze is the only one of the two with a state, so it is
+   also the only one that fills when engaged. */
+.act-btn.freeze .act-name { color: #7fb8e0; }
+.act-btn.freeze:hover:not(:disabled) { border-color: #2f5a7a; }
+.act-btn.freeze.on {
+  background: #15293a;
+  border-color: #7fb8e0;
+}
+.act-btn.freeze.on .act-name { color: #d6ecfa; }
+.act-btn.freeze.on .act-sub { color: #8fb4cd; }
 .act-btn.inject .act-name { color: #8ad18a; }
 .act-btn.inject:hover:not(:disabled) { border-color: #2f6f3a; }
 .act-btn.learning { border-style: dashed; border-color: rgba(59, 130, 246, .55); }
@@ -952,7 +959,47 @@ html, body, #live-root {
 }
 
 .in-tools { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-.in-fader { display: flex; align-items: center; gap: 8px; font-size: 9px; }
+/* The send fader joins MIDI learn on the same terms as the monitor sliders, so
+   the dashed border and the armed tint mean the same thing in both places. The
+   transparent border is always there, or arming would nudge the layout. */
+.in-fader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 9px;
+  border: 2px dashed transparent;
+  border-radius: 6px;
+  padding: 0 4px;
+}
+.in-fader.learning { border-color: rgba(59, 130, 246, .55); cursor: pointer; }
+.in-fader.armed { border-color: var(--learn); background: rgba(59, 130, 246, .12); }
+.in-fader.learning input[type=range] { pointer-events: none; }
+.fader-label { color: var(--dim); letter-spacing: .08em; text-transform: uppercase; }
+
+/* Per-box monitoring: a second, listen-only level inside each box. Tighter
+   than the master slider, and in white like the master's accent, so the two
+   read as the same family. */
+.in-section .monitor { padding-top: 4px; font-size: 9px; gap: 8px; }
+.in-section .monitor input[type=range] { accent-color: #ffffff; }
+
+/* The master slider and the mode switch share a row. */
+.monitor-row { display: flex; align-items: flex-end; gap: 10px; }
+.monitor-row .monitor { flex: 1 1 auto; min-width: 0; }
+.mon-mode {
+  flex: 0 0 auto;
+  margin-bottom: 2px;
+  padding: 4px 7px;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  background: #0d0d0d;
+  color: #8a8a8a;
+  font-size: 8px;
+  letter-spacing: .1em;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mon-mode:hover { color: #ddd; }
+.mon-mode.on { background: #e9e9e9; border-color: #e9e9e9; color: #101010; }
 
 /* Names the effect whose before/after traces fill the band at the foot of the
    canvas. Sits over the band, out of the waveform's way. */
@@ -1164,6 +1211,113 @@ html, body, #live-root {
   transform: translateX(-50%);
 }
 
+/* ── show view: one screen, two marks, nothing else ───────────── */
+.live-root.show .live-bar,
+.live-root.show .live-main,
+.live-root.show .live-knobs { display: none; }
+.show-view { position: fixed; inset: 0; background: #000; z-index: 60; }
+.show-canvas { display: block; width: 100%; height: 100%; }
+/* Commentary, top left. Big, white, no chrome — a faint placeholder so the box
+   can always be found on an otherwise bare screen, and a rule down the left
+   while it has focus so you can see where you are typing. */
+.show-note {
+  position: fixed;
+  top: 20px;
+  left: 22px;
+  width: min(44vw, 620px);
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  padding: 0;
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 30px;
+  font-weight: 500;
+  line-height: 1.22;
+  letter-spacing: .01em;
+}
+.show-note::placeholder { color: rgba(255, 255, 255, .2); }
+.show-note:focus {
+  border-left: 2px solid rgba(255, 255, 255, .3);
+  padding-left: 12px;
+  margin-left: -14px;
+}
+
+/* Captions straddling the input line, both aligned to the left edge. They sit
+   close enough that the waveform crosses them, which is intended: the line is
+   the subject and the words are underneath it. */
+.show-caption,
+.show-prompts,
+.show-ai {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: .13em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  pointer-events: none;
+}
+/* Where the sound came from. Twice the prompts' size and set over two lines,
+   so it reads as the title of the screen rather than a label. */
+.show-caption {
+  position: fixed;
+  left: 22px;
+  max-width: calc(100% - 44px);
+  top: calc(50% + 13px);
+  color: #ffffff;
+  font-size: 22px;
+  line-height: 1.2;
+  white-space: normal;
+}
+/* Everything above the line, stacked and anchored by its foot: the prompts sit
+   against the line and the AI caption grows upward from them, so the caption
+   coming and going never shifts the prompts. */
+.show-above {
+  position: fixed;
+  left: 22px;
+  right: 22px;
+  bottom: calc(50% + 13px);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  pointer-events: none;
+}
+/* The counterpart to the white caption, and the same size: what the model made
+   of the line, in the red of the traces that carry it away. It holds its space
+   while hidden so the prompts do not jump when the output stops. */
+.show-ai {
+  color: rgb(214, 40, 40);
+  font-size: 22px;
+  line-height: 1.2;
+  opacity: 0;
+  transition: opacity .5s ease;
+}
+.show-ai.on { opacity: 1; }
+/* What is being made of it — the same red as the traces it describes. */
+.show-prompts { color: rgb(214, 40, 40); }
+
+/* The one permanent mark besides the traces. Dim until reached for. */
+.show-exit {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #2a1414;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, .55);
+  color: #6f3232;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease;
+}
+.show-exit:hover { color: #ff5a5a; border-color: #5c2222; }
+
 /* ── view toggle ──────────────────────────────────────────────── */
 .view-toggle {
   margin-left: auto;
@@ -1228,3 +1382,92 @@ html, body, #live-root {
 .vertical .cable { opacity: .42; }
 .vertical .cable-shadow { opacity: .22; }
 .cable.dragging { opacity: .95; }
+
+/* ── SYNC: stacked under Nudge, which is the knob it writes to ──── */
+.sync-btn {
+  font: inherit;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  padding: 2px 7px;
+  border: 1px solid var(--g-line);
+  border-radius: 4px;
+  background: #121010;
+  color: var(--dim);
+  cursor: pointer;
+  transition: color .12s ease, border-color .12s ease, background .12s ease;
+}
+.sync-btn:hover:not(:disabled) { color: #9fc4f0; border-color: #35506f; background: #16171b; }
+.sync-btn:active:not(:disabled) { background: #1d2230; }
+.sync-btn:disabled { opacity: .3; cursor: not-allowed; }
+.sync-btn.on {
+  color: #0b0d12;
+  background: #9fc4f0;
+  border-color: #9fc4f0;
+}
+.sync-read {
+  font-size: 7px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The master fader lives under FLUSH/INJECT, so it stretches across the pair
+   rather than sitting at the monitors own narrower width. White, like the
+   input monitor, because it is a global control and not a track colour. */
+.master-vol { margin-top: 2px; }
+.master-vol .monitor { width: 100%; padding-top: 4px; }
+.master-vol .monitor input[type=range] { flex: 1 1 auto; min-width: 0; accent-color: #ffffff; }
+
+/* ── master pre-FX latches ──────────────────────────────────────── */
+.act-btn.mfx .act-name { font-size: 9px; letter-spacing: .03em; color: #c9a6e8; }
+.act-btn.mfx:hover:not(:disabled) { border-color: #5a3f78; }
+/* Lit means the summed feed is being processed right now, so it reads as a
+   state rather than as a press: filled, not merely outlined. */
+.act-btn.mfx.on {
+  background: #2a1b3a;
+  border-color: #a07ccd;
+}
+.act-btn.mfx.on .act-name { color: #e6d4f7; }
+.act-btn.mfx.on .act-sub { color: #b79dd4; }
+.mfx-lat {
+  font-size: 8px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--dim);
+  text-align: center;
+  margin-top: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── SOLO PROC: pinned inside the spectrogram, bottom right ─────── */
+.spec-btn {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  font: inherit;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  /* Over the image, so it needs its own ground to stay readable against a
+     busy spectrogram — and enough transparency not to hide what is under it. */
+  border: 1px solid rgba(255, 255, 255, .16);
+  border-radius: 4px;
+  background: rgba(8, 8, 8, .66);
+  color: #8a8a8a;
+  cursor: pointer;
+  transition: color .12s ease, border-color .12s ease, background .12s ease;
+}
+.spec-btn:hover { color: #ddd; border-color: var(--track, var(--accent)); }
+/* Lit means the master sweep is passing this track by: a state, so it fills. */
+.spec-btn.on {
+  color: #0b0b0b;
+  background: var(--track, var(--accent));
+  border-color: var(--track, var(--accent));
+}

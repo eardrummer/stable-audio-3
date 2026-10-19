@@ -76,3 +76,10 @@ export class FxChain {
     this.output.disconnect();
   }
 }
+
+/**
+ * What the master SMEAR and SCRAMBLE buttons set their method to. Fixed rather
+ * than another knob: those buttons are a performance gesture, and 0.8 is where
+ * both methods read as the effect rather than as a treatment of the input.
+ */
+export const MASTER_FX_AMOUNT = 0.8;

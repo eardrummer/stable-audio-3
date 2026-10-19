@@ -16,6 +16,10 @@ export const VARIANTS = 5;
 export const SPREAD_MIN = 0;
 export const SPREAD_MAX = 0.08;
 export const MAX_NUDGE = 5;          // seconds of output delay for alignment
+// SYNC: how often the alignment is re-checked, and how far a nudge has to be
+// out before it is rewritten. The medians wobble; the delay line should not.
+export const SYNC_POLL_MS = 1000;
+export const SYNC_DEADBAND = 0.03;   // seconds
 
 // Crossfade timing. Consecutive generations blend over a fixed window; true
 // overlap only exists when Generate Rate is shorter than Input Rate, otherwise
@@ -59,6 +63,13 @@ export interface TrackParams {
   hpf: number;      // 0 = wide open
   comb: number;     // 0 = bypassed
   outputMonitor: number;
+  /**
+   * Opt this track out of ALL TRACKS. With it lit, a knob or a MIDI move made
+   * while MASTER is engaged passes this track by, so it holds the settings it
+   * has while the rest of the rack is swept together. Selecting the track and
+   * turning a knob still edits it — otherwise the lit button would lock it.
+   */
+  soloProcess: boolean;
 }
 
 let trackSeq = 0;
@@ -78,6 +89,7 @@ export const defaultTrack = (): TrackParams => ({
   hpf: 0,
   comb: 0,
   outputMonitor: 0.8,
+  soloProcess: false,
 });
 
 // ── output filter mappings ───────────────────────────────────────────
@@ -216,6 +228,9 @@ export interface SourceInstance {
   kind: SourceKind;
   /** Send level into the tracks this box is patched to. */
   level: number;
+  /** Listen-only level, used when monitoring is per box rather than summed.
+   *  Starts silent: a mic that monitors itself the moment it opens howls. */
+  monitor: number;
   /** One flag per track index. */
   to: boolean[];
   /** Mic only: which hardware channel(s) this box takes. */
@@ -238,6 +253,7 @@ export const newSource = (kind: SourceKind, nTracks: number): SourceInstance => 
   id: `src${++sourceSeq}`,
   kind,
   level: 1,
+  monitor: 0,
   to: Array.from({ length: nTracks }, () => true),
   chanSel: '0+1',
   fxMethod: DEFAULT_FX,

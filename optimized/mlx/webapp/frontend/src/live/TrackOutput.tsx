@@ -1,7 +1,7 @@
 import {
   forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
-import { Plus, Minus, Headphones } from 'lucide-react';
+import { Plus, Minus, Headphones, Unlink } from 'lucide-react';
 import MidiSlider from './MidiSlider';
 import { drawSpectrogram } from '../shared/spectrogram';
 import {
@@ -23,6 +23,12 @@ import {
 
 export interface TrackHandle {
   push(header: object, pcm: ArrayBuffer): void;
+  /** Fill `into` with this track's audible output as -1..1, resampled to
+   *  whatever length was asked for. False when there is no graph yet. */
+  readWave(into: Float32Array): boolean;
+  /** Seconds between a snapshot leaving the browser and the audio made from
+   *  it being heard, or null before any cycle has been timed. */
+  latency(): number | null;
   begin(): void;
   /** Silence what is sounding without ending the session. */
   flush(): void;
@@ -44,6 +50,8 @@ interface Props {
   onConnected?: (c: boolean) => void;
   learnProps: (id: string) => LearnProps;
   running: boolean;
+  /** Rack-wide output fader, multiplied into this track's monitor gain. */
+  masterVolume: number;
   /** The track the knob row is editing. */
   active: boolean;
   onActivate: () => void;
@@ -87,6 +95,8 @@ interface Voice {
 /** Gap between variant lanes, in canvas pixels. It lies outside every lane's
  *  scroll region, so the divider stays put while the lanes fall past it. */
 const LANE_GUTTER = 3;
+/** How many recent cycles the latency median looks at. */
+const LAT_KEEP = 5;
 
 /**
  * Where the playback line sits, as a fraction of the pane height measured from
@@ -170,7 +180,7 @@ function sumGain(entries: { buf: AudioBuffer; pan: number }[]): number {
 
 const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   index, connectionId, params, shared, onParam, onMidi, onAdd, onRemove,
-  onError, onShelfDone, onConnected, learnProps, running,
+  onError, onShelfDone, onConnected, learnProps, running, masterVolume,
   active, onActivate, soloed, muted, onSolo, soloVisible, onNode, patchTarget, onNodeDown,
 }, ref) {
   const theme = TRACK_THEME[index] ?? TRACK_THEME[0];
@@ -207,11 +217,33 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   const pendingHeaderRef = useRef<any>(null);
   const voicesRef = useRef<Voice[]>([]);
 
+  /** Snapshot-to-sound for the most recent cycles. The stamp rode along to the
+   *  backend and came back with the audio, so this covers the queue wait, the
+   *  engine lock, generation, the WAV transfer and decodeAudioData — the whole
+   *  distance between a gesture and hearing it. SYNC reads these. */
+  const latsRef = useRef<number[]>([]);
+  const latCycleRef = useRef(-1);
+  const markHeard = useCallback((cycle: number, tag?: number) => {
+    if (!tag || cycle === latCycleRef.current) return;   // one reading per cycle
+    latCycleRef.current = cycle;
+    const l = latsRef.current;
+    l.push((performance.now() - tag) / 1000);
+    if (l.length > LAT_KEEP) l.shift();
+  }, []);
+
   // The socket handler is created once; live values reach it through refs.
   const paramsRef = useRef(params);
   useEffect(() => { paramsRef.current = params; }, [params]);
   const mutedRef = useRef(muted);
   useEffect(() => { mutedRef.current = muted; }, [muted]);
+  const masterVolRef = useRef(masterVolume);
+  useEffect(() => { masterVolRef.current = masterVolume; }, [masterVolume]);
+  /** What this track is actually passing: its own monitor, scaled by the rack
+   *  fader, and nothing at all when another track's solo has silenced it. */
+  const audibleLevel = useCallback(
+    () => (mutedRef.current ? 0 : paramsRef.current.outputMonitor * masterVolRef.current),
+    [],
+  );
   const sharedRef = useRef(shared);
   useEffect(() => { sharedRef.current = shared; }, [shared]);
   const midiRef = useRef(onMidi);
@@ -234,7 +266,7 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       delay.connect(analyser);
       analyser.connect(gain);
       gain.connect(ctx.destination);
-      gain.gain.value = mutedRef.current ? 0 : paramsRef.current.outputMonitor;
+      gain.gain.value = audibleLevel();
 
       // ── filters ──────────────────────────────────────────────────────
       // fxIn -> LPF -> HPF -> [dry + comb] -> nudge -> analyser -> monitor.
@@ -312,7 +344,7 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       combPreRef.current = combPre; combPostRef.current = combPost;
     }
     return ctxRef.current!;
-  }, []);
+  }, [audibleLevel]);
 
   /** Start a set of clips together, equal-power crossfading out whatever is
    *  sounding. One entry in single-variant mode; one per variant in ALL mode,
@@ -417,8 +449,8 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   }, [playSet]);
 
   useEffect(() => {
-    if (gainRef.current) gainRef.current.gain.value = muted ? 0 : params.outputMonitor;
-  }, [params.outputMonitor, muted]);
+    if (gainRef.current) gainRef.current.gain.value = muted ? 0 : params.outputMonitor * masterVolume;
+  }, [params.outputMonitor, muted, masterVolume]);
 
   useEffect(() => {
     const d = delayRef.current, c = ctxRef.current;
@@ -494,6 +526,8 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   const lanesRef = useRef(0);
   const lastTRef = useRef(0);
   const carryRef = useRef(0);
+  /** Scratch for readWave, so the show view's RAF allocates nothing. */
+  const waveBytesRef = useRef<Uint8Array<ArrayBuffer>>(new Uint8Array(new ArrayBuffer(0)));
   useEffect(() => {
     const tick = () => {
       rafRef.current = requestAnimationFrame(tick);
@@ -621,9 +655,10 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
           // Hold until the whole family has landed, so the variants start
           // together as one panned image rather than trickling in.
           const ready = cyc.buffers.slice(0, family).every(Boolean);
-          if (ready) setFromCycle(cyc, 0);
+          if (ready) { markHeard(cyc.cycle, hdr.tag); setFromCycle(cyc, 0); }
         } else if (hdr.index === pp.variant) {
           // Single variant: start as soon as the audible lane lands.
+          markHeard(cyc.cycle, hdr.tag);
           setFromCycle(cyc, 0);
         }
         return;
@@ -647,7 +682,7 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
 
     return () => ws.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionId, index, setFromCycle, ensureCtx]);
+  }, [connectionId, index, setFromCycle, ensureCtx, markHeard]);
 
   useEffect(() => { if (running) sendParams(); }, [
     running, sendParams,
@@ -669,6 +704,8 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const p = paramsRef.current, sh = sharedRef.current;
       setDropped(0);
+      latsRef.current = [];        // a new session re-times from scratch
+      latCycleRef.current = -1;
       const c = ensureCtx();
       if (c.state === 'suspended') void c.resume();
       ws.send(JSON.stringify({
@@ -680,6 +717,32 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
           loopback: p.loopback, selected_variant: p.variant,
         },
       }));
+    },
+    latency() {
+      const l = latsRef.current;
+      if (!l.length) return null;
+      // Median rather than the latest reading: the global engine lock makes any
+      // single cycle jumpy depending on which track got in first.
+      const sorted = [...l].sort((a, b) => a - b);
+      return sorted[sorted.length >> 1];
+    },
+    readWave(into: Float32Array) {
+      const an = analyserRef.current;
+      if (!an) return false;
+      // The analyser sits before the monitor gain, so it reads full scale
+      // whatever the fader says. Scale by what the monitor is actually passing,
+      // and contribute nothing at all when it is passing nothing — a track
+      // turned down, or silenced by another track's solo, is not being heard.
+      const level = audibleLevel();
+      if (level <= 0) return false;
+      if (waveBytesRef.current.length !== an.fftSize) {
+        waveBytesRef.current = new Uint8Array(new ArrayBuffer(an.fftSize));
+      }
+      const buf = waveBytesRef.current;
+      an.getByteTimeDomainData(buf);
+      const n = into.length, m = buf.length;
+      for (let i = 0; i < n; i++) into[i] = (buf[((i * m) / n) | 0] / 128 - 1) * level;
+      return true;
     },
     flush() {
       // The backend forgets its own last output too, or Loopback would feed
@@ -730,7 +793,7 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
         redecode_index: paramsRef.current.variant,
       }));
     },
-  }), [ensureCtx]);
+  }), [ensureCtx, audibleLevel]);
 
   return (
     <section
@@ -796,6 +859,22 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
               </div>
             ))}
           </div>
+        )}
+
+        {/* Bottom right of the image, where it sits over the oldest part of the
+            spectrogram rather than over anything being read. Hidden with one
+            track, like Solo: there is no rack to be swept by. */}
+        {soloVisible && (
+          <button
+            className={`spec-btn ${params.soloProcess ? 'on' : ''}`}
+            onClick={() => onParam({ soloProcess: !params.soloProcess })}
+            title={params.soloProcess
+              ? 'Rejoin ALL TRACKS: master knob moves will reach this track again'
+              : 'Hold this track out of ALL TRACKS, so master knob and MIDI moves pass it by. Selecting the track still edits it.'}
+          >
+            <Unlink size={11} />
+            <span>SOLO PROC</span>
+          </button>
         )}
       </div>
 

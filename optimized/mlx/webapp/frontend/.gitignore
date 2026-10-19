@@ -25,3 +25,6 @@ dist-ssr
 
 # Vendored Strudel sample banks (fetched by npm run fetch-samples)
 public/strudel-samples/
+
+# Show-view announcement audio — yours, not the repo's
+public/assets/

@@ -134,6 +134,9 @@ class Snapshot:
     audio: np.ndarray       # (2, T) float32
     seconds: float
     received_at: float = field(default_factory=time.time)
+    # The client clock reading when this snapshot was pushed, echoed back
+    # untouched so the browser can time the whole round trip itself.
+    tag: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -295,11 +298,11 @@ class LiveSession:
             self.params.update(clean)
         self._send_json({"type": "params", "params": self.params})
 
-    def submit(self, audio: np.ndarray, seconds: float) -> None:
+    def submit(self, audio: np.ndarray, seconds: float, tag: float = 0.0) -> None:
         """Hand the worker a fresh snapshot, displacing any waiting one."""
         with self._lock:
             dropped = self._pending is not None
-            self._pending = Snapshot(audio=audio, seconds=seconds)
+            self._pending = Snapshot(audio=audio, seconds=seconds, tag=tag)
         if dropped:
             # The loop is running behind the requested generate rate.
             self._send_json({"type": "dropped"})
@@ -413,6 +416,7 @@ class LiveSession:
                 "type": "variant", "cycle": cycle, "index": i,
                 "noise": round(noise, 3), "seed": seed,
                 "bytes": len(data), "gen_ms": round(gen_ms, 1),
+                "tag": snap.tag,
             })
             self._send_bytes(data)
 
@@ -575,6 +579,7 @@ def build_router(engine):
                         continue
                     ch = int(pending_header.get("channels", 2))
                     sr = int(pending_header.get("sample_rate", SAMPLE_RATE))
+                    tag = float(pending_header.get("tag", 0.0))
                     pending_header = None
                     pcm = np.frombuffer(blob, dtype=np.float32)
                     if pcm.size == 0:
@@ -593,7 +598,7 @@ def build_router(engine):
                             "error": f"resample {sr} Hz -> {SAMPLE_RATE} Hz failed: {e}",
                         })
                         continue
-                    session.submit(audio, audio.shape[-1] / SAMPLE_RATE)
+                    session.submit(audio, audio.shape[-1] / SAMPLE_RATE, tag)
 
         except WebSocketDisconnect:
             pass

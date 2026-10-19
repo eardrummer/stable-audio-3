@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2, Plus, Rows2, Columns2 } from 'lucide-react';
+import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2, Plus, Rows2, Columns2, AudioWaveform } from 'lucide-react';
+import ShowView from './ShowView';
 import Knob from './Knob';
 import LatentShelf from './LatentShelf';
 import StrudelPanel, { type StrudelPanelHandle } from './StrudelPanel';
 import InputSection from './InputSection';
 import MidiSlider from './MidiSlider';
 import TrackOutput, { type TrackHandle } from './TrackOutput';
-import { FX_METHODS, FxChain, fxMethod } from './inputfx';
+import { FX_METHODS, FxChain, fxMethod, MASTER_FX_AMOUNT } from './inputfx';
 import {
   API_URL, VARIANTS, SPREAD_MIN, SPREAD_MAX, MAX_NUDGE, TRACK_THEME,
+  SYNC_POLL_MS, SYNC_DEADBAND,
   SOURCE_KINDS, SOURCE_META, MAX_SLOTS, defaultSources, defaultTrack, newSource,
   lpfHz, hpfHz, combHz,
   type TrackParams, type SourceKind, type SourceInstance,
@@ -17,6 +19,12 @@ import {
 /** Cutoffs read better as "1.2k" than as four digits under a knob. */
 const hz = (f: number) =>
   (f >= 1000 ? `${(f / 1000).toFixed(f >= 10000 ? 0 : 1)}k` : String(Math.round(f))) + 'Hz';
+
+/** Stacked, side by side, or the bare performance screen. */
+type Layout = 'vertical' | 'horizontal' | 'show';
+/** The split is only meaningful for the two working layouts. */
+const splitKey = (l: Layout): 'vertical' | 'horizontal' =>
+  (l === 'horizontal' ? 'horizontal' : 'vertical');
 
 interface RingBuf { l: Float32Array; r: Float32Array; w: number; filled: number; sr: number }
 interface SourceNodes {
@@ -35,6 +43,13 @@ interface SourceNodes {
    *  difference between them is the effect itself. */
   fxIn?: AnalyserNode;
   fxOut?: AnalyserNode;
+  /**
+   * Listen-only gain for this box, between its output and the monitor bus. In
+   * summed mode it sits at 1 and the bus carries the master level; per box it
+   * carries the box's own and the bus becomes a trim over all of them. Flipping
+   * modes therefore changes gains only — nothing is ever rewired.
+   */
+  mon?: GainNode;
   /** Mic: the hardware feed and this box's own loop share the box's fader. */
   liveGain?: GainNode;
   loopGain?: GainNode;
@@ -79,8 +94,32 @@ import './live.css';
 // beat-denominated window. ~12 MB of Float32 at 48 kHz stereo.
 const MAX_BUFFER_SECS = 32;  // largest InputRate the ring buffer must hold
 const MAX_LOOP_SECS = 60;    // ceiling on a recorded loop
+/**
+ * How many hardware channels a Live Input box can choose from. Raise it for a
+ * wider interface — the channel list, the splitter and the clamp all follow it.
+ *
+ * The list is NOT built from what the device reports, because Chrome routinely
+ * leaves `channelCount` out of a track's settings even on a multi-channel
+ * interface, and it has to be pickable before the transport starts, when no
+ * device is open to report anything. The splitter is this wide to match, so a
+ * selection can never ask for an output that does not exist; a channel the
+ * device is not supplying is silent, which the box's own waveform makes
+ * obvious. The real count is still detected and shown in the status line.
+ */
+const MAX_INPUT_CHANNELS = 4;
 
-const RATES = [1, 3, 5, 10];               // seconds, when Tempo is off
+// Every whole second, when Tempo is off. The sparse 1/3/5/10 set could not
+// express a 3 s window regenerated every 2 s, which is exactly the kind of
+// overlap the loop is for.
+//
+// Input Rate reaches further than Generate Rate: the window handed to the model
+// is what a long phrase needs room for, while regenerating less often than
+// every 10 s is a different thing to want. Both stay inside the backend's
+// limits (input_rate 0.25-32 s, generate_rate 0.2-40 s) and inside the ring,
+// which holds MAX_BUFFER_SECS.
+const wholeSecs = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
+const INPUT_RATES = wholeSecs(15);
+const GEN_RATES = wholeSecs(10);
 const BEATS = [4, 8, 16, 32];              // beats, when Tempo is on
                                            // (1 beat is too short to diffuse well)
 const TAP_RESET_MS = 2500;                 // gap after which a tap starts a new count
@@ -157,11 +196,50 @@ export default function LiveApp() {
   }, []);
   /** Knobs and MIDI act on the active track — or on every track when MASTER
    *  is engaged. Reads still come from the active track, so a knob shows one
-   *  value; turning it in master mode makes the tracks agree. */
+   *  value; turning it in master mode makes the tracks agree.
+   *
+   *  A track with SOLO PROC lit is passed over by the master sweep, but never
+   *  when it is the active track: the button is an opt-out from the rack moving
+   *  together, not a lock, and a track you cannot edit at all would be a trap. */
   const patchActive = useCallback((patch: Partial<TrackParams>) => {
-    setTracks(ts => ts.map((t, j) =>
-      (masterRef.current || j === activeTabRef.current ? { ...t, ...patch } : t)));
+    setTracks(ts => ts.map((t, j) => (
+      j === activeTabRef.current || (masterRef.current && !t.soloProcess)
+        ? { ...t, ...patch } : t)));
   }, []);
+  /**
+   * Master pre-FX: the same Smear and Scramble the boxes offer, but on the
+   * summed feed each track sends, so one press processes everything patched in.
+   * Latching, and both can be on at once.
+   *
+   * SCRAMBLE RUNS FIRST. It cuts its slices on detected onsets, and Smear
+   * exists to dissolve exactly those onsets, so the other order would leave the
+   * detector nothing to find.
+   */
+  /**
+   * FREEZE holds the input the model is working from. The ring simply stops
+   * advancing, so the window every snapshot reads — which ends at the write
+   * head — is the same audio on every cycle from the press onward. Generation
+   * carries on with a fresh seed each time, so you get the model turning one
+   * held moment over and over rather than following you.
+   *
+   * It is the capture that freezes, not the room: monitoring, the waveforms and
+   * the input FX all stay live, and whatever FX was engaged at the press is
+   * baked into the held buffer.
+   */
+  const [frozen, setFrozen] = useState(false);
+  const frozenRef = useRef(false);
+  useEffect(() => { frozenRef.current = frozen; }, [frozen]);
+
+  const [masterFx, setMasterFx] = useState({ scramble: false, smear: false });
+  const masterFxRef = useRef(masterFx);
+  useEffect(() => { masterFxRef.current = masterFx; }, [masterFx]);
+  /** Amount for either method when its button is lit. */
+  const masterFxAmt = useCallback(
+    (on: boolean) => (on ? MASTER_FX_AMOUNT : 0), []);
+
+  /** Rack-wide output fader. Each track multiplies it into its own monitor
+   *  gain, so the per-track balance survives a move of this one. */
+  const [masterVolume, setMasterVolume] = useState(1);
   const [inputRate, setInputRate] = useState(10);       // seconds (Tempo off)
   const [generateRate, setGenerateRate] = useState(10);
   const [tempoOn, setTempoOn] = useState(false);
@@ -183,7 +261,34 @@ export default function LiveApp() {
   const cur = tracks[activeTab] ?? tracks[0];
   const activeVariants = cur.multiVariant ? VARIANTS : 1;
 
-  const [inputMonitor, setInputMonitor] = useState(0);   // muted by default
+  /**
+   * The master monitor level, remembered per mode. Summed monitoring starts
+   * muted, because a mic that monitors itself the moment it opens howls. Per-box
+   * monitoring starts at unity instead: there the master is only a trim over
+   * levels that are themselves all at zero, so unity is still silent — and
+   * leaving it at zero would make every per-box fader do nothing, which is the
+   * one combination of these two defaults that reads as a bug.
+   */
+  const [monLevels, setMonLevels] = useState<{ sum: number; box: number }>({ sum: 0, box: 1 });
+  const monitorModeRef = useRef<'sum' | 'box'>('sum');
+  /** Summed monitoring, or one level per input box. */
+  const [monitorMode, setMonitorMode] = useState<'sum' | 'box'>(() => {
+    try { return localStorage.getItem('sa3_live_monmode') === 'box' ? 'box' : 'sum'; }
+    catch { return 'sum'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('sa3_live_monmode', monitorMode); } catch { /* private mode */ }
+    monitorModeRef.current = monitorMode;
+  }, [monitorMode]);
+  const inputMonitor = monLevels[monitorMode === 'box' ? 'box' : 'sum'];
+  /** Same signature the slider and MIDI already use; writes whichever mode's
+   *  value is live, read from a ref so a stale closure cannot cross them. */
+  const setInputMonitor = useCallback((v: number | ((prev: number) => number)) => {
+    setMonLevels(m => {
+      const key = monitorModeRef.current === 'box' ? 'box' : 'sum';
+      return { ...m, [key]: typeof v === 'function' ? v(m[key]) : v };
+    });
+  }, []);
 
   // --- latent shelf ----------------------------------------------------
   const [shelfOpen, setShelfOpen] = useState(false);
@@ -224,8 +329,11 @@ export default function LiveApp() {
     return { vertical: 0.5, horizontal: 0.5 };
   });
   /** 'vertical' = inputs above outputs; 'horizontal' = inputs left of outputs. */
-  const [layout, setLayout] = useState<'vertical' | 'horizontal'>(() => {
-    try { return (localStorage.getItem('sa3_live_layout') as 'vertical' | 'horizontal') || 'vertical'; }
+  const [layout, setLayout] = useState<Layout>(() => {
+    try {
+      const v = localStorage.getItem('sa3_live_layout');
+      return v === 'horizontal' || v === 'show' ? v : 'vertical';
+    }
     catch { return 'vertical'; }
   });
   const measureRef = useRef<(() => void) | null>(null);
@@ -264,7 +372,11 @@ export default function LiveApp() {
   const inCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const inGainRef = useRef<GainNode | null>(null);
+  /** Summed live input, for the show view. */
   const inAnalyserRef = useRef<AnalyserNode | null>(null);
+  const showSumRef = useRef<GainNode | null>(null);
+  const showBytesRef = useRef<Uint8Array<ArrayBuffer>>(new Uint8Array(new ArrayBuffer(0)));
+  const showTmpRef = useRef<Float32Array>(new Float32Array(0));
   const clickGainRef = useRef<GainNode | null>(null);
   const clickTimerRef = useRef<number | null>(null);
   const nextClickRef = useRef(0);
@@ -279,6 +391,8 @@ export default function LiveApp() {
   const trackMixRef = useRef<GainNode[]>([]);
   const ringsRef = useRef<RingBuf[]>([]);
   const procsRef = useRef<ScriptProcessorNode[]>([]);
+  /** Master pre-FX, one pair per track and index-parallel to the mixes. */
+  const mfxRef = useRef<{ scramble: FxChain; smear: FxChain }[]>([]);
   const tapSinkRef = useRef<GainNode | null>(null);
   const srcCanvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
   const srcNodeEls = useRef<Record<string, HTMLDivElement | null>>({});
@@ -486,9 +600,9 @@ export default function LiveApp() {
     const lerp = (lo: number, hi: number) => lo + norm * (hi - lo);
     const pick = (arr: number[]) => arr[Math.min(arr.length - 1, Math.floor(norm * arr.length))];
     if (id === 'inputRate') {
-      if (tempoRef.current) setInputBeats(pick(BEATS)); else setInputRate(pick(RATES));
+      if (tempoRef.current) setInputBeats(pick(BEATS)); else setInputRate(pick(INPUT_RATES));
     } else if (id === 'generateRate') {
-      if (tempoRef.current) setGenerateBeats(pick(BEATS)); else setGenerateRate(pick(RATES));
+      if (tempoRef.current) setGenerateBeats(pick(BEATS)); else setGenerateRate(pick(GEN_RATES));
     }
     // Everything below is per track and lands on whichever tab is showing.
     else if (id === 'noise') patchActive({ noise: Number(lerp(0.05, 1).toFixed(2)) });
@@ -502,11 +616,22 @@ export default function LiveApp() {
     }
     // Momentary: fire once as the control crosses halfway, so a pad, a
     // footswitch or a fader all work and holding one down does not repeat.
-    else if (id === 'flush' || id === 'inject') {
+    else if (id === 'mfxScramble' || id === 'mfxSmear') {
       const down = norm >= 0.5;
       if (down && !triggersRef.current[id]) {
-        (id === 'flush' ? actionsRef.current.flush : actionsRef.current.inject)();
+        const k = id === 'mfxScramble' ? 'scramble' : 'smear';
+        setMasterFx(v => ({ ...v, [k]: !v[k] }));
       }
+      triggersRef.current[id] = down;
+    }
+    else if (id === 'freeze') {
+      const down = norm >= 0.5;
+      if (down && !triggersRef.current[id]) setFrozen(v => !v);
+      triggersRef.current[id] = down;
+    }
+    else if (id === 'inject') {
+      const down = norm >= 0.5;
+      if (down && !triggersRef.current[id]) actionsRef.current.inject();
       triggersRef.current[id] = down;
     }
     else if (id === 'fxAmount') {
@@ -517,6 +642,15 @@ export default function LiveApp() {
     else if (id === 'hpf') patchActive({ hpf: Number(norm.toFixed(3)) });
     else if (id === 'comb') patchActive({ comb: Number(norm.toFixed(3)) });
     else if (id === 'inputMonitor') setInputMonitor(Number(norm.toFixed(2)));
+    else if (id === 'masterVolume') setMasterVolume(Number(norm.toFixed(2)));
+    // One binding per box, keyed to the box rather than to a slot number.
+    else if (id.startsWith('inputMonitor:')) {
+      patchSource(id.slice('inputMonitor:'.length), { monitor: Number(norm.toFixed(2)) });
+    }
+    else if (/^send\d+$/.test(id)) {
+      const inst = sourcesRef.current[Number(id.slice(4))];
+      if (inst) patchSource(inst.id, { level: Number(norm.toFixed(2)) });
+    }
     else if (id.startsWith('outputMonitor')) {
       const t = Number(id.slice('outputMonitor'.length)) || 0;
       patchTrack(t, { outputMonitor: Number(norm.toFixed(2)) });
@@ -558,12 +692,44 @@ export default function LiveApp() {
 
   useEffect(() => { if (inGainRef.current) inGainRef.current.gain.value = inputMonitor; }, [inputMonitor]);
 
+  // Per-box monitor levels, and the switch between the two modes. The master
+  // slider stays live in both: in box mode it trims the whole monitor bus.
+  const levelKey = sources.map(x => `${x.id}:${x.level}`).join(',');
+  useEffect(() => {
+    const t = inCtxRef.current?.currentTime ?? 0;
+    for (const inst of sourcesRef.current) {
+      srcNodesRef.current[inst.id]?.gain.gain.setTargetAtTime(inst.level, t, 0.02);
+    }
+  }, [levelKey]);
+
+  const monKey = `${monitorMode}|${sources.map(x => `${x.id}:${x.monitor}`).join(',')}`;
+  useEffect(() => {
+    const t = inCtxRef.current?.currentTime ?? 0;
+    for (const inst of sourcesRef.current) {
+      const g = srcNodesRef.current[inst.id]?.mon;
+      // Ramped, so moving a fader or flipping the mode never clicks.
+      g?.gain.setTargetAtTime(monitorModeRef.current === 'box' ? inst.monitor : 1, t, 0.02);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [monKey]);
+
   // Tempo-aware pre-FX (Scramble slices in sixteenths) follow the app's BPM,
   // including the one a Live Code pattern sets on evaluate — which happens
   // after the chains are built, so this has to be live rather than set once.
   useEffect(() => {
     for (const n of Object.values(srcNodesRef.current)) n?.fx.setTempo(bpm);
+    for (const m of mfxRef.current) m.scramble.setTempo(bpm);
   }, [bpm]);
+
+  // The buttons are latches, so the amount is the only thing that moves. Both
+  // methods are a true bypass at 0 — they tear their guts down rather than run
+  // at zero mix — so an unlit button costs nothing per track.
+  useEffect(() => {
+    for (const m of mfxRef.current) {
+      m.scramble.setAmount(masterFxAmt(masterFx.scramble));
+      m.smear.setAmount(masterFxAmt(masterFx.smear));
+    }
+  }, [masterFx, masterFxAmt]);
 
   // Pre-FX follows its box live. Method changes swap the chain's guts behind
   // stable endpoints, so a box never drops out of its patch mid-set.
@@ -618,6 +784,11 @@ export default function LiveApp() {
   useEffect(() => {
     const tick = () => {
       rafRef.current = requestAnimationFrame(tick);
+
+      // Nothing behind the show view is visible, so none of it is worth drawing.
+      // The tracks' own spectrograms keep running: they are cheap, and a track
+      // cannot be unmounted without losing its session.
+      if (layoutRef.current === 'show') { frameRef.current++; return; }
 
       // One scope per enabled source. A Live Input's canvas switches to its own
       // recorded take once one exists, and a File Loop shows the file it
@@ -800,6 +971,10 @@ export default function LiveApp() {
       w: 0, filled: 0, sr: ctx.sampleRate,
     };
     proc.onaudioprocess = (e) => {
+      // Frozen: drop the block on the floor. Leaving `w` and `filled` where
+      // they are is the whole mechanism — the window the snapshot reads back
+      // from the write head cannot move if the head does not.
+      if (frozenRef.current) return;
       const Lc = e.inputBuffer.getChannelData(0);
       const Rc = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : Lc;
       for (let k = 0; k < Lc.length; k++) {
@@ -809,10 +984,21 @@ export default function LiveApp() {
       }
       ring.filled = Math.min(ring.filled + Lc.length, ring.l.length);
     };
-    mix.connect(proc);
+    // Master pre-FX sits here: after the patch sum, before the ring, so it
+    // changes what the model conditions on and leaves the monitor path — which
+    // is tapped per source, further upstream — hearing the dry feed.
+    const st = masterFxRef.current;
+    const mfx = {
+      scramble: new FxChain(ctx, 'scramble', masterFxAmt(st.scramble)),
+      smear: new FxChain(ctx, 'smear', masterFxAmt(st.smear)),
+    };
+    mfx.scramble.setTempo(bpmRef.current);
+    mix.connect(mfx.scramble.input);
+    mfx.scramble.output.connect(mfx.smear.input);
+    mfx.smear.output.connect(proc);
     proc.connect(tapSink);
-    return { mix, ring, proc };
-  }, []);
+    return { mix, ring, proc, mfx };
+  }, [masterFxAmt]);
 
   // ─────────────────────────────────────────────────────────────────────
   // Transport
@@ -824,6 +1010,11 @@ export default function LiveApp() {
     // Each track has its own mix, so each gets its own window. When two tracks
     // are patched identically the bytes are identical, but they are still sent
     // separately — the backend sessions are independent.
+    // One stamp for the whole round: the instant this window of input ends.
+    // The backend echoes it back with the audio it made, which is how each
+    // track times its own snapshot-to-sound delay.
+    const tag = performance.now();
+
     rings.forEach((ring, ti) => {
       const want = Math.min(Math.floor(paramsRef.current.inputRate * ring.sr), ring.filled);
       if (want < ring.sr * 0.25) return;   // under 250 ms captured; nothing useful
@@ -836,7 +1027,7 @@ export default function LiveApp() {
         inter[i * 2 + 1] = ring.r[j];
       }
       trackRefs.current[ti]?.push(
-        { type: 'audio_header', channels: 2, sample_rate: ring.sr },
+        { type: 'audio_header', channels: 2, sample_rate: ring.sr, tag },
         inter.buffer,
       );
     });
@@ -861,10 +1052,6 @@ export default function LiveApp() {
 
   /** Silence every track at once, and have each session forget its own last
    *  output so Loopback cannot bring back what was just cut. */
-  const flushAll = useCallback(() => {
-    for (const t of trackRefs.current) t?.flush();
-  }, []);
-
   /**
    * Generate now from the last Input Rate of audio, the window ending at this
    * instant, and re-phase the cycle clock to the press. The ring is already
@@ -877,12 +1064,69 @@ export default function LiveApp() {
     scheduleCycles(paramsRef.current.generateRate * 1000);
   }, [pushSnapshot, scheduleCycles]);
 
+  /**
+   * Line the tracks up on the slowest one. Each track measures its own round
+   * trip — queue wait, engine lock, generation, transfer, decode — and holding
+   * every faster track back by the difference puts one input moment under the
+   * same wall-clock instant in all of them. Nudge sits before each track's
+   * analyser, so the spectrograms line up as well as the audio.
+   *
+   * The alignment is only as stable as those timings: the global engine lock
+   * can hand the tracks a different order on the next cycle, so this is a
+   * button to re-press, not a setting. It acts on every track at once whatever
+   * MASTER says — a half-aligned rack is worse than an unaligned one.
+   */
+  const applySync = useCallback((lats: (number | null)[]) => {
+    const known = lats.filter((v): v is number => v !== null);
+    if (known.length < 2) return;
+    const slowest = Math.max(...known);
+    setTracks(ts => ts.map((t, i) => {
+      const own = lats[i];
+      if (own == null) return t;
+      const n = Math.max(0, Math.min(MAX_NUDGE, Number((slowest - own).toFixed(2))));
+      // Deadband: the medians wobble by a few ms and rewriting nudge on every
+      // tick would keep the delay line gliding for no audible reason.
+      return Math.abs(n - t.nudge) < SYNC_DEADBAND ? t : { ...t, nudge: n };
+    }));
+  }, []);
+
+  /** Latched: SYNC is upkeep, not a one-shot, so it holds the alignment as the
+   *  timings move. Also the only window onto whether any round trip has been
+   *  measured yet — without it a press on cold tracks looks like a dead button. */
+  const [syncOn, setSyncOn] = useState(false);
+  const [latencies, setLatencies] = useState<(number | null)[]>([]);
+
+  useEffect(() => {
+    if (!running) { setSyncOn(false); setLatencies([]); return; }
+    const id = setInterval(() => {
+      const lats = trackRefs.current.map(t => t?.latency() ?? null);
+      setLatencies(prev => (prev.length === lats.length
+        && prev.every((p, i) => p === lats[i]) ? prev : lats));
+      if (syncOn) applySync(lats);
+    }, SYNC_POLL_MS);
+    return () => clearInterval(id);
+  }, [running, syncOn, applySync]);
+
   // MIDI reaches these through a ref: applyMidi is defined further up, and a
   // dependency array is evaluated during render, before these exist.
-  const actionsRef = useRef({ flush: flushAll, inject: injectNow });
-  useEffect(() => { actionsRef.current = { flush: flushAll, inject: injectNow }; }, [flushAll, injectNow]);
+  const actionsRef = useRef({ inject: injectNow });
+  useEffect(() => { actionsRef.current = { inject: injectNow }; }, [injectNow]);
 
   const [isStarting, setIsStarting] = useState(false);
+
+  // Bulk delay the master FX adds to the feed. Pure functions of the amount,
+  // so this needs no round trip through the audio nodes.
+  const mfxLatency =
+    (masterFx.scramble ? fxMethod('scramble').latencyAt(MASTER_FX_AMOUNT) : 0)
+    + (masterFx.smear ? fxMethod('smear').latencyAt(MASTER_FX_AMOUNT) : 0);
+
+  // What SYNC has to work with: how many tracks have been timed, and what the
+  // active one measured. Shown under the button so a greyed-out SYNC can be
+  // told apart from a broken one.
+  const syncReady = latencies.filter(v => v !== null).length;
+  const activeLat = latencies[activeTab] ?? null;
+  const syncLabel = activeLat != null ? `${activeLat.toFixed(2)}s rt`
+    : syncReady ? 'no data' : 'waiting';
 
   /** Lazily pull in the AGPL Strudel bundle, only when Live Code is used. */
   const ensureStrudel = useCallback(async (): Promise<StrudelHandle | null> => {
@@ -1114,16 +1358,22 @@ export default function LiveApp() {
       audio: {
         deviceId: deviceId ? { exact: deviceId } : undefined,
         echoCancellation: false, noiseSuppression: false, autoGainControl: false,
-        // Ask for everything the interface offers; a 2-in device reports 2.
-        channelCount: { ideal: 8 },
+        // Ask for every channel a box can address; a 2-in device just reports 2.
+        channelCount: { ideal: MAX_INPUT_CHANNELS },
       },
     });
     streamRef.current = stream;
     const raw = ctx.createMediaStreamSource(stream);
-    const nCh = Math.max(1, stream.getAudioTracks()[0]?.getSettings().channelCount ?? 2);
-    micChanRef.current = nCh;
-    setDetectedChannels(nCh);
-    const splitter = ctx.createChannelSplitter(nCh);
+    // Track settings often omit channelCount entirely, and the old `?? 2`
+    // fallback then hid channels 3 and 4 on a four-in interface. The source
+    // node knows how wide the stream really is, so take whichever says more.
+    const reported = stream.getAudioTracks()[0]?.getSettings().channelCount ?? 0;
+    setDetectedChannels(Math.max(1, reported, raw.channelCount || 0));
+    // The splitter and the clamp use the addressable width, not the detected
+    // one: clamping to a mis-detected 2 would quietly play channel 2 when
+    // channel 3 was asked for, which is worse than silence.
+    micChanRef.current = MAX_INPUT_CHANNELS;
+    const splitter = ctx.createChannelSplitter(MAX_INPUT_CHANNELS);
     raw.connect(splitter);
     micSplitRef.current = splitter;
     return splitter;
@@ -1212,12 +1462,15 @@ export default function LiveApp() {
     fxOut.fftSize = 2048;
     fx.output.connect(fxOut);
 
+    const mon = ctx.createGain();
+    mon.gain.value = monitorModeRef.current === 'box' ? inst.monitor : 1;
+
     // Display tap is PRE-fader, so a box stays visible at level 0.
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 2048;
     head.connect(analyser);
 
-    return { head, gain, out: fx.output, fx, fxIn, fxOut, analyser, merger: micMerger, ...extra };
+    return { head, gain, out: fx.output, fx, fxIn, fxOut, mon, analyser, merger: micMerger, ...extra };
   };
 
 
@@ -1255,13 +1508,15 @@ export default function LiveApp() {
       const mixes: GainNode[] = [];
       const rings: RingBuf[] = [];
       const procs: ScriptProcessorNode[] = [];
+      const mfxs: { scramble: FxChain; smear: FxChain }[] = [];
       for (let i = 0; i < tracks.length; i++) {
         const c = makeTrackChain(ctx, tapSink, cap);
-        mixes.push(c.mix); rings.push(c.ring); procs.push(c.proc);
+        mixes.push(c.mix); rings.push(c.ring); procs.push(c.proc); mfxs.push(c.mfx);
       }
       trackMixRef.current = mixes;
       ringsRef.current = rings;
       procsRef.current = procs;
+      mfxRef.current = mfxs;
 
       // Monitoring scales the same summed mix that is being sent, so what you
       // hear is the balance the model receives. It stays at 0 by default so a
@@ -1283,13 +1538,28 @@ export default function LiveApp() {
         const n = await buildSource(inst, ctx);
         if (!n) continue;
         built[inst.id] = n;
-        n.out.connect(monitorGain);
+        // Through the box's own monitor gain, so per-box levels need no rewire.
+        if (n.mon) { n.out.connect(n.mon); n.mon.connect(monitorGain); }
+        else n.out.connect(monitorGain);
         // Patch into whichever tracks this box is routed to.
         inst.to.forEach((on, ti) => {
           if (on && mixes[ti]) n.out.connect(mixes[ti]);
         });
       }
       srcNodesRef.current = built;
+
+      // Summed input for the show view. monitorGain would be the obvious tap,
+      // but its gain is the monitor volume — usually 0 — so an analyser after it
+      // reads silence. This is a unity sum of every box's post-FX output, and it
+      // ends at the silent sink so the graph has a reason to render it.
+      const showSum = ctx.createGain();
+      const showAn = ctx.createAnalyser();
+      showAn.fftSize = 2048;
+      for (const n of Object.values(built)) n.out.connect(showSum);
+      showSum.connect(showAn);
+      showAn.connect(tapSink);
+      showSumRef.current = showSum;
+      inAnalyserRef.current = showAn;
 
       // A file is already in memory, so a track fed ONLY by the file need not
       // sit through a real InputRate of silence: pre-fill its ring and resume
@@ -1369,6 +1639,9 @@ export default function LiveApp() {
 
   const stop = () => {
     setRunning(false);
+    // START builds fresh rings with nothing in them, so a freeze carried across
+    // a stop would leave the model with no input and no way to tell why.
+    setFrozen(false);
     // ...and STOP presses HUSH, the other half of the same deal.
     if (sourcesRef.current.some(x => x.kind === 'code')) hushStrudel();
     setStatus('Idle');
@@ -1376,8 +1649,13 @@ export default function LiveApp() {
     for (const t of trackRefs.current) t?.finish();
     for (const pr of procsRef.current) pr.disconnect();
     procsRef.current = [];
+    for (const m of mfxRef.current) { m.scramble.dispose(); m.smear.dispose(); }
+    mfxRef.current = [];
     for (const m of trackMixRef.current) m.disconnect();
     trackMixRef.current = [];
+    showSumRef.current?.disconnect();
+    showSumRef.current = null;
+    inAnalyserRef.current?.disconnect();
     tapSinkRef.current?.disconnect();
     tapSinkRef.current = null;
     for (const n of Object.values(srcNodesRef.current)) {
@@ -1455,6 +1733,59 @@ export default function LiveApp() {
     else setLoops(m => ({ ...m, [inst.id]: { ...(m[inst.id] ?? IDLE_SLOT), trim } }));
   };
 
+  // ── show view ────────────────────────────────────────────────────────
+  /** Fill `into` with the summed live input, as -1..1, at whatever resolution
+   *  the caller asked for. */
+  const readInputWave = useCallback((into: Float32Array) => {
+    const an = inAnalyserRef.current;
+    if (!an) return false;
+    if (showBytesRef.current.length !== an.fftSize) {
+      showBytesRef.current = new Uint8Array(new ArrayBuffer(an.fftSize));
+    }
+    const buf = showBytesRef.current;
+    an.getByteTimeDomainData(buf);
+    const n = into.length, m = buf.length;
+    for (let i = 0; i < n; i++) into[i] = buf[((i * m) / n) | 0] / 128 - 1;
+    return true;
+  }, []);
+
+  /** Fill `into` with every track's output as it is actually being heard, each
+   *  already scaled by its own monitor level. Each track has its own
+   *  AudioContext, so this cannot be summed in the audio graph — it is added
+   *  here instead, which is visually right but not phase-accurate. */
+  const readOutputWave = useCallback((into: Float32Array) => {
+    if (showTmpRef.current.length !== into.length) showTmpRef.current = new Float32Array(into.length);
+    const tmp = showTmpRef.current;
+    into.fill(0);
+    let n = 0;
+    for (const t of trackRefs.current) {
+      if (!t?.readWave(tmp)) continue;
+      for (let i = 0; i < into.length; i++) into[i] += tmp[i];
+      n++;
+    }
+    if (!n) return false;
+    // Summed rather than averaged, so one track at full monitor draws the same
+    // trace whether or not a second track is up. Clamped so several loud tracks
+    // cannot draw a trace straight through the captions.
+    if (n > 1) for (let i = 0; i < into.length; i++) into[i] = Math.max(-1, Math.min(1, into[i]));
+    return true;
+  }, []);
+
+  /**
+   * The prompts the audience is actually hearing, for the show view's caption.
+   * A track contributes nothing if its prompt is empty, if its monitor is all
+   * the way down, or if another track's solo has silenced it — in each case
+   * there is no sound to attribute to it.
+   */
+  const audiblePrompts = tracks
+    .filter((t, i) => t.prompt.trim() && t.outputMonitor > 0 && (solo === null || solo === i))
+    .map(t => t.prompt.trim());
+
+  /** Leaving the show view returns to whichever working layout you came from. */
+  const lastFlatRef = useRef<Layout>('vertical');
+  useEffect(() => { if (layout !== 'show') lastFlatRef.current = layout; }, [layout]);
+  const leaveShow = useCallback(() => setLayout(lastFlatRef.current), []);
+
   // ── the draggable divider between the two halves ─────────────────────
   const stageRef = useRef<HTMLDivElement | null>(null);
   const splitDragRef = useRef(false);
@@ -1481,7 +1812,7 @@ export default function LiveApp() {
     // Neither side may be squeezed to nothing: a pane below this still has
     // room for its title and one box.
     const clamped = Math.max(0.18, Math.min(0.82, f));
-    setSplit(sp => ({ ...sp, [layoutRef.current]: clamped }));
+    setSplit(sp => ({ ...sp, [splitKey(layoutRef.current)]: clamped }));
   }, []);
 
   const onSplitUp = useCallback((e: React.PointerEvent) => {
@@ -1498,7 +1829,7 @@ export default function LiveApp() {
   /** Double-click the divider to go back to even halves. */
   const resetSplit = useCallback(() => {
     setSplit(sp => {
-      const next = { ...sp, [layoutRef.current]: 0.5 };
+      const next = { ...sp, [splitKey(layoutRef.current)]: 0.5 };
       localStorage.setItem('sa3_live_split', JSON.stringify(next));
       return next;
     });
@@ -1683,6 +2014,7 @@ export default function LiveApp() {
         trackMixRef.current = [...trackMixRef.current, c.mix];
         ringsRef.current = [...ringsRef.current, c.ring];
         procsRef.current = [...procsRef.current, c.proc];
+        mfxRef.current = [...mfxRef.current, c.mfx];
       }
       // Every existing box patches to the new track by default.
       setSources(list => list.map(x => ({ ...x, to: [...x.to, true] })));
@@ -1709,7 +2041,10 @@ export default function LiveApp() {
     const oldProc = procsRef.current[i];
     if (oldProc) { oldProc.onaudioprocess = null; try { oldProc.disconnect(); } catch { /* idem */ } }
     trackMixRef.current = drop(trackMixRef.current);
+    const deadFx = mfxRef.current[i];
+    if (deadFx) { deadFx.scramble.dispose(); deadFx.smear.dispose(); }
     procsRef.current = drop(procsRef.current);
+    mfxRef.current = drop(mfxRef.current);
     ringsRef.current = drop(ringsRef.current);
     setTracks(ts => {
       const gone = ts[i];
@@ -1744,7 +2079,7 @@ export default function LiveApp() {
     if (id) patchSource(id, patch);
   }, []);
 
-  const renderSource = (inst: SourceInstance) => (
+  const renderSource = (inst: SourceInstance, slot: number) => (
     <InputSection
       key={inst.id}
       src={inst}
@@ -1753,13 +2088,10 @@ export default function LiveApp() {
       connected={inst.to.slice(0, tracks.length).filter(Boolean).length}
       patching={patchFromTrack !== null}
       running={running}
-      channelOptions={channelOptions(detectedChannels)}
+      channelOptions={channelOptions(MAX_INPUT_CHANNELS)}
+      sendLearn={knobProps(`send${slot}`)}
       onChanSel={(v) => patchSource(inst.id, { chanSel: v })}
-      onLevel={(v) => {
-        patchSource(inst.id, { level: v });
-        srcNodesRef.current[inst.id]?.gain.gain.setTargetAtTime(
-          v, inCtxRef.current?.currentTime ?? 0, 0.02);
-      }}
+      onLevel={(v) => patchSource(inst.id, { level: v })}
       onRemove={() => removeSource(inst.id)}
       onCanvas={(el) => { srcCanvasRefs.current[inst.id] = el; }}
       onNode={(el) => { srcNodeEls.current[inst.id] = el; }}
@@ -1787,6 +2119,15 @@ export default function LiveApp() {
           try { (e.target as Element).releasePointerCapture(e.pointerId); } catch { /* done */ }
         },
       }}
+      monitorSlider={monitorMode === 'box' ? (
+        <MidiSlider {...knobProps(`inputMonitor:${inst.id}`)} label="Mon"
+                    value={inst.monitor}
+                    onChange={(v) => {
+                      patchSource(inst.id, { monitor: v });
+                      srcNodesRef.current[inst.id]?.mon?.gain.setTargetAtTime(
+                        v, inCtxRef.current?.currentTime ?? 0, 0.02);
+                    }} />
+      ) : undefined}
       fxBadge={inst.fxAmount > 0
         ? <>{fxMethod(inst.fxMethod).label}<b>{fxMethod(inst.fxMethod).format(inst.fxAmount)}</b></>
         : undefined}
@@ -1928,7 +2269,7 @@ export default function LiveApp() {
           <option value="medium">medium</option>
         </select>
 
-        <div className="view-toggle" title="Switch between stacked and side-by-side layouts">
+        <div className="view-toggle" title="Stacked, side by side, or the bare show screen">
           <button className={layout === 'vertical' ? 'on' : ''}
                   onClick={() => setLayout('vertical')} aria-label="Stacked layout">
             <Rows2 size={13} />
@@ -1936,6 +2277,10 @@ export default function LiveApp() {
           <button className={layout === 'horizontal' ? 'on' : ''}
                   onClick={() => setLayout('horizontal')} aria-label="Side-by-side layout">
             <Columns2 size={13} />
+          </button>
+          <button className={layout === 'show' ? 'on' : ''}
+                  onClick={() => setLayout('show')} aria-label="Show view">
+            <AudioWaveform size={13} />
           </button>
         </div>
 
@@ -1999,7 +2344,7 @@ export default function LiveApp() {
 
         <div className="stage" ref={stageRef}>
         <section className="pane input-pane"
-                 style={{ flexGrow: split[layout], flexBasis: 0 }}>
+                 style={{ flexGrow: split[splitKey(layout)], flexBasis: 0 }}>
           <canvas ref={noiseCanvasRef} className="pane-noise" />
           <div className="pane-title">Live-Input Feed</div>
 
@@ -2010,12 +2355,13 @@ export default function LiveApp() {
           <div className="in-stack">
             <div className="in-col main">
             {sources.filter(x => x.kind !== 'code').map(inst => (
-              renderSource(inst)
+              renderSource(inst, sources.indexOf(inst))
             ))}
             </div>
             {sources.some(x => x.kind === 'code') && (
               <div className="in-col code">
-                {sources.filter(x => x.kind === 'code').map(inst => (renderSource(inst)))}
+                {sources.filter(x => x.kind === 'code')
+                  .map(inst => (renderSource(inst, sources.indexOf(inst))))}
               </div>
             )}
           </div>
@@ -2051,8 +2397,17 @@ export default function LiveApp() {
                    }} />
           </div>
 
-          <MidiSlider {...knobProps('inputMonitor')} label="Monitor"
-                      value={inputMonitor} onChange={setInputMonitor} />
+          <div className="monitor-row">
+            <MidiSlider {...knobProps('inputMonitor')} label="Monitor"
+                        value={inputMonitor} onChange={setInputMonitor} />
+            <button
+              className={`mon-mode ${monitorMode === 'box' ? 'on' : ''}`}
+              onClick={() => setMonitorMode(m => (m === 'box' ? 'sum' : 'box'))}
+              title={monitorMode === 'box'
+                ? 'Each box has its own monitor level; Monitor trims all of them. Click for one summed level.'
+                : 'Give every input box its own monitor level'}
+            >PER BOX</button>
+          </div>
         </section>
 
         <div
@@ -2083,7 +2438,7 @@ export default function LiveApp() {
           </div>
         </div>
 
-        <div className="out-side" style={{ flexGrow: 1 - split[layout], flexBasis: 0 }}>
+        <div className="out-side" style={{ flexGrow: 1 - split[splitKey(layout)], flexBasis: 0 }}>
           <div className="pane-title right">Live-Output Feed</div>
           <div className="out-stack">
           {tracks.map((t, i) => (
@@ -2116,6 +2471,7 @@ export default function LiveApp() {
               onShelfDone={() => setShelfBusy(false)}
               learnProps={knobProps}
               running={running}
+              masterVolume={masterVolume}
             />
           ))}
           </div>
@@ -2194,14 +2550,14 @@ export default function LiveApp() {
           <div className="group-cap">MASTER</div>
           <div className="knob-row act-row">
             <button
-              className={`act-btn flush ${midiLearn ? 'learning' : ''} ${armed === 'flush' ? 'armed' : ''}`}
-              onClick={() => (midiLearn ? arm('flush') : flushAll())}
+              className={`act-btn freeze ${frozen ? 'on' : ''} ${midiLearn ? 'learning' : ''} ${armed === 'freeze' ? 'armed' : ''}`}
+              onClick={() => (midiLearn ? arm('freeze') : setFrozen(v => !v))}
               disabled={!running && !midiLearn}
-              title="Silence every track now, and have each one forget its own last output so Loopback cannot bring it back"
+              title="Hold the input the model is working from. Capture stops advancing, so every cycle from here re-reads the same window — you keep playing and hearing yourself, but the model keeps turning over the moment you froze. Press again to let it move."
             >
-              <span className="act-name">FLUSH</span>
-              <span className="act-sub">silence all</span>
-              {bindingLabel('flush') && <span className="act-bind">{bindingLabel('flush')}</span>}
+              <span className="act-name">FREEZE</span>
+              <span className="act-sub">{frozen ? 'holding' : 'hold input'}</span>
+              {bindingLabel('freeze') && <span className="act-bind">{bindingLabel('freeze')}</span>}
             </button>
             <button
               className={`act-btn inject ${midiLearn ? 'learning' : ''} ${armed === 'inject' ? 'armed' : ''}`}
@@ -2213,6 +2569,38 @@ export default function LiveApp() {
               <span className="act-sub">generate now</span>
               {bindingLabel('inject') && <span className="act-bind">{bindingLabel('inject')}</span>}
             </button>
+            {/* The pre-FX latches share the row with the momentary pair. Both
+                are in signal order — whatever is lit processes the summed feed
+                on its way to the ring, so the model conditions on it while the
+                input monitor keeps hearing the dry sources. */}
+            <button
+              className={`act-btn mfx ${masterFx.scramble ? 'on' : ''} ${midiLearn ? 'learning' : ''} ${armed === 'mfxScramble' ? 'armed' : ''}`}
+              onClick={() => (midiLearn ? arm('mfxScramble') : setMasterFx(v => ({ ...v, scramble: !v.scramble })))}
+              title="Reorder 1/16-note slices of the whole summed input at 80%, cut on the hits and drawn from the last bar. Runs before SMEAR, which would otherwise dissolve the onsets it cuts on. Latches."
+            >
+              <span className="act-name">SCRAMBLE</span>
+              <span className="act-sub">{masterFx.scramble ? 'on · 80%' : 'off'}</span>
+              {bindingLabel('mfxScramble') && <span className="act-bind">{bindingLabel('mfxScramble')}</span>}
+            </button>
+            <button
+              className={`act-btn mfx ${masterFx.smear ? 'on' : ''} ${midiLearn ? 'learning' : ''} ${armed === 'mfxSmear' ? 'armed' : ''}`}
+              onClick={() => (midiLearn ? arm('mfxSmear') : setMasterFx(v => ({ ...v, smear: !v.smear })))}
+              title="Convolve the whole summed input with a 529 ms Gaussian noise burst at 80%: the spectrum survives, the attacks dissolve. Runs last. Latches."
+            >
+              <span className="act-name">SMEAR</span>
+              <span className="act-sub">{masterFx.smear ? 'on · 80%' : 'off'}</span>
+              {bindingLabel('mfxSmear') && <span className="act-bind">{bindingLabel('mfxSmear')}</span>}
+            </button>
+          </div>
+          {mfxLatency > 0 && (
+            <div className="mfx-lat">+{(mfxLatency * 1000).toFixed(0)} ms to the feed</div>
+          )}
+
+          {/* The fader sits under the pair because it is the same scope: one
+              control over everything the rack is putting out. */}
+          <div className="master-vol">
+            <MidiSlider {...knobProps('masterVolume')} label="Volume"
+                        value={masterVolume} onChange={setMasterVolume} />
           </div>
         </div>
 
@@ -2269,9 +2657,9 @@ export default function LiveApp() {
             </>
           ) : (
             <>
-              <Knob {...knobProps('inputRate')} label="Input Rate" values={RATES}
+              <Knob {...knobProps('inputRate')} label="Input Rate" values={INPUT_RATES}
                     value={inputRate} onChange={setInputRate} format={v => `${v}s`} />
-              <Knob {...knobProps('generateRate')} label="Generate Rate" values={RATES}
+              <Knob {...knobProps('generateRate')} label="Generate Rate" values={GEN_RATES}
                     value={generateRate} onChange={setGenerateRate} format={v => `${v}s`} />
             </>
           )}
@@ -2336,9 +2724,24 @@ export default function LiveApp() {
           <Knob {...knobProps('loopback')} label="Loopback" min={0} max={1} step={0.01}
                 value={cur.loopback} onChange={v => patchActive({ loopback: v })}
                 format={v => `${Math.round(v * 100)}%`} />
-          <Knob {...knobProps('nudge')} label="Nudge" min={0} max={MAX_NUDGE} step={0.01}
-                value={cur.nudge} onChange={v => patchActive({ nudge: v })}
-                format={v => `${v.toFixed(2)}s`} />
+          <div className="variant-cell">
+            <Knob {...knobProps('nudge')} label="Nudge" min={0} max={MAX_NUDGE} step={0.01}
+                  value={cur.nudge} onChange={v => patchActive({ nudge: v })}
+                  format={v => `${v.toFixed(2)}s`} />
+            <button className={`sync-btn${syncOn ? ' on' : ''}`}
+                    onClick={() => {
+                      const next = !syncOn;
+                      setSyncOn(next);
+                      if (next) applySync(trackRefs.current.map(t => t?.latency() ?? null));
+                    }}
+                    disabled={!running || syncReady < 2}
+                    title={syncReady < 2
+                      ? 'Waiting on measured round trips — two tracks need to have played a cycle each. If this stays greyed out while both tracks are sounding, the backend is running an older build that does not echo the timing stamp.'
+                      : 'Latched: holds every track back to match the slowest round trip, so one input moment lands at the same instant in all of them, and keeps re-aligning as the timings move.'}>
+              SYNC
+            </button>
+            <div className="sync-read">{syncLabel}</div>
+          </div>
           </div>
         </div>
 
@@ -2372,6 +2775,14 @@ export default function LiveApp() {
           </button>
         )}
       </footer>
+
+      {/* The performance screen sits over everything; the rest of the app stays
+          mounted behind it, because unmounting a track would take its socket
+          and its audio graph with it. */}
+      {layout === 'show' && (
+        <ShowView inputWave={readInputWave} outputWave={readOutputWave}
+                  prompts={audiblePrompts} onExit={leaveShow} />
+      )}
     </div>
   );
 }

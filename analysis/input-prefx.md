@@ -305,3 +305,57 @@ a mic can be washed out while a Live Code pattern stays sharp. The rack's Input
 FX group edits whichever box is selected — click a box to select it, the same
 gesture that picks a track on the output side. The selected box's name is shown
 under the group caption.
+
+## 6. Master SMEAR and SCRAMBLE
+
+The per-box controls above are for setting a rig up. The MASTER group carries
+two latching buttons that are for playing it: SCRAMBLE and SMEAR, each fixed at
+`MASTER_FX_AMOUNT = 0.8`, applied to **the summed feed a track sends** rather
+than to any one box. One press processes everything patched in, whatever the
+boxes are individually set to, and the box FX still runs first — it is upstream.
+
+They insert between a track's mix and its ring:
+
+```
+sources ─┬─► box FX ─► monitor ──────────────────────────────► ears
+         └─► track mix ─► SCRAMBLE ─► SMEAR ─► ring ─► model
+```
+
+Three things fall out of that position, and they are the reasons for it:
+
+**Scramble leads.** It cuts its slices on detected onsets. Smear exists to
+dissolve onsets — a 529 ms Gaussian noise burst at 0.8 — so the other order
+starves the detector and the reordering stops being audible. Signal order is
+also the order the buttons sit in, left to right.
+
+**The monitor stays dry.** The monitor is tapped per source, upstream of the
+mixes, so it is untouched by a master latch: you hear the raw sources while the
+model conditions on the processed sum. The processed version comes back as the
+model's output, which is the feedback that matters. Hearing the feed itself
+would mean re-routing the monitor to follow one track's post-FX point, and with
+per-track patching that tap can only ever be true for one track.
+
+**One pair per track, built with the mixes.** `makeTrackChain` creates them, so
+they are index-parallel to the mixes and rings and are added and disposed with
+them. Both methods are a true bypass at amount 0 — they tear their guts down
+rather than run at zero mix — so an unlit button is two unity gains per track
+and costs nothing. A latch pressed before START is picked up when the graph is
+built, since the chains read the current state at construction.
+
+Bulk delay added to the feed, shown under the buttons while either is lit:
+
+| lit | added |
+| --- | --- |
+| neither | 0 ms |
+| SCRAMBLE | 52 ms |
+| SMEAR | 265 ms |
+| both | 317 ms |
+
+This is real delay, not something to compensate: the window the model sees is
+shifted that much further into the past. Scramble's figure is its detector
+tolerance plus lag; Smear's is T/2, because dissolving an attack means spreading
+energy backwards as well as forwards, and backwards means lookahead.
+
+Both latches are MIDI-learnable (`mfxScramble`, `mfxSmear`) and toggle on the
+rising edge, so a pad or a footswitch works and holding one down does not
+chatter.

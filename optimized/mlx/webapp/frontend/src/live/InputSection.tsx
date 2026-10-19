@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { X } from 'lucide-react';
-import { SOURCE_META, type SourceInstance } from './trackTypes';
+import { SOURCE_META, type LearnProps, type SourceInstance } from './trackTypes';
 
 /**
  * One input box: its own display, send fader, and a patch node on the right
@@ -27,6 +27,11 @@ interface Props {
   overlay?: ReactNode;
   /** Names the input effect drawn in the band at the foot of the canvas. */
   fxBadge?: ReactNode;
+  /** Listen-only level, shown only while monitoring is per box. Its presence
+   *  is what labels the fader below it, so the two cannot be confused. */
+  monitorSlider?: ReactNode;
+  /** Lets the send fader take part in MIDI learn, like the monitors do. */
+  sendLearn?: LearnProps;
   tools?: ReactNode;
   canvasProps?: React.CanvasHTMLAttributes<HTMLCanvasElement>;
   patching?: boolean;
@@ -39,7 +44,8 @@ interface Props {
 
 export default function InputSection({
   src, onLevel, onChanSel, onRemove, onCanvas, onNode, onNodeDown,
-  channelOptions, overlay, fxBadge, tools, canvasProps, patching, connected, running,
+  channelOptions, overlay, fxBadge, monitorSlider, sendLearn, tools,
+  canvasProps, patching, connected, running,
   active, onActivate,
 }: Props) {
   const meta = SOURCE_META[src.kind];
@@ -88,13 +94,24 @@ export default function InputSection({
       <div ref={onNode} className="patch-node out" onPointerDown={onNodeDown}
            title="Drag to a track to patch" />
 
-      <div className="in-fader">
+      {monitorSlider}
+
+      <div
+        className={`in-fader ${sendLearn?.learning ? 'learning' : ''} ${sendLearn?.armed ? 'armed' : ''}`}
+        // While arming, a click has to select the fader rather than move it.
+        onPointerDown={sendLearn?.learning ? () => sendLearn.onArm?.(sendLearn.id) : undefined}
+      >
+        {/* Labelled only when a monitor slider sits above it: on its own there
+            is nothing to mistake it for. */}
+        {monitorSlider && <span className="fader-label">Send</span>}
         <input
           type="range" min={0} max={1} step={0.01} value={src.level}
           aria-label={`${meta.name} send level`}
+          disabled={sendLearn?.learning}
           onChange={(e) => onLevel(Number(e.target.value))}
         />
         <span className="dim">{Math.round(src.level * 100)}%</span>
+        {sendLearn?.bound && <span className="slider-binding">{sendLearn.bound}</span>}
       </div>
     </section>
   );
