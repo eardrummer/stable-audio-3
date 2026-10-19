@@ -11,3 +11,6 @@ live_out/
 # Remembered MIDI surface and learned CC map — machine-local, like history
 midi_map.json
 midi_map.json.tmp
+
+# Prompt presets are content and ARE tracked; only the atomic-write temp is not
+prompt_presets.json.tmp

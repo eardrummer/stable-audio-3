@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2, Plus, Rows2, Columns2, AudioWaveform } from 'lucide-react';
+import { Play, Square, Sliders, Circle, Mic, Repeat, FolderOpen, PanelRight, Code2, Trash2, Plus, Rows2, Columns2, AudioWaveform, Speaker } from 'lucide-react';
 import ShowView from './ShowView';
 import Knob from './Knob';
 import LatentShelf from './LatentShelf';
@@ -10,6 +10,7 @@ import TrackOutput, { type TrackHandle } from './TrackOutput';
 import { FX_METHODS, FxChain, fxMethod, MASTER_FX_AMOUNT } from './inputfx';
 import {
   API_URL, VARIANTS, SPREAD_MIN, SPREAD_MAX, MAX_NUDGE, TRACK_THEME,
+  OUT_PAIRS, pairLabel,
   SYNC_POLL_MS, SYNC_DEADBAND,
   SOURCE_KINDS, SOURCE_META, MAX_SLOTS, defaultSources, defaultTrack, newSource,
   lpfHz, hpfHz, combHz,
@@ -216,6 +217,19 @@ export default function LiveApp() {
         ? { ...t, ...patch } : t)));
   }, []);
   /**
+   * Hardware output routing. The master pair carries the whole rack and every
+   * track feeds it, so a track's own pair is an ADDITIONAL send rather than a
+   * move — nothing ever leaves the mix by being routed somewhere.
+   *
+   * `outChannels` is what the device actually gave us, not what we asked for.
+   * It is shown in the panel because a browser that hands back 2 would make
+   * every pair collapse onto 1/2 while the pickers still read 5/6.
+   */
+  const [masterPair, setMasterPair] = useState(0);
+  const [outChannels, setOutChannels] = useState<number | null>(null);
+  const [mapOpen, setMapOpen] = useState(false);
+
+  /**
    * Master pre-FX: the same Smear and Scramble the boxes offer, but on the
    * summed feed each track sends, so one press processes everything patched in.
    * Latching, and both can be on at once.
@@ -366,6 +380,48 @@ export default function LiveApp() {
   const [captureRate, setCaptureRate] = useState<number | null>(null);
   const [status, setStatus] = useState('Idle');
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Named sets of per-track prompts, kept in a file beside the backend so a
+   * combination that worked can be brought back rather than retyped. Recall
+   * fills by position and never adds or removes tracks: each track owns a
+   * WebSocket and an audio graph, and restructuring the rack is not something
+   * a recall should do by accident mid-set.
+   */
+  const [presets, setPresets] = useState<{ name: string; prompts: string[] }[]>([]);
+
+  useEffect(() => {
+    fetch(`${API_URL}/api/live/prompt_presets`)
+      .then(r => r.json())
+      .then(d => setPresets(d.presets || []))
+      .catch(() => {});
+  }, []);
+
+  const recallPreset = (name: string) => {
+    const p = presets.find(x => x.name === name);
+    if (!p) return;
+    setTracks(ts => ts.map((t, i) => (
+      i < p.prompts.length ? { ...t, prompt: p.prompts[i] } : t)));
+  };
+
+  const savePreset = async () => {
+    const prompts = tracksRef.current.map(t => t.prompt);
+    const name = window.prompt(
+      'Save these prompts as', `preset ${presets.length + 1}`)?.trim();
+    if (!name) return;
+    try {
+      const r = await fetch(`${API_URL}/api/live/prompt_presets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, prompts }),
+      });
+      const d = await r.json();
+      if (d.status === 'ok') setPresets(d.presets);
+      else setError(`Could not save the preset: ${d.error}`);
+    } catch {
+      setError('Could not save the preset — is the backend running?');
+    }
+  };
 
   // --- MIDI ------------------------------------------------------------
   const [midiLearn, setMidiLearn] = useState(false);
@@ -2342,6 +2398,64 @@ export default function LiveApp() {
           <PanelRight size={15} /> LATENT
         </button>
 
+        <div className="outmap">
+          <button className={`midi-btn ${mapOpen ? 'on' : ''}`}
+                  onClick={() => setMapOpen(v => !v)}
+                  title="Send the master mix and each track to hardware output pairs">
+            <Speaker size={15} /> OUTPUTS
+          </button>
+          {mapOpen && (
+            <div className="outmap-panel">
+              <div className="outmap-head">
+                <span>OUTPUT MAPPING</span>
+                <button className="outmap-x" onClick={() => setMapOpen(false)}
+                        aria-label="Close">×</button>
+              </div>
+
+              {/* The device's answer, not our request. A 2 here means every
+                  pair below is landing on 1/2 whatever it says. */}
+              <div className={`outmap-note ${outChannels !== null && outChannels < 4 ? 'warn' : ''}`}>
+                {outChannels === null
+                  ? 'Press START to open the device and read its channel count'
+                  : outChannels < 4
+                    ? `Device gave ${outChannels} channels — every pair is landing on 1/2`
+                    : `${outChannels} channels available · ${Math.floor(outChannels / 2)} pairs`}
+              </div>
+
+              <label className="outmap-row master">
+                <span>Master mix</span>
+                <select className="live-select" value={masterPair}
+                        onChange={e => setMasterPair(Number(e.target.value))}
+                        title="Where the whole rack goes, after the master fader">
+                  {Array.from({ length: OUT_PAIRS }, (_, p) => (
+                    <option key={p} value={p}>{pairLabel(p)}</option>
+                  ))}
+                </select>
+              </label>
+
+              {tracks.map((t, i) => (
+                <label key={t.id} className="outmap-row">
+                  <span style={{ color: TRACK_THEME[i]?.accent }}>
+                    {TRACK_THEME[i]?.name ?? `Track ${i + 1}`}
+                  </span>
+                  <select className="live-select" value={t.outPair}
+                          onChange={e => patchTrack(i, { outPair: Number(e.target.value) })}
+                          title="An additional send; this track stays in the master mix either way">
+                    {Array.from({ length: OUT_PAIRS }, (_, p) => (
+                      <option key={p} value={p}>{pairLabel(p)}</option>
+                    ))}
+                  </select>
+                </label>
+              ))}
+
+              <div className="outmap-foot">
+                Each track feeds the master pair as well as its own. Two tracks
+                on one pair sum; a track already on the master pair stays at unity.
+              </div>
+            </div>
+          )}
+        </div>
+
 
         <select className="live-select" value={maxSlots}
                 onChange={e => setMaxSlots(Number(e.target.value))}
@@ -2355,6 +2469,34 @@ export default function LiveApp() {
           <option value="sm-sfx">sm-sfx</option>
           <option value="medium">medium</option>
         </select>
+
+        {/* Prompts come back by position: the first set goes to track 1. The
+            picker resets to its label after a choice, so recalling the same
+            set twice in a row is two presses rather than none. */}
+        <div className="prompt-presets">
+          <select
+            className="live-select"
+            value=""
+            disabled={!presets.length}
+            title={presets.length
+              ? 'Load a saved set of prompts into the tracks, in order'
+              : 'No saved prompt sets yet — SAVE one first'}
+            onChange={e => { recallPreset(e.target.value); e.currentTarget.value = ''; }}
+          >
+            <option value="" disabled>
+              {presets.length ? 'Recall prompts…' : 'No presets'}
+            </option>
+            {presets.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
+          </select>
+          <button
+            className="preset-save"
+            onClick={savePreset}
+            disabled={!tracks.some(t => t.prompt.trim())}
+            title="Save every track's prompt as a named set, in track order. Saving over a name replaces it."
+          >
+            SAVE
+          </button>
+        </div>
 
         <div className="view-toggle" title="Stacked, side by side, or the bare show screen">
           <button className={layout === 'vertical' ? 'on' : ''}
@@ -2559,6 +2701,8 @@ export default function LiveApp() {
               learnProps={knobProps}
               running={running}
               masterVolume={masterVolume}
+              masterPair={masterPair}
+              onChannels={i === 0 ? setOutChannels : undefined}
             />
           ))}
           </div>

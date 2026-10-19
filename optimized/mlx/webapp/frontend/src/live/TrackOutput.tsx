@@ -5,7 +5,7 @@ import { Plus, Minus, Headphones, Unlink } from 'lucide-react';
 import MidiSlider from './MidiSlider';
 import { drawSpectrogram } from '../shared/spectrogram';
 import {
-  WS_URL, VARIANTS, MAX_NUDGE, XF_MAX_CYCLE, XF_SWITCH, XF_MIN,
+  WS_URL, VARIANTS, MAX_NUDGE, OUT_CHANNELS, XF_MAX_CYCLE, XF_SWITCH, XF_MIN,
   FADE_IN_CURVE, FADE_OUT_CURVE, TRACK_THEME,
   lpfHz, hpfHz, combGains, softClipCurve, COMB_LO, COMB_FB_HPF, SPREAD_MAX,
   type TrackParams, type SharedParams, type LearnProps,
@@ -52,6 +52,12 @@ interface Props {
   running: boolean;
   /** Rack-wide output fader, multiplied into this track's monitor gain. */
   masterVolume: number;
+  /** Hardware pair carrying the whole mix; every track feeds it as well as its
+   *  own, which is what makes the master send the sum of the rack. */
+  masterPair: number;
+  /** How many channels this track's device actually offered, reported once the
+   *  context exists so the mapping panel can show the truth rather than 8. */
+  onChannels?: (max: number) => void;
   /** The track the knob row is editing. */
   active: boolean;
   onActivate: () => void;
@@ -181,6 +187,7 @@ function sumGain(entries: { buf: AudioBuffer; pan: number }[]): number {
 const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   index, connectionId, params, shared, onParam, onMidi, onAdd, onRemove,
   onError, onShelfDone, onConnected, learnProps, running, masterVolume,
+  masterPair, onChannels,
   active, onActivate, soloed, muted, onSolo, soloVisible, onNode, patchTarget, onNodeDown,
 }, ref) {
   const theme = TRACK_THEME[index] ?? TRACK_THEME[0];
@@ -211,6 +218,13 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
    *  no route to the destination is not guaranteed to be rendered at all, so
    *  the previews would read as silence without it. */
   const previewSinkRef = useRef<GainNode | null>(null);
+  /** The monitor gain is stereo; the splitter takes it apart so each side can
+   *  be placed on a numbered hardware channel, and the merger puts the whole
+   *  8-channel frame back together for the destination. */
+  const splitRef = useRef<ChannelSplitterNode | null>(null);
+  const mergeRef = useRef<ChannelMergerNode | null>(null);
+  /** Channels the device really gave us, which may be 2 whatever we asked for. */
+  const chCountRef = useRef(2);
   const specRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const cycleRef = useRef<CycleAudio | null>(null);
@@ -236,6 +250,8 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   useEffect(() => { paramsRef.current = params; }, [params]);
   const mutedRef = useRef(muted);
   useEffect(() => { mutedRef.current = muted; }, [muted]);
+  const onChannelsRef = useRef(onChannels);
+  useEffect(() => { onChannelsRef.current = onChannels; }, [onChannels]);
   const masterVolRef = useRef(masterVolume);
   useEffect(() => { masterVolRef.current = masterVolume; }, [masterVolume]);
   /** What this track is actually passing: its own monitor, scaled by the rack
@@ -251,6 +267,29 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
 
   const activeVariants = params.multiVariant ? VARIANTS : 1;
 
+  /**
+   * Send this track to its own pair and to the master pair. Two connections to
+   * the same merger input are ignored by the graph rather than doubled, so a
+   * track sitting on the master pair stays at unity; two different tracks on
+   * one pair do sum, which is the point.
+   *
+   * A pair the device cannot reach is clamped to the last one it can, so a
+   * 2-channel device plays everything rather than silently dropping tracks.
+   */
+  useEffect(() => {
+    const split = splitRef.current, merge = mergeRef.current;
+    if (!split || !merge) return;
+    try { split.disconnect(); } catch { /* nothing attached yet */ }
+    const pairs = Math.max(1, Math.floor(chCountRef.current / 2));
+    const place = (p: number) => {
+      const i = Math.max(0, Math.min(pairs - 1, p));
+      split.connect(merge, 0, i * 2);
+      split.connect(merge, 1, i * 2 + 1);
+    };
+    place(params.outPair);
+    place(masterPair);
+  }, [params.outPair, masterPair]);
+
   // ── output chain ────────────────────────────────────────────────────
   const ensureCtx = useCallback(() => {
     if (!ctxRef.current) {
@@ -265,8 +304,24 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       delay.delayTime.value = paramsRef.current.nudge;
       delay.connect(analyser);
       analyser.connect(gain);
-      gain.connect(ctx.destination);
       gain.gain.value = audibleLevel();
+
+      // ── hardware routing ─────────────────────────────────────────────
+      // Ask the device for as many channels as it has, up to the 8 the browser
+      // can carry. A device that only offers 2 leaves this at 2 and every pair
+      // collapses onto it — which is why the count is reported upward: a panel
+      // offering 4 pairs over a 2-channel destination would be a lie.
+      const maxCh = ctx.destination.maxChannelCount || 2;
+      const want = Math.max(2, Math.min(OUT_CHANNELS, maxCh));
+      try { ctx.destination.channelCount = want; } catch { /* stays as it was */ }
+      chCountRef.current = ctx.destination.channelCount || 2;
+      const merge = ctx.createChannelMerger(chCountRef.current);
+      const split = ctx.createChannelSplitter(2);
+      gain.connect(split);
+      merge.connect(ctx.destination);
+      splitRef.current = split;
+      mergeRef.current = merge;
+      onChannelsRef.current?.(chCountRef.current);
 
       // ── filters ──────────────────────────────────────────────────────
       // fxIn -> LPF -> HPF -> [dry + comb] -> nudge -> analyser -> monitor.

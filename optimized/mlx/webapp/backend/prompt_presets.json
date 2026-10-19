@@ -1,0 +1,13 @@
+{
+  "presets": [
+    {
+      "name": "bso-1",
+      "prompts": [
+        "harmonic spectral spread",
+        "crinkle plastic crunch",
+        "rhythmic sequenced plucks",
+        ""
+      ]
+    }
+  ]
+}

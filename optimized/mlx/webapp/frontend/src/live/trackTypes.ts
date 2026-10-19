@@ -15,6 +15,19 @@ export const VARIANTS = 5;
 // remaining effect is the panning spread across the stereo field.
 export const SPREAD_MIN = 0;
 export const SPREAD_MAX = 0.08;
+/**
+ * Hardware output routing. Chrome will raise an AudioContext's destination to
+ * its device's maxChannelCount, but a Chromium issue reports that going above
+ * 8 breaks Web Audio outright, so 8 is the ceiling whatever the interface has
+ * (an 18i20 has 20 outputs; 8 of them are reachable from a browser).
+ *
+ * Everything is routed in stereo pairs, because every track's chain ends in a
+ * StereoPannerNode and a pair is what a track actually produces.
+ */
+export const OUT_CHANNELS = 8;
+export const OUT_PAIRS = OUT_CHANNELS / 2;
+export const pairLabel = (p: number) => `${p * 2 + 1}/${p * 2 + 2}`;
+
 export const MAX_NUDGE = 5;          // seconds of output delay for alignment
 // SYNC: how often the alignment is re-checked, and how far a nudge has to be
 // out before it is rewritten. The medians wobble; the delay line should not.
@@ -70,6 +83,9 @@ export interface TrackParams {
    * turning a knob still edits it — otherwise the lit button would lock it.
    */
   soloProcess: boolean;
+  /** Which hardware pair this track is sent to, 0 = channels 1/2. It is sent
+   *  there in ADDITION to the master pair, so a track always stays in the mix. */
+  outPair: number;
 }
 
 let trackSeq = 0;
@@ -90,6 +106,7 @@ export const defaultTrack = (): TrackParams => ({
   comb: 0,
   outputMonitor: 0.8,
   soloProcess: false,
+  outPair: 0,
 });
 
 // ── output filter mappings ───────────────────────────────────────────

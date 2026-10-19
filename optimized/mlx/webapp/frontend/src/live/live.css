@@ -1471,3 +1471,67 @@ html, body, #live-root {
   background: var(--track, var(--accent));
   border-color: var(--track, var(--accent));
 }
+
+/* ── prompt presets, in the top bar ─────────────────────────────────── */
+.prompt-presets { display: inline-flex; align-items: center; gap: 4px; }
+.prompt-presets .live-select { max-width: 150px; }
+.preset-save {
+  font: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  padding: 3px 8px;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  background: #0d0d0d;
+  color: #9a9a9a;
+  cursor: pointer;
+  transition: color .12s ease, border-color .12s ease;
+}
+.preset-save:hover:not(:disabled) { color: #ddd; border-color: var(--accent); }
+.preset-save:disabled { opacity: .35; cursor: not-allowed; }
+
+/* ── output mapping panel ───────────────────────────────────────────── */
+.outmap { position: relative; display: inline-flex; }
+.outmap-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px 11px;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  background: #0b0b0b;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .6);
+}
+.outmap-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 9px; font-weight: 700; letter-spacing: .1em; color: var(--dim);
+}
+.outmap-x {
+  border: 0; background: none; color: var(--dim);
+  font-size: 15px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.outmap-x:hover { color: #ddd; }
+/* The device's real channel count. Red when it cannot carry the pairs below,
+   because that is the one failure the pickers cannot show by themselves. */
+.outmap-note { font-size: 9px; color: var(--dim); line-height: 1.4; }
+.outmap-note.warn { color: #e8837a; }
+.outmap-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  font-size: 11px; color: #ccc;
+}
+.outmap-row.master {
+  padding-bottom: 6px;
+  border-bottom: 1px solid #1d1d1d;
+  font-weight: 600;
+}
+.outmap-row .live-select { min-width: 72px; }
+.outmap-foot {
+  font-size: 8px; line-height: 1.5; color: #6a6a6a;
+  border-top: 1px solid #1d1d1d; padding-top: 6px;
+}

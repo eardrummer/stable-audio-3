@@ -546,6 +546,71 @@ def save_midi_map(**changes) -> dict:
     return cur
 
 
+# Prompt presets: named sets of per-track prompts, so a combination that worked
+# can be brought back rather than retyped. Unlike the MIDI map this is content,
+# not machine state, so it is kept in the repo and is meant to be hand-editable.
+PROMPT_FILE = Path(__file__).resolve().parent / "prompt_presets.json"
+
+
+def load_presets() -> list[dict]:
+    """[{"name": str, "prompts": [str, ...]}, ...], newest last."""
+    try:
+        with open(PROMPT_FILE) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"[Live] prompt presets unreadable, starting empty: {e}")
+        return []
+    out = []
+    for p in d.get("presets") or []:
+        # Tolerant of a hand-edited file: skip anything malformed rather than
+        # failing the whole list, and coerce prompts to strings.
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "prompts": [str(x) for x in (p.get("prompts") or [])],
+        })
+    return out
+
+
+def save_preset(name: str, prompts: list[str]) -> list[dict]:
+    """Add the set, or replace the one of that name in place -- so saving over
+    a name is a deliberate overwrite and does not leave two of them."""
+    presets = load_presets()
+    entry = {"name": name, "prompts": [str(x) for x in prompts]}
+    for i, p in enumerate(presets):
+        if p["name"].lower() == name.lower():
+            presets[i] = entry
+            break
+    else:
+        presets.append(entry)
+    tmp = PROMPT_FILE.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"presets": presets}, f, indent=2)
+        tmp.replace(PROMPT_FILE)
+    except Exception as e:
+        print(f"[Live] could not write the prompt presets: {e}")
+    return presets
+
+
+def delete_preset(name: str) -> list[dict]:
+    presets = [p for p in load_presets() if p["name"].lower() != name.lower()]
+    tmp = PROMPT_FILE.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"presets": presets}, f, indent=2)
+        tmp.replace(PROMPT_FILE)
+    except Exception as e:
+        print(f"[Live] could not write the prompt presets: {e}")
+    return presets
+
+
 midi_bridge = MidiBridge()
 
 
@@ -588,6 +653,24 @@ def build_router(engine):
         if not isinstance(b, dict):
             return {"status": "error", "error": "bindings must be an object"}
         return {"status": "ok", **save_midi_map(bindings=b)}
+
+    @router.get("/api/live/prompt_presets")
+    def get_presets():
+        return {"presets": load_presets()}
+
+    @router.post("/api/live/prompt_presets")
+    def post_preset(body: dict):
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return {"status": "error", "error": "a preset needs a name"}
+        prompts = body.get("prompts")
+        if not isinstance(prompts, list):
+            return {"status": "error", "error": "prompts must be a list"}
+        return {"status": "ok", "presets": save_preset(name, prompts)}
+
+    @router.delete("/api/live/prompt_presets")
+    def del_preset(name: str):
+        return {"status": "ok", "presets": delete_preset(name)}
 
     @router.get("/api/live/midi_ports")
     def midi_ports():
