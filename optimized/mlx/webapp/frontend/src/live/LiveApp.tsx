@@ -6,6 +6,7 @@ import LatentShelf from './LatentShelf';
 import StrudelPanel, { type StrudelPanelHandle } from './StrudelPanel';
 import InputSection from './InputSection';
 import MidiSlider from './MidiSlider';
+import { Recorder, type Src, stamp, GESTURE_END_MS } from './score';
 import TrackOutput, { type TrackHandle } from './TrackOutput';
 import { FX_METHODS, FxChain, fxMethod, MASTER_FX_AMOUNT } from './inputfx';
 import {
@@ -132,6 +133,23 @@ const GEN_RATES = wholeSecs(14);
 const GEN_MIN = GEN_RATES[0], GEN_MAX = GEN_RATES[GEN_RATES.length - 1];
 const BEATS = [4, 8, 16, 32];              // beats, when Tempo is on
                                            // (1 beat is too short to diffuse well)
+/**
+ * How each parameter is named in the score. A score that said `lpf: 0.42` would
+ * be a log; the point is a document, so every key that can be recorded has the
+ * label the rack puts under the knob.
+ */
+const SCORE_LABEL: Record<string, string> = {
+  prompt: 'Prompt', noise: 'Noise', steps: 'Steps', cfg: 'CFG',
+  spread: 'Spread', variant: 'Variant', multiVariant: '5 variants',
+  allVariants: 'ALL variants', loopback: 'Loopback', nudge: 'Nudge',
+  lpf: 'LPF', hpf: 'HPF', comb: 'Comb', outputMonitor: 'Monitor',
+  soloProcess: 'SOLO PROC', outPair: 'Output pair',
+  level: 'Send', monitor: 'Box monitor', chanSel: 'Input channel',
+  fxMethod: 'Input FX method', fxAmount: 'Input FX amount',
+  to: 'Patch routing', fileTrim: 'File trim',
+};
+const scoreLabel = (k: string) => SCORE_LABEL[k] ?? k;
+
 const TAP_RESET_MS = 2500;                 // gap after which a tap starts a new count
 const TAP_HISTORY = 8;                     // intervals averaged for the estimate
 const CLICK_LOOKAHEAD_MS = 25;             // scheduler wake interval
@@ -201,9 +219,75 @@ export default function LiveApp() {
   const activeTabRef = useRef(0);
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
 
-  const patchTrack = useCallback((i: number, patch: Partial<TrackParams>) => {
-    setTracks(ts => ts.map((t, j) => (j === i ? { ...t, ...patch } : t)));
+  /**
+   * The score recorder. Every parameter change already passes through one of a
+   * handful of funnels, so tapping those gives near-complete coverage rather
+   * than a list of controls that silently falls out of date.
+   */
+  const scoreRef = useRef(new Recorder());
+  const [recording, setRecording] = useState(false);
+  const [recMs, setRecMs] = useState(0);
+  const recStartRef = useRef(0);
+
+  /**
+   * Who is making the change being logged. Set around the paths where it is not
+   * the obvious answer — MIDI, and the places the system derives a value on
+   * your behalf — so the score can say WHY the generate rate jumped rather than
+   * leaving it looking spontaneous.
+   */
+  const srcRef = useRef<{ by: Src; cause?: string }>({ by: 'ui' });
+  const asSource = useCallback(<T,>(by: Src, cause: string | undefined, fn: () => T): T => {
+    const prev = srcRef.current;
+    srcRef.current = { by, cause };
+    try { return fn(); } finally { srcRef.current = prev; }
   }, []);
+
+  /** One discrete event: a button, a toggle, a menu. */
+  const note = useCallback((what: string, to: unknown, from?: unknown, scope?: string) => {
+    const { by, cause } = srcRef.current;
+    scoreRef.current.point(performance.now(), what, to, { from, scope, by, cause });
+  }, []);
+
+  /** One continuous change, coalesced like any other knob move. For the
+   *  rack-wide controls that have no patch funnel to be caught by. */
+  const noteMove = useCallback((
+    key: string, what: string, from: number, to: number, scope?: string,
+  ) => {
+    if (from === to) return;
+    const { by, cause } = srcRef.current;
+    scoreRef.current.move(performance.now(), key, what, from, to, { scope, by, cause });
+  }, []);
+
+  /**
+   * Log a patch against the values it is replacing. Numbers go through `move`
+   * so a drag coalesces into one entry with its shape; everything else is a
+   * point. The old value comes from the ref rather than from state, because
+   * these funnels run before React has re-rendered.
+   */
+  const notePatch = useCallback((
+    scope: string, before: Record<string, unknown>, patch: Record<string, unknown>,
+  ) => {
+    if (!scoreRef.current.recording) return;
+    const now = performance.now();
+    const { by, cause } = srcRef.current;
+    for (const [k, v] of Object.entries(patch)) {
+      const was = before?.[k];
+      if (was === v) continue;
+      const label = scoreLabel(k);
+      if (typeof v === 'number' && typeof was === 'number') {
+        scoreRef.current.move(now, `${scope}:${k}`, label, was, v, { scope, by, cause });
+      } else {
+        scoreRef.current.point(now, label, v, { from: was, scope, by, cause });
+      }
+    }
+  }, []);
+
+  const patchTrack = useCallback((i: number, patch: Partial<TrackParams>) => {
+    notePatch(TRACK_THEME[i]?.name ?? `Track ${i + 1}`,
+      tracksRef.current[i] as unknown as Record<string, unknown>,
+      patch as Record<string, unknown>);
+    setTracks(ts => ts.map((t, j) => (j === i ? { ...t, ...patch } : t)));
+  }, [notePatch]);
   /** Knobs and MIDI act on the active track — or on every track when MASTER
    *  is engaged. Reads still come from the active track, so a knob shows one
    *  value; turning it in master mode makes the tracks agree.
@@ -212,10 +296,17 @@ export default function LiveApp() {
    *  when it is the active track: the button is an opt-out from the rack moving
    *  together, not a lock, and a track you cannot edit at all would be a trap. */
   const patchActive = useCallback((patch: Partial<TrackParams>) => {
+    // In master mode one gesture moves several tracks; the score says so once
+    // rather than repeating the move per track.
+    const i = activeTabRef.current;
+    notePatch(
+      masterRef.current ? 'all tracks' : (TRACK_THEME[i]?.name ?? `Track ${i + 1}`),
+      tracksRef.current[i] as unknown as Record<string, unknown>,
+      patch as Record<string, unknown>);
     setTracks(ts => ts.map((t, j) => (
       j === activeTabRef.current || (masterRef.current && !t.soloProcess)
         ? { ...t, ...patch } : t)));
-  }, []);
+  }, [notePatch]);
   /**
    * Hardware output routing. The master pair carries the whole rack and every
    * track feeds it, so a track's own pair is an ADDITIONAL send rather than a
@@ -346,8 +437,14 @@ export default function LiveApp() {
   const tracksRef = useRef(tracks);
   useEffect(() => { tracksRef.current = tracks; }, [tracks]);
   const patchSource = useCallback((id: string, patch: Partial<SourceInstance>) => {
+    const inst = sourcesRef.current.find(x => x.id === id);
+    const slot = sourcesRef.current.findIndex(x => x.id === id);
+    notePatch(
+      inst ? `${SOURCE_META[inst.kind].name} ${slot + 1}` : id,
+      inst as unknown as Record<string, unknown>,
+      patch as Record<string, unknown>);
     setSources(list => list.map(x => (x.id === id ? { ...x, ...patch } : x)));
-  }, []);
+  }, [notePatch]);
   const [addMenu, setAddMenu] = useState(false);
   /** Ceiling on both input boxes and output tracks. */
   const [maxSlots, setMaxSlots] = useState(MAX_SLOTS);
@@ -413,6 +510,15 @@ export default function LiveApp() {
   const recallPreset = (name: string) => {
     const p = presets.find(x => x.name === name);
     if (!p) return;
+    note('Recall prompts', name);
+    asSource('system', `preset "${name}"`, () => {
+      p.prompts.forEach((text, i) => {
+        if (i < tracksRef.current.length && text !== tracksRef.current[i].prompt) {
+          note('Prompt', text, tracksRef.current[i].prompt,
+            TRACK_THEME[i]?.name ?? `Track ${i + 1}`);
+        }
+      });
+    });
     setTracks(ts => ts.map((t, i) => (
       i < p.prompts.length ? { ...t, prompt: p.prompts[i] } : t)));
   };
@@ -487,6 +593,70 @@ export default function LiveApp() {
       });
     } catch { /* backend down; the panel still works for this session */ }
   }, [outDevices]);
+
+  /**
+   * Everything the rack was set to when recording began. A list of changes
+   * without it is unreadable: "Noise 0.35 -> 0.62" says nothing if you cannot
+   * see where the other nineteen knobs were standing.
+   */
+  const openingState = useCallback(() => ({
+    model, tempo: tempoOn ? { bpm, inputBeats, generateBeats } : null,
+    inputRate, generateRate,
+    masterVolume, masterFx, frozen, masterPair, outChannels,
+    inputDevice: devices.find(d => d.deviceId === deviceId)?.label ?? '',
+    outputDevice: outDevices.find(d => d.deviceId === sinkIdRef.current)?.label ?? 'system default',
+    inputs: sourcesRef.current.map((x, i) => ({
+      slot: i + 1, kind: x.kind, channel: x.chanSel, send: x.level,
+      monitor: x.monitor, fx: x.fxMethod, fxAmount: x.fxAmount, patchedTo: x.to,
+    })),
+    tracks: tracksRef.current.map((t, i) => ({
+      track: TRACK_THEME[i]?.name ?? `Track ${i + 1}`,
+      prompt: t.prompt, noise: t.noise, steps: t.steps, cfg: t.cfg,
+      variants: t.multiVariant ? VARIANTS : 1, variant: t.variant,
+      spread: t.spread, allVariants: t.allVariants,
+      loopback: t.loopback, nudge: t.nudge,
+      lpf: t.lpf, hpf: t.hpf, comb: t.comb,
+      monitor: t.outputMonitor, outPair: t.outPair, soloProcess: t.soloProcess,
+    })),
+  }), [model, tempoOn, bpm, inputBeats, generateBeats, inputRate, generateRate,
+       masterVolume, masterFx, frozen, masterPair, outChannels, devices, deviceId, outDevices]);
+
+  const startScore = useCallback(() => {
+    scoreRef.current.start(performance.now(), new Date().toISOString(), openingState());
+    recStartRef.current = performance.now();
+    setRecMs(0);
+    setRecording(true);
+  }, [openingState]);
+
+  const stopScore = useCallback(async () => {
+    if (!scoreRef.current.recording) return;
+    const take = scoreRef.current.stop(performance.now());
+    setRecording(false);
+    try {
+      const r = await fetch(`${API_URL}/api/live/score`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(take),
+      });
+      const d = await r.json();
+      setStatus(d.status === 'ok'
+        ? `Score saved: ${d.name} · ${take.events.length} events over ${take.duration}`
+        : `Could not save the score: ${d.error}`);
+    } catch {
+      setError('Could not save the score — is the backend running?');
+    }
+  }, []);
+
+  /** Close finished sweeps and move the clock. Idle moves would otherwise wait
+   *  for the next event, or for STOP, before landing in the score. */
+  useEffect(() => {
+    if (!recording) return;
+    const id = setInterval(() => {
+      scoreRef.current.flush(performance.now());
+      setRecMs(performance.now() - recStartRef.current);
+    }, GESTURE_END_MS);
+    return () => clearInterval(id);
+  }, [recording]);
 
   // --- MIDI ------------------------------------------------------------
   const [midiLearn, setMidiLearn] = useState(false);
@@ -624,17 +794,23 @@ export default function LiveApp() {
    * different musical decision and not one to make on someone's behalf.
    */
   const setFreeze = useCallback((on: boolean) => {
+    note('FREEZE', on);
     setFrozen(on);
     if (on) {
       if (tempoRef.current) { thawRateRef.current = null; return; }
       thawRateRef.current = paramsRef.current.generateRate;
       const held = paramsRef.current.inputRate;
-      setGenerateRate(Math.max(GEN_MIN, Math.min(GEN_MAX, Math.round(held) - 1)));
+      const derived = Math.max(GEN_MIN, Math.min(GEN_MAX, Math.round(held) - 1));
+      asSource('system', 'FREEZE', () =>
+        note('Generate Rate', derived, thawRateRef.current ?? undefined));
+      setGenerateRate(derived);
     } else if (thawRateRef.current !== null) {
+      asSource('system', 'FREEZE released', () =>
+        note('Generate Rate', thawRateRef.current));
       setGenerateRate(thawRateRef.current);
       thawRateRef.current = null;
     }
-  }, []);
+  }, [asSource, note]);
   // Only a take's *length* moves the layout; its playhead and rec counter do not.
   const loopLensKey = Object.values(loops).map(l => l.len).join(',');
   const activeSrcRef = useRef<string | null>(activeSrc);
@@ -784,8 +960,18 @@ export default function LiveApp() {
   const bindingsRef = useRef<Bindings>(bindings);
   useEffect(() => { armedRef.current = armed; }, [armed]);
   useEffect(() => { bindingsRef.current = bindings; }, [bindings]);
+  // The rack-wide controls a CC can move, mirrored so the score can say what
+  // each one was before the controller moved it.
+  const inputBeatsRef = useRef(inputBeats);
+  useEffect(() => { inputBeatsRef.current = inputBeats; }, [inputBeats]);
+  const generateBeatsRef = useRef(generateBeats);
+  useEffect(() => { generateBeatsRef.current = generateBeats; }, [generateBeats]);
+  const inputMonitorRef = useRef(inputMonitor);
+  useEffect(() => { inputMonitorRef.current = inputMonitor; }, [inputMonitor]);
+  const masterVolumeRef = useRef(masterVolume);
+  useEffect(() => { masterVolumeRef.current = masterVolume; }, [masterVolume]);
 
-  const applyMidi = useCallback((channel: number, control: number, norm: number) => {
+  const applyMidiInner = useCallback((channel: number, control: number, norm: number) => {
     // Learn mode: the next CC claims whichever control is armed.
     const armedId = armedRef.current;
     if (armedId) {
@@ -807,9 +993,25 @@ export default function LiveApp() {
     const lerp = (lo: number, hi: number) => lo + norm * (hi - lo);
     const pick = (arr: number[]) => arr[Math.min(arr.length - 1, Math.floor(norm * arr.length))];
     if (id === 'inputRate') {
-      if (tempoRef.current) setInputBeats(pick(BEATS)); else setInputRate(pick(INPUT_RATES));
+      if (tempoRef.current) {
+        const v = pick(BEATS);
+        noteMove('inputRate', 'Input Rate', inputBeatsRef.current, v);
+        setInputBeats(v);
+      } else {
+        const v = pick(INPUT_RATES);
+        noteMove('inputRate', 'Input Rate', paramsRef.current.inputRate, v);
+        setInputRate(v);
+      }
     } else if (id === 'generateRate') {
-      if (tempoRef.current) setGenerateBeats(pick(BEATS)); else setGenerateRate(pick(GEN_RATES));
+      if (tempoRef.current) {
+        const v = pick(BEATS);
+        noteMove('generateRate', 'Generate Rate', generateBeatsRef.current, v);
+        setGenerateBeats(v);
+      } else {
+        const v = pick(GEN_RATES);
+        noteMove('generateRate', 'Generate Rate', paramsRef.current.generateRate, v);
+        setGenerateRate(v);
+      }
     }
     // Everything below is per track and lands on whichever tab is showing.
     else if (id === 'noise') patchActive({ noise: Number(lerp(0.05, 1).toFixed(2)) });
@@ -827,18 +1029,22 @@ export default function LiveApp() {
       const down = norm >= 0.5;
       if (down && !triggersRef.current[id]) {
         const k = id === 'mfxScramble' ? 'scramble' : 'smear';
+        note(`Master ${k.toUpperCase()}`, !masterFxRef.current[k]);
         setMasterFx(v => ({ ...v, [k]: !v[k] }));
       }
       triggersRef.current[id] = down;
     }
     else if (id === 'freeze') {
       const down = norm >= 0.5;
-      if (down && !triggersRef.current[id]) setFreeze(!frozenRef.current);
+      if (down && !triggersRef.current[id]) setFreeze(!frozenRef.current);   // notes itself
       triggersRef.current[id] = down;
     }
     else if (id === 'inject') {
       const down = norm >= 0.5;
-      if (down && !triggersRef.current[id]) actionsRef.current.inject();
+      if (down && !triggersRef.current[id]) {
+        note('INJECT', 'pressed');
+        actionsRef.current.inject();
+      }
       triggersRef.current[id] = down;
     }
     else if (id === 'fxAmount') {
@@ -848,8 +1054,16 @@ export default function LiveApp() {
     else if (id === 'lpf') patchActive({ lpf: Number(norm.toFixed(3)) });
     else if (id === 'hpf') patchActive({ hpf: Number(norm.toFixed(3)) });
     else if (id === 'comb') patchActive({ comb: Number(norm.toFixed(3)) });
-    else if (id === 'inputMonitor') setInputMonitor(Number(norm.toFixed(2)));
-    else if (id === 'masterVolume') setMasterVolume(Number(norm.toFixed(2)));
+    else if (id === 'inputMonitor') {
+      const v = Number(norm.toFixed(2));
+      noteMove('inputMonitor', 'Input Monitor', inputMonitorRef.current, v);
+      setInputMonitor(v);
+    }
+    else if (id === 'masterVolume') {
+      const v = Number(norm.toFixed(2));
+      noteMove('masterVolume', 'Master Volume', masterVolumeRef.current, v);
+      setMasterVolume(v);
+    }
     // One binding per box, keyed to the box rather than to a slot number.
     else if (/^inputMonitor@\d+$/.test(id)) {
       const inst = sourcesRef.current[Number(id.slice('inputMonitor@'.length))];
@@ -864,6 +1078,13 @@ export default function LiveApp() {
       patchTrack(t, { outputMonitor: Number(norm.toFixed(2)) });
     }
   }, [patchActive, patchTrack]);
+
+  /** Everything a controller does is tagged in the score as coming from the
+   *  controller, with the CC that did it, so a MIDI sweep is distinguishable
+   *  from the same sweep made by hand. */
+  const applyMidi = useCallback((channel: number, control: number, norm: number) => {
+    asSource('midi', `CC ${control}`, () => applyMidiInner(channel, control, norm));
+  }, [asSource, applyMidiInner]);
 
   /** Which momentary bindings are currently held, for edge detection. */
   const triggersRef = useRef<Record<string, boolean>>({});
@@ -1288,6 +1509,16 @@ export default function LiveApp() {
     const known = lats.filter((v): v is number => v !== null);
     if (known.length < 2) return;
     const slowest = Math.max(...known);
+    asSource('system', 'SYNC', () => {
+      lats.forEach((own, i) => {
+        if (own == null) return;
+        const n = Math.max(0, Math.min(MAX_NUDGE, Number((slowest - own).toFixed(2))));
+        if (Math.abs(n - (tracksRef.current[i]?.nudge ?? 0)) >= SYNC_DEADBAND) {
+          note('Nudge', n, tracksRef.current[i]?.nudge,
+            TRACK_THEME[i]?.name ?? `Track ${i + 1}`);
+        }
+      });
+    });
     setTracks(ts => ts.map((t, i) => {
       const own = lats[i];
       if (own == null) return t;
@@ -1296,7 +1527,7 @@ export default function LiveApp() {
       // tick would keep the delay line gliding for no audible reason.
       return Math.abs(n - t.nudge) < SYNC_DEADBAND ? t : { ...t, nudge: n };
     }));
-  }, []);
+  }, [asSource, note]);
 
   /** Latched: SYNC is upkeep, not a one-shot, so it holds the alignment as the
    *  timings move. Also the only window onto whether any round trip has been
@@ -1813,6 +2044,7 @@ export default function LiveApp() {
       for (const t of trackRefs.current) t?.begin();
 
       setRunning(true);
+      startScore();
       setIsStarting(false);
 
       // Live Code shares the transport. Evaluating here rather than whenever
@@ -1846,6 +2078,8 @@ export default function LiveApp() {
   };
 
   const stop = () => {
+    // Before anything is torn down, so the take closes on the state it ran in.
+    if (scoreRef.current.recording) void stopScore();
     setRunning(false);
     // START builds fresh rings with nothing in them, so a freeze carried across
     // a stop would leave the model with no input and no way to tell why. Going
@@ -2464,6 +2698,16 @@ export default function LiveApp() {
           <PanelRight size={15} /> LATENT
         </button>
 
+        {/* Not a button: a take runs for exactly as long as the transport does,
+            so there is nothing to press and nothing to forget. This only says
+            whether one is being written, and how long it has been going. */}
+        <div className={`score-tag ${recording ? 'on' : ''}`}
+             title={recording
+               ? 'A score of this session is being written; it is saved when STOP is hit'
+               : 'A score is written for every session: it starts with START and is saved on STOP'}>
+          <Circle size={9} /> {recording ? stamp(recMs) : 'SCORE'}
+        </div>
+
         <div className="outmap">
           <button className={`midi-btn ${mapOpen ? 'on' : ''}`}
                   onClick={() => setMapOpen(v => !v)}
@@ -2484,7 +2728,12 @@ export default function LiveApp() {
               <label className="outmap-row">
                 <span>Device</span>
                 <select className="live-select outmap-dev" value={sinkId}
-                        onChange={e => { setSinkId(e.target.value); void saveRouting({ sinkId: e.target.value }); }}
+                        onChange={e => {
+                          note('Output device',
+                            outDevices.find(d => d.deviceId === e.target.value)?.label ?? 'system default');
+                          setSinkId(e.target.value);
+                          void saveRouting({ sinkId: e.target.value });
+                        }}
                         title="Which hardware output every track's context plays to">
                   <option value="">System default</option>
                   {outDevices.map(d => (
@@ -2509,6 +2758,7 @@ export default function LiveApp() {
                 <select className="live-select" value={masterPair}
                         onChange={e => {
                           const p = Number(e.target.value);
+                          note('Master output pair', pairLabel(p), pairLabel(masterPair));
                           setMasterPair(p);
                           void saveRouting({ masterPair: p });
                         }}
@@ -2730,7 +2980,8 @@ export default function LiveApp() {
 
           <div className="monitor-row">
             <MidiSlider {...knobProps('inputMonitor')} label="Monitor"
-                        value={inputMonitor} onChange={setInputMonitor} />
+                        value={inputMonitor}
+                        onChange={v => { noteMove('inputMonitor', 'Input Monitor', inputMonitor, v); setInputMonitor(v); }} />
             <button
               className={`mon-mode ${monitorMode === 'box' ? 'on' : ''}`}
               onClick={() => setMonitorMode(m => (m === 'box' ? 'sum' : 'box'))}
@@ -2794,7 +3045,10 @@ export default function LiveApp() {
               onActivate={() => setActiveTab(i)}
               soloed={solo === i}
               muted={solo !== null && solo !== i}
-              onSolo={() => setSolo(cur => (cur === i ? null : i))}
+              onSolo={() => {
+                note('Solo', solo === i ? 'off' : (TRACK_THEME[i]?.name ?? `Track ${i + 1}`));
+                setSolo(cur => (cur === i ? null : i));
+              }}
               soloVisible={tracks.length > 1}
               onNode={(el) => { trackNodeEls.current[t.id] = el; }}
               patchTarget={patchFrom !== null}
@@ -2895,7 +3149,11 @@ export default function LiveApp() {
             </button>
             <button
               className={`act-btn inject ${midiLearn ? 'learning' : ''} ${armed === 'inject' ? 'armed' : ''}`}
-              onClick={() => (midiLearn ? arm('inject') : injectNow())}
+              onClick={() => {
+                if (midiLearn) { arm('inject'); return; }
+                note('INJECT', 'pressed');
+                injectNow();
+              }}
               disabled={!running && !midiLearn}
               title="Generate now from the last Input Rate of audio, the window ending at this instant, and re-phase the cycle clock to the press"
             >
@@ -2909,7 +3167,11 @@ export default function LiveApp() {
                 input monitor keeps hearing the dry sources. */}
             <button
               className={`act-btn mfx ${masterFx.scramble ? 'on' : ''} ${midiLearn ? 'learning' : ''} ${armed === 'mfxScramble' ? 'armed' : ''}`}
-              onClick={() => (midiLearn ? arm('mfxScramble') : setMasterFx(v => ({ ...v, scramble: !v.scramble })))}
+              onClick={() => {
+                if (midiLearn) { arm('mfxScramble'); return; }
+                note('Master SCRAMBLE', !masterFx.scramble);
+                setMasterFx(v => ({ ...v, scramble: !v.scramble }));
+              }}
               title="Reorder 1/16-note slices of the whole summed input at 80%, cut on the hits and drawn from the last bar. Runs before SMEAR, which would otherwise dissolve the onsets it cuts on. Latches."
             >
               <span className="act-name">SCRAMBLE</span>
@@ -2918,7 +3180,11 @@ export default function LiveApp() {
             </button>
             <button
               className={`act-btn mfx ${masterFx.smear ? 'on' : ''} ${midiLearn ? 'learning' : ''} ${armed === 'mfxSmear' ? 'armed' : ''}`}
-              onClick={() => (midiLearn ? arm('mfxSmear') : setMasterFx(v => ({ ...v, smear: !v.smear })))}
+              onClick={() => {
+                if (midiLearn) { arm('mfxSmear'); return; }
+                note('Master SMEAR', !masterFx.smear);
+                setMasterFx(v => ({ ...v, smear: !v.smear }));
+              }}
               title="Convolve the whole summed input with a 529 ms Gaussian noise burst at 80%: the spectrum survives, the attacks dissolve. Runs last. Latches."
             >
               <span className="act-name">SMEAR</span>
@@ -2934,7 +3200,8 @@ export default function LiveApp() {
               control over everything the rack is putting out. */}
           <div className="master-vol">
             <MidiSlider {...knobProps('masterVolume')} label="Volume"
-                        value={masterVolume} onChange={setMasterVolume} />
+                        value={masterVolume}
+                        onChange={v => { noteMove('masterVolume', 'Master Volume', masterVolume, v); setMasterVolume(v); }} />
           </div>
         </div>
 
@@ -2983,18 +3250,22 @@ export default function LiveApp() {
           {beatSec ? (
             <>
               <Knob {...knobProps('inputRate')} label="Input Rate" values={BEATS}
-                    value={inputBeats} onChange={setInputBeats}
+                    value={inputBeats}
+                    onChange={v => { noteMove('inputRate', 'Input Rate', inputBeats, v); setInputBeats(v); }}
                     format={b => `${b}b · ${(b * beatSec).toFixed(1)}s`} />
               <Knob {...knobProps('generateRate')} label="Generate Rate" values={BEATS}
-                    value={generateBeats} onChange={setGenerateBeats}
+                    value={generateBeats}
+                    onChange={v => { noteMove('generateRate', 'Generate Rate', generateBeats, v); setGenerateBeats(v); }}
                     format={b => `${b}b · ${(b * beatSec).toFixed(1)}s`} />
             </>
           ) : (
             <>
               <Knob {...knobProps('inputRate')} label="Input Rate" values={INPUT_RATES}
-                    value={inputRate} onChange={setInputRate} format={v => `${v}s`} />
+                    value={inputRate} format={v => `${v}s`}
+                    onChange={v => { noteMove('inputRate', 'Input Rate', inputRate, v); setInputRate(v); }} />
               <Knob {...knobProps('generateRate')} label="Generate Rate" values={GEN_RATES}
-                    value={generateRate} onChange={setGenerateRate} format={v => `${v}s`} />
+                    value={generateRate} format={v => `${v}s`}
+                    onChange={v => { noteMove('generateRate', 'Generate Rate', generateRate, v); setGenerateRate(v); }} />
             </>
           )}
           </div>
@@ -3065,6 +3336,7 @@ export default function LiveApp() {
             <button className={`sync-btn${syncOn ? ' on' : ''}`}
                     onClick={() => {
                       const next = !syncOn;
+                      note('SYNC', next);
                       setSyncOn(next);
                       if (next) applySync(trackRefs.current.map(t => t?.latency() ?? null));
                     }}

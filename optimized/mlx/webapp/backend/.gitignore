@@ -18,3 +18,6 @@ prompt_presets.json.tmp
 # Output routing is per-machine patching, like the MIDI map
 routing.json
 routing.json.tmp
+
+# Recorded performance scores
+scores/

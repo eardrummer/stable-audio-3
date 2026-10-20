@@ -664,6 +664,111 @@ def save_routing(body: dict) -> dict:
     return cur
 
 
+# Scores: one take per file, a timestamped account of what was done to the rack.
+# Two files per take -- the JSON is the record, the markdown is the thing you can
+# read or hand to someone. Rendering here rather than in the browser keeps the
+# two in step and puts them side by side on disk.
+SCORE_DIR = Path(__file__).resolve().parent / "scores"
+
+
+def _fmt(v) -> str:
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, float):
+        return f"{v:.3f}".rstrip("0").rstrip(".")
+    if v is None or v == "":
+        return "(empty)"
+    if isinstance(v, (list, dict)):
+        return json.dumps(v, separators=(",", ":"))
+    return str(v)
+
+
+def render_score(take: dict) -> str:
+    """The same take as prose. One heading per event, so it reads down the page
+    as a timeline rather than as a table of values."""
+    out: list[str] = []
+    started = take.get("started", "")
+    out.append(f"# Score — {started}")
+    out.append("")
+    out.append(f"Duration **{take.get('duration', '?')}** · "
+               f"{len(take.get('events') or [])} events")
+    out.append("")
+
+    opening = take.get("openingState") or {}
+    out.append("## Opening state")
+    out.append("")
+    for t in opening.get("tracks") or []:
+        name = t.get("track", "track")
+        prompt = t.get("prompt") or "(no prompt)"
+        out.append(f"- **{name}** — \"{prompt}\"  ")
+        out.append(f"  noise {_fmt(t.get('noise'))} · steps {_fmt(t.get('steps'))} · "
+                   f"cfg {_fmt(t.get('cfg'))} · monitor {_fmt(t.get('monitor'))} · "
+                   f"out {_fmt(t.get('outPair'))}")
+    for i in opening.get("inputs") or []:
+        out.append(f"- **{i.get('kind', 'input')} {i.get('slot')}** — "
+                   f"ch {_fmt(i.get('channel'))} · send {_fmt(i.get('send'))} · "
+                   f"FX {_fmt(i.get('fx'))} at {_fmt(i.get('fxAmount'))}")
+    rates = (f"input {_fmt(opening.get('inputRate'))}s / "
+             f"generate {_fmt(opening.get('generateRate'))}s")
+    out.append(f"- **rates** — {rates}")
+    out.append(f"- **master** — volume {_fmt(opening.get('masterVolume'))} · "
+               f"pair {_fmt(opening.get('masterPair'))} · "
+               f"out {_fmt(opening.get('outputDevice'))}")
+    out.append("")
+    out.append("## Timeline")
+    out.append("")
+
+    for e in take.get("events") or []:
+        what = e.get("what", "?")
+        scope = e.get("scope")
+        head = f"### {e.get('t', '')}  {what}" + (f" — {scope}" if scope else "")
+        out.append(head)
+        bits = []
+        if "from" in e and e.get("from") != e.get("to"):
+            bits.append(f"{_fmt(e.get('from'))} → {_fmt(e.get('to'))}")
+        else:
+            bits.append(_fmt(e.get("to")))
+        if e.get("over"):
+            bits.append(f"over {e['over']}s")
+        by = e.get("by", "ui")
+        if by != "ui":
+            bits.append(f"by {by}" + (f" ({e['cause']})" if e.get("cause") else ""))
+        out.append("  " + " · ".join(bits))
+        path = e.get("path")
+        if path and len(path) > 2:
+            shape = " ".join(f"{_fmt(v)}" for _, v in path)
+            out.append(f"  shape: {shape}")
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def write_score(take: dict) -> str:
+    """One folder per take, holding score.json and score.md. A folder rather
+    than two loose files because a take will accrete more than this -- a render,
+    a note, a photo of the patch -- and a date-stamped directory is where those
+    go without renaming anything.
+
+    Returns the folder name."""
+    started = str(take.get("started") or "")
+    # Colons are legal on macOS but miserable in a shell, so the name uses
+    # dashes, and the sub-second part is dropped: a folder per take is already
+    # unique at one-second resolution unless two are started in the same second.
+    stem = started.replace(":", "-").split(".")[0].rstrip("Z")
+    if not stem:
+        stem = time.strftime("%Y-%m-%dT%H-%M-%S")
+    folder = SCORE_DIR / stem
+    # Two takes inside one second would otherwise overwrite each other.
+    if folder.exists():
+        n = 2
+        while (SCORE_DIR / f"{stem}-{n}").exists():
+            n += 1
+        folder = SCORE_DIR / f"{stem}-{n}"
+    folder.mkdir(parents=True)
+    (folder / "score.json").write_text(json.dumps(take, indent=2))
+    (folder / "score.md").write_text(render_score(take))
+    return folder.name
+
+
 midi_bridge = MidiBridge()
 
 
@@ -706,6 +811,18 @@ def build_router(engine):
         if not isinstance(b, dict):
             return {"status": "error", "error": "bindings must be an object"}
         return {"status": "ok", **save_midi_map(bindings=b)}
+
+    @router.post("/api/live/score")
+    def post_score(body: dict):
+        if not isinstance(body.get("events"), list):
+            return {"status": "error", "error": "a take needs an events list"}
+        try:
+            name = write_score(body)
+        except Exception as e:
+            print(f"[Live] could not write the score: {e}")
+            return {"status": "error", "error": str(e)}
+        print(f"[Live] score written: {name} ({len(body['events'])} events)")
+        return {"status": "ok", "name": name}
 
     @router.get("/api/live/routing")
     def get_routing():

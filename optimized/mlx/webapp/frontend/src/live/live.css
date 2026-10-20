@@ -1536,3 +1536,23 @@ html, body, #live-root {
   font-size: 8px; line-height: 1.5; color: #6a6a6a;
   border-top: 1px solid #1d1d1d; padding-top: 6px;
 }
+
+/* ── score indicator ────────────────────────────────────────────────── */
+/* Not a control: it reports that a take is being written. Red while running,
+   because a score is a file being appended to and that should be visible. */
+.score-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  color: #6a6a6a;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.score-tag.on { color: #ffd9d6; background: #3a1512; border-color: #e8837a; }
+.score-tag.on svg { color: #ff4a3d; }
