@@ -10,7 +10,7 @@ import TrackOutput, { type TrackHandle } from './TrackOutput';
 import { FX_METHODS, FxChain, fxMethod, MASTER_FX_AMOUNT } from './inputfx';
 import {
   API_URL, VARIANTS, SPREAD_MIN, SPREAD_MAX, MAX_NUDGE, TRACK_THEME,
-  OUT_PAIRS, pairLabel,
+  pairsFor, pairLabel, INPUT_PAIR,
   SYNC_POLL_MS, SYNC_DEADBAND,
   SOURCE_KINDS, SOURCE_META, MAX_SLOTS, defaultSources, defaultTrack, newSource,
   lpfHz, hpfHz, combHz,
@@ -228,6 +228,19 @@ export default function LiveApp() {
   const [masterPair, setMasterPair] = useState(0);
   const [outChannels, setOutChannels] = useState<number | null>(null);
   const [mapOpen, setMapOpen] = useState(false);
+  const [outDevices, setOutDevices] = useState<MediaDeviceInfo[]>([]);
+  /** '' is the system default output. */
+  const [sinkId, setSinkId] = useState('');
+
+  // Read by saveRouting, which must not be rebuilt every time one of them moves.
+  const masterPairRef = useRef(0);
+  useEffect(() => { masterPairRef.current = masterPair; }, [masterPair]);
+  const sinkIdRef = useRef('');
+  useEffect(() => { sinkIdRef.current = sinkId; }, [sinkId]);
+
+  /** How many pairs the picker may offer: what the device gave, or four as a
+   *  guess before the device has been opened. */
+  const outPairs = outChannels ? pairsFor(outChannels) : 4;
 
   /**
    * Master pre-FX: the same Smear and Scramble the boxes offer, but on the
@@ -422,6 +435,58 @@ export default function LiveApp() {
       setError('Could not save the preset — is the backend running?');
     }
   };
+
+  /**
+   * The output layout is per-rig, not per-session: master on 3/4 with tracks on
+   * 5/6, 7/8 and 9/10 is a patching decision about a room, so it belongs in a
+   * file rather than being retyped after every reload.
+   *
+   * The device is stored by LABEL as well as id. Device ids are scoped to the
+   * browser origin and are regenerated when site data is cleared, so a saved id
+   * can silently stop matching; the label is what still finds "BlackHole 16ch"
+   * next month. The id is kept as a tie-breaker when two devices share a name.
+   */
+  const routingLoaded = useRef(false);
+  useEffect(() => {
+    if (!outDevices.length || routingLoaded.current) return;
+    routingLoaded.current = true;
+    (async () => {
+      try {
+        const d = await (await fetch(`${API_URL}/api/live/routing`)).json();
+        if (typeof d.masterPair === 'number') setMasterPair(d.masterPair);
+        if (Array.isArray(d.trackPairs)) {
+          setTracks(ts => ts.map((t, i) => (
+            typeof d.trackPairs[i] === 'number' ? { ...t, outPair: d.trackPairs[i] } : t)));
+        }
+        const byLabel = outDevices.find(x => x.label && x.label === d.sinkLabel);
+        const byId = outDevices.find(x => x.deviceId === d.sinkId);
+        const found = byLabel ?? byId;
+        if (found) setSinkId(found.deviceId);
+        else if (d.sinkLabel) {
+          setError(`Saved output device "${d.sinkLabel}" is not connected — using the default`);
+        }
+      } catch { /* no backend or nothing saved; defaults stand */ }
+    })();
+  }, [outDevices]);
+
+  const saveRouting = useCallback(async (patch: {
+    masterPair?: number; trackPairs?: number[]; sinkId?: string;
+  }) => {
+    const sink = patch.sinkId ?? sinkIdRef.current;
+    const body = {
+      masterPair: patch.masterPair ?? masterPairRef.current,
+      trackPairs: patch.trackPairs ?? tracksRef.current.map(t => t.outPair),
+      sinkId: sink,
+      sinkLabel: outDevices.find(d => d.deviceId === sink)?.label ?? '',
+    };
+    try {
+      await fetch(`${API_URL}/api/live/routing`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch { /* backend down; the panel still works for this session */ }
+  }, [outDevices]);
 
   // --- MIDI ------------------------------------------------------------
   const [midiLearn, setMidiLearn] = useState(false);
@@ -641,6 +706,7 @@ export default function LiveApp() {
       const ins = ds.filter(d => d.kind === 'audioinput');
       setDevices(ins);
       if (ins[0]) setDeviceId(prev => prev || ins[0].deviceId);
+      setOutDevices(ds.filter(d => d.kind === 'audiooutput'));
     }).catch(() => {});
   }, []);
 
@@ -2412,22 +2478,42 @@ export default function LiveApp() {
                         aria-label="Close">×</button>
               </div>
 
-              {/* The device's answer, not our request. A 2 here means every
-                  pair below is landing on 1/2 whatever it says. */}
+              {/* The device picker. Without it the context follows the macOS
+                  default output, which is a setting outside this app and a
+                  silent way for everything to go to the wrong interface. */}
+              <label className="outmap-row">
+                <span>Device</span>
+                <select className="live-select outmap-dev" value={sinkId}
+                        onChange={e => { setSinkId(e.target.value); void saveRouting({ sinkId: e.target.value }); }}
+                        title="Which hardware output every track's context plays to">
+                  <option value="">System default</option>
+                  {outDevices.map(d => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || `Output ${d.deviceId.slice(0, 6)}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              {/* The device's answer, not our request. */}
               <div className={`outmap-note ${outChannels !== null && outChannels < 4 ? 'warn' : ''}`}>
                 {outChannels === null
                   ? 'Press START to open the device and read its channel count'
                   : outChannels < 4
                     ? `Device gave ${outChannels} channels — every pair is landing on 1/2`
-                    : `${outChannels} channels available · ${Math.floor(outChannels / 2)} pairs`}
+                    : `${outChannels} channels · ${outPairs} pairs`}
               </div>
 
               <label className="outmap-row master">
                 <span>Master mix</span>
                 <select className="live-select" value={masterPair}
-                        onChange={e => setMasterPair(Number(e.target.value))}
+                        onChange={e => {
+                          const p = Number(e.target.value);
+                          setMasterPair(p);
+                          void saveRouting({ masterPair: p });
+                        }}
                         title="Where the whole rack goes, after the master fader">
-                  {Array.from({ length: OUT_PAIRS }, (_, p) => (
+                  {Array.from({ length: outPairs }, (_, p) => (
                     <option key={p} value={p}>{pairLabel(p)}</option>
                   ))}
                 </select>
@@ -2439,14 +2525,30 @@ export default function LiveApp() {
                     {TRACK_THEME[i]?.name ?? `Track ${i + 1}`}
                   </span>
                   <select className="live-select" value={t.outPair}
-                          onChange={e => patchTrack(i, { outPair: Number(e.target.value) })}
+                          onChange={e => {
+                            const p = Number(e.target.value);
+                            patchTrack(i, { outPair: p });
+                            void saveRouting({
+                              trackPairs: tracksRef.current.map((x, j) => (j === i ? p : x.outPair)),
+                            });
+                          }}
                           title="An additional send; this track stays in the master mix either way">
-                    {Array.from({ length: OUT_PAIRS }, (_, p) => (
+                    {Array.from({ length: outPairs }, (_, p) => (
                       <option key={p} value={p}>{pairLabel(p)}</option>
                     ))}
                   </select>
                 </label>
               ))}
+
+              {/* Chrome's getUserMedia only ever hands over channels 1-2, so on
+                  a loopback device the input is locked to this pair and anything
+                  sent here is fed back to the model. Allowed, never silent. */}
+              {(masterPair === INPUT_PAIR || tracks.some(t => t.outPair === INPUT_PAIR)) && (
+                <div className="outmap-note warn">
+                  {pairLabel(INPUT_PAIR)} is the pair capture reads from — sending
+                  there feeds the model its own output
+                </div>
+              )}
 
               <div className="outmap-foot">
                 Each track feeds the master pair as well as its own. Two tracks
@@ -2702,6 +2804,7 @@ export default function LiveApp() {
               running={running}
               masterVolume={masterVolume}
               masterPair={masterPair}
+              sinkId={sinkId}
               onChannels={i === 0 ? setOutChannels : undefined}
             />
           ))}

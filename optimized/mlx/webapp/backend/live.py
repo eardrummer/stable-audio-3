@@ -611,6 +611,59 @@ def delete_preset(name: str) -> list[dict]:
     return presets
 
 
+# Hardware output routing: which device, and which stereo pair the master mix
+# and each track are sent to. A patching decision about a room, so it outlives
+# the browser session the way the MIDI map does.
+ROUTING_FILE = Path(__file__).resolve().parent / "routing.json"
+
+ROUTING_DEFAULT = {"sinkId": "", "sinkLabel": "", "masterPair": 0, "trackPairs": []}
+
+
+def load_routing() -> dict:
+    try:
+        with open(ROUTING_FILE) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return dict(ROUTING_DEFAULT)
+    except Exception as e:
+        print(f"[Live] routing unreadable, using defaults: {e}")
+        return dict(ROUTING_DEFAULT)
+    out = dict(ROUTING_DEFAULT)
+    out["sinkId"] = str(d.get("sinkId") or "")
+    out["sinkLabel"] = str(d.get("sinkLabel") or "")
+    try:
+        out["masterPair"] = max(0, int(d.get("masterPair", 0)))
+    except (TypeError, ValueError):
+        pass
+    pairs = d.get("trackPairs")
+    if isinstance(pairs, list):
+        clean = []
+        for v in pairs:
+            try:
+                clean.append(max(0, int(v)))
+            except (TypeError, ValueError):
+                clean.append(0)
+        out["trackPairs"] = clean
+    return out
+
+
+def save_routing(body: dict) -> dict:
+    """Merge whatever the panel sent over what is stored, so a device change and
+    a pair change can arrive as separate writes without erasing each other."""
+    cur = load_routing()
+    for k in ROUTING_DEFAULT:
+        if k in body and body[k] is not None:
+            cur[k] = body[k]
+    tmp = ROUTING_FILE.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(cur, f, indent=2)
+        tmp.replace(ROUTING_FILE)
+    except Exception as e:
+        print(f"[Live] could not write the routing: {e}")
+    return cur
+
+
 midi_bridge = MidiBridge()
 
 
@@ -653,6 +706,14 @@ def build_router(engine):
         if not isinstance(b, dict):
             return {"status": "error", "error": "bindings must be an object"}
         return {"status": "ok", **save_midi_map(bindings=b)}
+
+    @router.get("/api/live/routing")
+    def get_routing():
+        return load_routing()
+
+    @router.post("/api/live/routing")
+    def post_routing(body: dict):
+        return {"status": "ok", **save_routing(body)}
 
     @router.get("/api/live/prompt_presets")
     def get_presets():

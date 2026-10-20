@@ -14,3 +14,7 @@ midi_map.json.tmp
 
 # Prompt presets are content and ARE tracked; only the atomic-write temp is not
 prompt_presets.json.tmp
+
+# Output routing is per-machine patching, like the MIDI map
+routing.json
+routing.json.tmp

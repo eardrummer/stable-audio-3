@@ -5,7 +5,7 @@ import { Plus, Minus, Headphones, Unlink } from 'lucide-react';
 import MidiSlider from './MidiSlider';
 import { drawSpectrogram } from '../shared/spectrogram';
 import {
-  WS_URL, VARIANTS, MAX_NUDGE, OUT_CHANNELS, XF_MAX_CYCLE, XF_SWITCH, XF_MIN,
+  WS_URL, VARIANTS, MAX_NUDGE, MAX_OUT_CHANNELS, pairsFor, XF_MAX_CYCLE, XF_SWITCH, XF_MIN,
   FADE_IN_CURVE, FADE_OUT_CURVE, TRACK_THEME,
   lpfHz, hpfHz, combGains, softClipCurve, COMB_LO, COMB_FB_HPF, SPREAD_MAX,
   type TrackParams, type SharedParams, type LearnProps,
@@ -55,8 +55,12 @@ interface Props {
   /** Hardware pair carrying the whole mix; every track feeds it as well as its
    *  own, which is what makes the master send the sum of the rack. */
   masterPair: number;
-  /** How many channels this track's device actually offered, reported once the
-   *  context exists so the mapping panel can show the truth rather than 8. */
+  /** Hardware output device for this track's context, '' for the system
+   *  default. Every track gets the same one; they are separate contexts, so
+   *  each has to be pointed at it itself. */
+  sinkId: string;
+  /** How many channels the device actually offered, reported whenever it
+   *  changes so the mapping panel shows the truth rather than an assumption. */
   onChannels?: (max: number) => void;
   /** The track the knob row is editing. */
   active: boolean;
@@ -187,7 +191,7 @@ function sumGain(entries: { buf: AudioBuffer; pan: number }[]): number {
 const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   index, connectionId, params, shared, onParam, onMidi, onAdd, onRemove,
   onError, onShelfDone, onConnected, learnProps, running, masterVolume,
-  masterPair, onChannels,
+  masterPair, sinkId, onChannels,
   active, onActivate, soloed, muted, onSolo, soloVisible, onNode, patchTarget, onNodeDown,
 }, ref) {
   const theme = TRACK_THEME[index] ?? TRACK_THEME[0];
@@ -252,6 +256,11 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
   useEffect(() => { mutedRef.current = muted; }, [muted]);
   const onChannelsRef = useRef(onChannels);
   useEffect(() => { onChannelsRef.current = onChannels; }, [onChannels]);
+  const sinkIdRef = useRef(sinkId);
+  const onErrorRef = useRef(onError);
+  useEffect(() => { onErrorRef.current = onError; }, [onError]);
+  const masterPairRef = useRef(masterPair);
+  useEffect(() => { masterPairRef.current = masterPair; }, [masterPair]);
   const masterVolRef = useRef(masterVolume);
   useEffect(() => { masterVolRef.current = masterVolume; }, [masterVolume]);
   /** What this track is actually passing: its own monitor, scaled by the rack
@@ -276,19 +285,77 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
    * A pair the device cannot reach is clamped to the last one it can, so a
    * 2-channel device plays everything rather than silently dropping tracks.
    */
-  useEffect(() => {
+  const placePairs = useCallback(() => {
     const split = splitRef.current, merge = mergeRef.current;
     if (!split || !merge) return;
     try { split.disconnect(); } catch { /* nothing attached yet */ }
-    const pairs = Math.max(1, Math.floor(chCountRef.current / 2));
+    const pairs = pairsFor(chCountRef.current);
     const place = (p: number) => {
       const i = Math.max(0, Math.min(pairs - 1, p));
       split.connect(merge, 0, i * 2);
       split.connect(merge, 1, i * 2 + 1);
     };
-    place(params.outPair);
-    place(masterPair);
-  }, [params.outPair, masterPair]);
+    place(paramsRef.current.outPair);
+    place(masterPairRef.current);
+  }, []);
+
+  /**
+   * Take the destination as wide as the device allows and rebuild the merger to
+   * match. The merger has to be rebuilt rather than reconfigured: its input
+   * count is fixed when it is constructed, and the device underneath it changes
+   * whenever the output picker moves — a 2-channel default and a 16-channel
+   * loopback need different mergers.
+   */
+  const rewireOut = useCallback((ctx: AudioContext) => {
+    const maxCh = ctx.destination.maxChannelCount || 2;
+    const want = Math.max(2, Math.min(MAX_OUT_CHANNELS, maxCh));
+    try { ctx.destination.channelCount = want; } catch { /* stays as it was */ }
+    const n = ctx.destination.channelCount || 2;
+    if (mergeRef.current && chCountRef.current === n) {
+      placePairs();                       // same device width; nothing to rebuild
+      return;
+    }
+    try { splitRef.current?.disconnect(); } catch { /* nothing attached */ }
+    try { mergeRef.current?.disconnect(); } catch { /* idem */ }
+    const merge = ctx.createChannelMerger(n);
+    merge.connect(ctx.destination);
+    mergeRef.current = merge;
+    chCountRef.current = n;
+    placePairs();
+    onChannelsRef.current?.(n);
+  }, [placePairs]);
+
+  useEffect(() => { placePairs(); }, [params.outPair, masterPair, placePairs]);
+
+  /**
+   * Point a context at the chosen device, then rebuild the routing — in that
+   * order, because maxChannelCount belongs to the device and only tells the
+   * truth once the switch has landed.
+   *
+   * setSinkId is per context and these are separate contexts, so every track
+   * does it for itself. Called both from ensureCtx, since the context is built
+   * lazily on START, and from the effect below when the picker moves; an effect
+   * alone would never fire for the context it was waiting for.
+   */
+  const applySink = useCallback(async (ctx: AudioContext) => {
+    const want = sinkIdRef.current;
+    try {
+      const set = (ctx as unknown as { setSinkId?: (id: string) => Promise<void> }).setSinkId;
+      // Absent before Chrome 110; the context then stays on the system default
+      // and the panel's channel count still describes whatever that is.
+      if (set) await set.call(ctx, want);
+    } catch (e) {
+      onErrorRef.current(
+        `Track ${index + 1}: could not use that output device — ${e instanceof Error ? e.message : e}`);
+    }
+    rewireOut(ctx);
+  }, [rewireOut, index]);
+
+  useEffect(() => {
+    sinkIdRef.current = sinkId;
+    const ctx = ctxRef.current;
+    if (ctx) void applySink(ctx);
+  }, [sinkId, applySink]);
 
   // ── output chain ────────────────────────────────────────────────────
   const ensureCtx = useCallback(() => {
@@ -307,21 +374,12 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       gain.gain.value = audibleLevel();
 
       // ── hardware routing ─────────────────────────────────────────────
-      // Ask the device for as many channels as it has, up to the 8 the browser
-      // can carry. A device that only offers 2 leaves this at 2 and every pair
-      // collapses onto it — which is why the count is reported upward: a panel
-      // offering 4 pairs over a 2-channel destination would be a lie.
-      const maxCh = ctx.destination.maxChannelCount || 2;
-      const want = Math.max(2, Math.min(OUT_CHANNELS, maxCh));
-      try { ctx.destination.channelCount = want; } catch { /* stays as it was */ }
-      chCountRef.current = ctx.destination.channelCount || 2;
-      const merge = ctx.createChannelMerger(chCountRef.current);
       const split = ctx.createChannelSplitter(2);
       gain.connect(split);
-      merge.connect(ctx.destination);
       splitRef.current = split;
-      mergeRef.current = merge;
-      onChannelsRef.current?.(chCountRef.current);
+      // Width and device first; the pairs land once the sink has settled.
+      rewireOut(ctx);
+      void applySink(ctx);
 
       // ── filters ──────────────────────────────────────────────────────
       // fxIn -> LPF -> HPF -> [dry + comb] -> nudge -> analyser -> monitor.
@@ -399,7 +457,9 @@ const TrackOutput = forwardRef<TrackHandle, Props>(function TrackOutput({
       combPreRef.current = combPre; combPostRef.current = combPost;
     }
     return ctxRef.current!;
-  }, [audibleLevel]);
+    // rewireOut and applySink are stable (their own deps never change for a
+    // given track), so this stays the once-built factory the socket relies on.
+  }, [audibleLevel, rewireOut, applySink]);
 
   /** Start a set of clips together, equal-power crossfading out whatever is
    *  sounding. One entry in single-variant mode; one per variant in ALL mode,

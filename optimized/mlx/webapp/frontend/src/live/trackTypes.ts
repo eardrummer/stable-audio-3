@@ -16,17 +16,22 @@ export const VARIANTS = 5;
 export const SPREAD_MIN = 0;
 export const SPREAD_MAX = 0.08;
 /**
- * Hardware output routing. Chrome will raise an AudioContext's destination to
- * its device's maxChannelCount, but a Chromium issue reports that going above
- * 8 breaks Web Audio outright, so 8 is the ceiling whatever the interface has
- * (an 18i20 has 20 outputs; 8 of them are reachable from a browser).
+ * Hardware output routing, in stereo pairs — a pair is what a track actually
+ * produces, since every chain ends in a StereoPannerNode.
  *
- * Everything is routed in stereo pairs, because every track's chain ends in a
- * StereoPannerNode and a pair is what a track actually produces.
+ * The channel count is the DEVICE's maxChannelCount, not a constant. This was
+ * capped at 8 on the strength of a Chromium issue reporting that anything above
+ * it broke Web Audio; that issue is marked Fixed and was filed against Chrome
+ * 39 beta, so the cap was a decade-old caution and it put channel 9/10 out of
+ * reach on a 16-channel loopback device. The only ceiling left is the spec's
+ * own limit on how many inputs a ChannelMergerNode may have.
  */
-export const OUT_CHANNELS = 8;
-export const OUT_PAIRS = OUT_CHANNELS / 2;
+export const MAX_OUT_CHANNELS = 32;
+export const pairsFor = (channels: number) => Math.max(1, Math.floor(channels / 2));
 export const pairLabel = (p: number) => `${p * 2 + 1}/${p * 2 + 2}`;
+/** The pair `getUserMedia` is locked to: Chrome hands over channels 1-2 and no
+ *  others, so on a loopback device anything sent here feeds the model. */
+export const INPUT_PAIR = 0;
 
 export const MAX_NUDGE = 5;          // seconds of output delay for alignment
 // SYNC: how often the alignment is re-checked, and how far a nudge has to be
